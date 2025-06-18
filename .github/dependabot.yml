@@ -7,6 +7,7 @@ updates:
       interval: "weekly"
   - package-ecosystem: "pip"
     directory: "/"
+    requirements-file: "requirements/hpu.txt"
     schedule:
       interval: "weekly"
     labels: ["dependencies"]
