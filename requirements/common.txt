@@ -3,7 +3,7 @@ cachetools
 psutil
 sentencepiece  # Required for LLaMA tokenizer.
 numpy
-requests == 1.0.0
+requests == 2.32.4
 tqdm
 blake3
 py-cpuinfo
