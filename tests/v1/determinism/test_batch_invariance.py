@@ -89,7 +89,7 @@ def test_v1_generation_is_deterministic_across_batch_sizes_with_needle(
         # Engine with bs=1 behavior
         llm_bs1 = LLM_with_max_seqs(
             model=model,
-            max_num_seqs=max_batch_size,
+            max_num_seqs=1,
             gpu_memory_utilization=gpu_mem_util,
             max_model_len=max_model_len,
             attention_config=attention_config,
