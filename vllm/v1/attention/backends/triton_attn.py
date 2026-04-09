@@ -408,6 +408,17 @@ class TritonAttentionImpl(AttentionImpl):
         self.use_alibi_sqrt = use_alibi_sqrt
         self.supports_quant_query_input = current_platform.is_cuda()
 
+        # Enable tensor descriptors for Q/K/V load/store on platforms that
+        # benefit from HW 2D block reads (Intel Xe2/Xe3).  The dead branch
+        # is eliminated at Triton compile time, so NVIDIA/AMD see zero cost.
+        # Override with VLLM_TRITON_USE_TD=1/0 for benchmarking.
+        import vllm.envs as envs
+        td_override = envs.VLLM_TRITON_USE_TD
+        if td_override is not None:
+            self.use_td = td_override
+        else:
+            self.use_td = current_platform.is_xpu()
+
     def forward(
         self,
         layer: torch.nn.Module,
@@ -522,6 +533,7 @@ class TritonAttentionImpl(AttentionImpl):
             sinks=self.sinks,
             output_scale=output_scale,
             mm_prefix_range=mm_prefix_range_tensor,
+            use_td=self.use_td,
         )
 
         return output
