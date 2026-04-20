@@ -117,6 +117,131 @@ def _load_kv_tile_td(
 
 
 @triton.jit
+def _load_kv_tile_ptr(
+    cache_ptr,
+    physical_block_idx,
+    kv_head_idx,
+    seq_offset,
+    offs_d,
+    dim_mask,
+    tile_mask,
+    stride_cache_0: tl.int64,
+    stride_cache_1: tl.int64,
+    stride_cache_2: tl.int64,
+    stride_cache_3: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    IS_K: tl.constexpr,
+):
+    """Load a KV cache tile via pointer arithmetic.
+
+    Returns (HEAD_SIZE_PADDED, TILE_SIZE) for K or
+    (TILE_SIZE, HEAD_SIZE_PADDED) for V.
+    """
+    if IS_K:
+        k_offset = (
+            physical_block_idx[None, :] * stride_cache_0
+            + kv_head_idx * stride_cache_2
+            + offs_d[:, None] * stride_cache_3
+            + (seq_offset % BLOCK_SIZE)[None, :] * stride_cache_1
+        )
+        return tl.load(
+            cache_ptr + k_offset,
+            mask=dim_mask[:, None] & tile_mask[None, :],
+            other=0.0,
+        )
+    else:
+        v_offset = (
+            physical_block_idx[:, None] * stride_cache_0
+            + kv_head_idx * stride_cache_2
+            + offs_d[None, :] * stride_cache_3
+            + (seq_offset % BLOCK_SIZE)[:, None] * stride_cache_1
+        )
+        return tl.load(
+            cache_ptr + v_offset,
+            mask=dim_mask[None, :] & tile_mask[:, None],
+            other=0.0,
+        )
+
+
+@triton.jit
+def _store_output_2d_td(
+    output_ptr,
+    acc,
+    q_block_local_len,
+    cur_batch_in_all_start_index,
+    q_block_local_idx,
+    kv_head_idx,
+    num_queries_per_kv: tl.constexpr,
+    output_stride_0: tl.int64,
+    output_stride_1: tl.int64,
+    BLOCK_Q: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+    HEAD_SIZE_PADDED: tl.constexpr,
+):
+    """Store output via tensor descriptor for 2D kernel."""
+    acc = acc.to(output_ptr.dtype.element_ty)
+    output_base = (
+        output_ptr
+        + (cur_batch_in_all_start_index
+           + q_block_local_idx * BLOCK_Q) * output_stride_0
+        + (kv_head_idx * num_queries_per_kv) * output_stride_1
+    )
+    output_desc = tl.make_tensor_descriptor(
+        base=output_base,
+        shape=(q_block_local_len, num_queries_per_kv, HEAD_SIZE),
+        strides=(output_stride_0, output_stride_1, 1),
+        block_shape=(BLOCK_Q, num_queries_per_kv, HEAD_SIZE_PADDED),
+    )
+    output_desc.store(
+        [0, 0, 0],
+        acc.reshape(BLOCK_Q, num_queries_per_kv, HEAD_SIZE_PADDED),
+    )
+
+
+@triton.jit
+def _store_segm_output_3d_td(
+    segm_output_ptr,
+    acc,
+    q_block_local_len,
+    cur_batch_in_all_start_index,
+    q_block_local_idx,
+    kv_head_idx,
+    num_queries_per_kv: tl.constexpr,
+    segm_idx,
+    num_query_heads: tl.constexpr,
+    NUM_SEGMENTS_PER_SEQ: tl.constexpr,
+    BLOCK_Q: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+    HEAD_SIZE_PADDED: tl.constexpr,
+):
+    """Store segment output via tensor descriptor for 3D kernel."""
+    acc = acc.to(segm_output_ptr.dtype.element_ty)
+    segm_output_base = (
+        segm_output_ptr
+        + (cur_batch_in_all_start_index
+           + q_block_local_idx * BLOCK_Q).to(tl.int64)
+        * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
+        + (kv_head_idx * num_queries_per_kv)
+        * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
+        + segm_idx * HEAD_SIZE_PADDED
+    )
+    segm_output_desc = tl.make_tensor_descriptor(
+        base=segm_output_base,
+        shape=(q_block_local_len, num_queries_per_kv, HEAD_SIZE),
+        strides=(
+            num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED,
+            NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED,
+            1,
+        ),
+        block_shape=(BLOCK_Q, num_queries_per_kv, HEAD_SIZE_PADDED),
+    )
+    segm_output_desc.store(
+        [0, 0, 0],
+        acc.reshape(BLOCK_Q, num_queries_per_kv, HEAD_SIZE_PADDED),
+    )
+
+
+@triton.jit
 def find_seq_idx(
     query_start_len_ptr,
     target_idx,
@@ -346,8 +471,6 @@ def kernel_unified_attention_2d(
         ).to(tl.int64)
 
         if USE_TD:
-            # --- Tensor-descriptor path for K/V loads ---
-            # static_assert guarantees tile stays inside one physical block.
             offset_in_block = (j * TILE_SIZE) % BLOCK_SIZE
             K_load = _load_kv_tile_td(
                 key_cache_ptr, physical_block_idx[0], kv_head_idx,
@@ -365,67 +488,39 @@ def kernel_unified_attention_2d(
                 BLOCK_SIZE, TILE_SIZE, HEAD_SIZE, HEAD_SIZE_PADDED,
                 IS_K=False,
             )
-
-            if K_load.dtype.is_fp8():
-                if Q.dtype.is_fp8():
-                    K = K_load
-                else:
-                    K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
-            else:
-                K = K_load
-
-            if V_load.dtype.is_fp8():
-                if Q.dtype.is_fp8():
-                    V = V_load
-                else:
-                    V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
-            else:
-                V = V_load
         else:
-            # --- Original pointer-arithmetic path for K/V loads ---
-            v_offset = (
-                physical_block_idx[:, None] * stride_v_cache_0
-                + kv_head_idx * stride_v_cache_2
-                + offs_d[None, :] * stride_v_cache_3
-                + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+            K_load = _load_kv_tile_ptr(
+                key_cache_ptr, physical_block_idx, kv_head_idx,
+                seq_offset, offs_d, dim_mask, tile_mask,
+                stride_k_cache_0, stride_k_cache_1,
+                stride_k_cache_2, stride_k_cache_3,
+                BLOCK_SIZE, IS_K=True,
+            )
+            V_load = _load_kv_tile_ptr(
+                value_cache_ptr, physical_block_idx, kv_head_idx,
+                seq_offset, offs_d, dim_mask, tile_mask,
+                stride_v_cache_0, stride_v_cache_1,
+                stride_v_cache_2, stride_v_cache_3,
+                BLOCK_SIZE, IS_K=False,
             )
 
-            k_offset = (
-                physical_block_idx[None, :] * stride_k_cache_0
-                + kv_head_idx * stride_k_cache_2
-                + offs_d[:, None] * stride_k_cache_3
-                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
-            )
-
-            # K : (HEAD_SIZE, TILE_SIZE)
-            K_load = tl.load(
-                key_cache_ptr + k_offset,
-                mask=dim_mask[:, None] & tile_mask[None, :],
-                other=0.0,
-            )
-
-            if K_load.dtype.is_fp8():
-                if Q.dtype.is_fp8():
-                    K = K_load
-                else:
-                    K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
-            else:
+        # K : (HEAD_SIZE_PADDED, TILE_SIZE)
+        if K_load.dtype.is_fp8():
+            if Q.dtype.is_fp8():
                 K = K_load
-
-            # V : (TILE_SIZE, HEAD_SIZE)
-            V_load = tl.load(
-                value_cache_ptr + v_offset,
-                mask=dim_mask[None, :] & tile_mask[:, None],
-                other=0.0,
-            )
-
-            if V_load.dtype.is_fp8():
-                if Q.dtype.is_fp8():
-                    V = V_load
-                else:
-                    V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
             else:
+                K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
+        else:
+            K = K_load
+
+        # V : (TILE_SIZE, HEAD_SIZE_PADDED)
+        if V_load.dtype.is_fp8():
+            if Q.dtype.is_fp8():
                 V = V_load
+            else:
+                V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
+        else:
+            V = V_load
 
         # Compute attention mask: causal by default (key <= query)
         query_abs_pos = context_len + query_pos[:, None]
@@ -536,22 +631,12 @@ def kernel_unified_attention_2d(
         acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
 
     if USE_TD:
-        acc = acc.to(output_ptr.dtype.element_ty)
-        output_base = (
-            output_ptr
-            + (cur_batch_in_all_start_index
-               + q_block_local_idx * BLOCK_Q) * output_stride_0
-            + (kv_head_idx * num_queries_per_kv) * output_stride_1
-        )
-        output_desc = tl.make_tensor_descriptor(
-            base=output_base,
-            shape=(q_block_local_len, num_queries_per_kv, HEAD_SIZE),
-            strides=(output_stride_0, output_stride_1, 1),
-            block_shape=(BLOCK_Q, num_queries_per_kv, HEAD_SIZE_PADDED),
-        )
-        output_desc.store(
-            [0, 0, 0],
-            acc.reshape(BLOCK_Q, num_queries_per_kv, HEAD_SIZE_PADDED),
+        _store_output_2d_td(
+            output_ptr, acc, q_block_local_len,
+            cur_batch_in_all_start_index, q_block_local_idx,
+            kv_head_idx, num_queries_per_kv,
+            output_stride_0, output_stride_1,
+            BLOCK_Q, HEAD_SIZE, HEAD_SIZE_PADDED,
         )
     else:
         output_offset = (
@@ -782,8 +867,6 @@ def kernel_unified_attention_3d(
         ).to(tl.int64)
 
         if USE_TD:
-            # --- Tensor-descriptor path for K/V loads ---
-            # static_assert guarantees tile stays inside one physical block.
             offset_in_block = (j * TILE_SIZE) % BLOCK_SIZE
             K_load = _load_kv_tile_td(
                 key_cache_ptr, physical_block_idx[0], kv_head_idx,
@@ -801,67 +884,39 @@ def kernel_unified_attention_3d(
                 BLOCK_SIZE, TILE_SIZE, HEAD_SIZE, HEAD_SIZE_PADDED,
                 IS_K=False,
             )
-
-            if K_load.dtype.is_fp8():
-                if Q.dtype.is_fp8():
-                    K = K_load
-                else:
-                    K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
-            else:
-                K = K_load
-
-            if V_load.dtype.is_fp8():
-                if Q.dtype.is_fp8():
-                    V = V_load
-                else:
-                    V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
-            else:
-                V = V_load
         else:
-            # --- Original pointer-arithmetic path for K/V loads ---
-            v_offset = (
-                physical_block_idx[:, None] * stride_v_cache_0
-                + kv_head_idx * stride_v_cache_2
-                + offs_d[None, :] * stride_v_cache_3
-                + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+            K_load = _load_kv_tile_ptr(
+                key_cache_ptr, physical_block_idx, kv_head_idx,
+                seq_offset, offs_d, dim_mask, tile_mask,
+                stride_k_cache_0, stride_k_cache_1,
+                stride_k_cache_2, stride_k_cache_3,
+                BLOCK_SIZE, IS_K=True,
+            )
+            V_load = _load_kv_tile_ptr(
+                value_cache_ptr, physical_block_idx, kv_head_idx,
+                seq_offset, offs_d, dim_mask, tile_mask,
+                stride_v_cache_0, stride_v_cache_1,
+                stride_v_cache_2, stride_v_cache_3,
+                BLOCK_SIZE, IS_K=False,
             )
 
-            k_offset = (
-                physical_block_idx[None, :] * stride_k_cache_0
-                + kv_head_idx * stride_k_cache_2
-                + offs_d[:, None] * stride_k_cache_3
-                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
-            )
-
-            # K : (HEAD_SIZE, TILE_SIZE)
-            K_load = tl.load(
-                key_cache_ptr + k_offset,
-                mask=dim_mask[:, None] & tile_mask[None, :],
-                other=0.0,
-            )
-
-            if K_load.dtype.is_fp8():
-                if Q.dtype.is_fp8():
-                    K = K_load
-                else:
-                    K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
-            else:
+        # K : (HEAD_SIZE_PADDED, TILE_SIZE)
+        if K_load.dtype.is_fp8():
+            if Q.dtype.is_fp8():
                 K = K_load
-
-            # V : (TILE_SIZE, HEAD_SIZE)
-            V_load = tl.load(
-                value_cache_ptr + v_offset,
-                mask=dim_mask[None, :] & tile_mask[:, None],
-                other=0.0,
-            )
-
-            if V_load.dtype.is_fp8():
-                if Q.dtype.is_fp8():
-                    V = V_load
-                else:
-                    V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
             else:
+                K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
+        else:
+            K = K_load
+
+        # V : (TILE_SIZE, HEAD_SIZE_PADDED)
+        if V_load.dtype.is_fp8():
+            if Q.dtype.is_fp8():
                 V = V_load
+            else:
+                V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
+        else:
+            V = V_load
 
         # Compute attention mask: causal by default (key <= query)
         query_abs_pos = context_len + query_pos[:, None]
@@ -965,29 +1020,12 @@ def kernel_unified_attention_3d(
         acc += tl.dot(P.to(V.dtype), V)
 
     if USE_TD:
-        acc = acc.to(segm_output_ptr.dtype.element_ty)
-        segm_output_base = (
-            segm_output_ptr
-            + (cur_batch_in_all_start_index
-               + q_block_local_idx * BLOCK_Q).to(tl.int64)
-            * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
-            + (kv_head_idx * num_queries_per_kv)
-            * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
-            + segm_idx * HEAD_SIZE_PADDED
-        )
-        segm_output_desc = tl.make_tensor_descriptor(
-            base=segm_output_base,
-            shape=(q_block_local_len, num_queries_per_kv, HEAD_SIZE),
-            strides=(
-                num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED,
-                NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED,
-                1,
-            ),
-            block_shape=(BLOCK_Q, num_queries_per_kv, HEAD_SIZE_PADDED),
-        )
-        segm_output_desc.store(
-            [0, 0, 0],
-            acc.reshape(BLOCK_Q, num_queries_per_kv, HEAD_SIZE_PADDED),
+        _store_segm_output_3d_td(
+            segm_output_ptr, acc, q_block_local_len,
+            cur_batch_in_all_start_index, q_block_local_idx,
+            kv_head_idx, num_queries_per_kv, segm_idx,
+            num_query_heads, NUM_SEGMENTS_PER_SEQ,
+            BLOCK_Q, HEAD_SIZE, HEAD_SIZE_PADDED,
         )
     else:
         segm_output_offset = (
