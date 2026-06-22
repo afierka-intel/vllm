@@ -465,22 +465,23 @@ def warn_if_moe_use_td_ineffective(
     """One-shot warning when ``VLLM_TRITON_USE_TD`` is set but ignored.
 
     Fires when the user set the env explicitly and either (a) the active
-    MoE backend is not the fused Triton kernel, or (b) the model is
-    quantized (the TD path falls back to the pointer path under any
-    quantization).
+    MoE backend is not a Triton kernel (fused or batched), or (b) the
+    model is quantized (the TD path falls back to the pointer path under
+    any quantization).
     """
     global _warned_moe_use_td_ineffective
     if _warned_moe_use_td_ineffective:
         return
     if envs.VLLM_TRITON_USE_TD is None:
         return
-    is_triton = active_backend.upper() == "TRITON"
+    is_triton = "TRITON" in active_backend.upper()
     if is_triton and not is_quantized:
         return
     if not is_triton:
         reason = (
             f"the active MoE backend is {active_backend!r}; pass "
-            "`--moe-backend triton` to enable the tensor-descriptor path"
+            "`--moe-backend triton` (or `batched_triton`) to enable the "
+            "tensor-descriptor path"
         )
     else:
         reason = (
