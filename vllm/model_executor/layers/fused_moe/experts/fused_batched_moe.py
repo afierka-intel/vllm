@@ -19,7 +19,9 @@ from vllm.model_executor.layers.fused_moe.utils import (
     _resize_cache,
     moe_kernel_quantize_input,
     normalize_batched_scales_shape,
+    resolve_moe_use_td,
     swiglu_limit_func,
+    warn_if_moe_use_td_ineffective,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
@@ -71,6 +73,13 @@ def moe_mmk(
     use_w8a8: tl.constexpr,
     use_w8a16: tl.constexpr,
     per_act_token_quant: tl.constexpr,
+    # Tensor-descriptor path for the A/B loads in the K-loop.  When
+    # ``USE_TD`` is set the caller passes pre-built descriptors whose base
+    # is already offset to this expert's tile, so the block index is 0 and
+    # only K advances.
+    a_desc=None,
+    b_desc=None,
+    USE_TD: tl.constexpr = False,
 ):
     offs_k = tl.arange(0, BLOCK_K)
 
@@ -108,14 +117,21 @@ def moe_mmk(
     # `accumulator` will be converted back to fp16 after the loop.
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_K)):
-        # Load the next block of A and B, generate a mask by checking the
-        # K dimension.
-        a = tl.load(
-            a_ptrs,
-            mask=mask_m[:, None] & (offs_k[None, :] < K - k * BLOCK_K),
-            other=0.0,
-        )
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_K, other=0.0)
+        if USE_TD:
+            # Tokens are already grouped per expert and the descriptor base
+            # is offset to this tile, so the M/N block index is 0 and the
+            # hardware zero-fills past the descriptor shape (no K-tail mask).
+            a = a_desc.load([0, k * BLOCK_K])
+            b = b_desc.load([0, k * BLOCK_K]).T
+        else:
+            # Load the next block of A and B, generate a mask by checking the
+            # K dimension.
+            a = tl.load(
+                a_ptrs,
+                mask=mask_m[:, None] & (offs_k[None, :] < K - k * BLOCK_K),
+                other=0.0,
+            )
+            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_K, other=0.0)
         # We accumulate along the K dimension.
         if use_w8a16:
             accumulator = tl.dot(a, b.to(compute_type), acc=accumulator)
@@ -135,9 +151,10 @@ def moe_mmk(
         else:
             accumulator += tl.dot(a, b)
 
-        # Advance the ptrs to the next K block.
-        a_ptrs += BLOCK_K * stride_ak
-        b_ptrs += BLOCK_K * stride_bk
+        if not USE_TD:
+            # Advance the ptrs to the next K block.
+            a_ptrs += BLOCK_K * stride_ak
+            b_ptrs += BLOCK_K * stride_bk
 
     if use_w8a16:
         accumulator = (accumulator * b_scale).to(compute_type)
@@ -168,12 +185,18 @@ def expert_triton_kernel(
     b_scale_ptr,
     b_zp_ptr,
     # strides
+    #
+    # The contiguous (last) strides ``stride_ak``/``stride_bk``/``stride_cn``
+    # are left un-annotated on purpose: ``tl.make_tensor_descriptor`` requires
+    # the descriptor's last-dim stride to be a compile-time ``1``, which only
+    # happens via Triton's equal-to-1 specialization for plain (non-int64)
+    # args.  The non-contiguous strides keep ``tl.int64`` to avoid overflow.
     stride_am: tl.int64,
-    stride_ak: tl.int64,
-    stride_bk: tl.int64,
+    stride_ak,
+    stride_bk,
     stride_bn: tl.int64,
     stride_cm: tl.int64,
-    stride_cn: tl.int64,
+    stride_cn,
     stride_ase: tl.int64,
     stride_asm: tl.int64,
     stride_ask: tl.int64,
@@ -193,15 +216,36 @@ def expert_triton_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    # Tensor-descriptor path (non-quantized only); base ptrs are already
+    # offset to this expert's tile.
+    USE_TD: tl.constexpr = False,
 ):
     offs_m = tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N) % N
     offs_k = tl.arange(0, BLOCK_K)
     mask_m = offs_m < M
 
-    # Make grids of a + b pointers
-    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
-    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+    if USE_TD:
+        a_desc = tl.make_tensor_descriptor(
+            base=a_ptr,
+            shape=(M, K),
+            strides=(stride_am, stride_ak),
+            block_shape=(BLOCK_M, BLOCK_K),
+        )
+        b_desc = tl.make_tensor_descriptor(
+            base=b_ptr,
+            shape=(N, K),
+            strides=(stride_bn, stride_bk),
+            block_shape=(BLOCK_N, BLOCK_K),
+        )
+        a_ptrs = None
+        b_ptrs = None
+    else:
+        # Make grids of a + b pointers
+        a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+        b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+        a_desc = None
+        b_desc = None
 
     accumulator = moe_mmk(
         a_ptrs,
@@ -238,13 +282,27 @@ def expert_triton_kernel(
         use_fp8_w8a8,
         use_int8_w8a16,
         per_act_token_quant,
+        a_desc,
+        b_desc,
+        USE_TD,
     )
 
     # store in C
-    offs_cn = tl.arange(0, BLOCK_N)
-    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_cn[None, :] * stride_cn
-    c_mask = mask_m[:, None] & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, accumulator, mask=c_mask)
+    if USE_TD:
+        # ``shape=(M, N)`` clips the ragged tail in hardware, so no mask is
+        # needed; the base is already offset to this tile so the index is 0.
+        c_desc = tl.make_tensor_descriptor(
+            base=c_ptr,
+            shape=(M, N),
+            strides=(stride_cm, stride_cn),
+            block_shape=(BLOCK_M, BLOCK_N),
+        )
+        c_desc.store([0, 0], accumulator)
+    else:
+        offs_cn = tl.arange(0, BLOCK_N)
+        c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_cn[None, :] * stride_cn
+        c_mask = mask_m[:, None] & (offs_cn[None, :] < N)
+        tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
 @triton.jit
@@ -266,15 +324,20 @@ def batched_triton_kernel(
     # moving by 1 element in a particular dimension. E.g. `stride_am` is
     # how much to increase `a_ptr` by to get the element one row down
     # (A has M rows).
+    #
+    # The contiguous (last) strides ``stride_ak``/``stride_bk``/``stride_cn``
+    # are left un-annotated so Triton's equal-to-1 specialization makes them
+    # compile-time ``1`` — required by ``tl.make_tensor_descriptor`` in the
+    # TD path (and harmless to the pointer path).
     stride_ae: tl.int64,
     stride_am: tl.int64,
-    stride_ak: tl.int64,
+    stride_ak,
     stride_be: tl.int64,
-    stride_bk: tl.int64,
+    stride_bk,
     stride_bn: tl.int64,
     stride_ce: tl.int64,
     stride_cm: tl.int64,
-    stride_cn: tl.int64,
+    stride_cn,
     stride_ase: tl.int64,
     stride_asm: tl.int64,
     stride_ask: tl.int64,
@@ -292,6 +355,8 @@ def batched_triton_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    # Tensor-descriptor path (non-quantized only).
+    USE_TD: tl.constexpr = False,
 ):
     expert_id = tl.program_id(axis=0)
     e_num_tokens = tl.load(expert_num_tokens + expert_id)
@@ -372,6 +437,7 @@ def batched_triton_kernel(
         BLOCK_M,
         BLOCK_N,
         BLOCK_K,
+        USE_TD,
     )
 
 
@@ -397,6 +463,13 @@ def invoke_moe_batched_triton_kernel(
     max_num_tokens = A.size(1)
     K = A.size(2)
     N = C.size(2)
+
+    is_quantized = (
+        use_fp8_w8a8 or use_int8_w8a16 or use_int4_w4a16 or per_act_token_quant
+    )
+    warn_if_moe_use_td_ineffective("BATCHED_TRITON", is_quantized=is_quantized)
+    # TD path is restricted to non-quantized weights; fall back otherwise.
+    use_td = resolve_moe_use_td() and not is_quantized
 
     BLOCK_M = config["BLOCK_SIZE_M"]
     BLOCK_N = config["BLOCK_SIZE_N"]
@@ -485,6 +558,7 @@ def invoke_moe_batched_triton_kernel(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
+        USE_TD=use_td,
     )
 
 
