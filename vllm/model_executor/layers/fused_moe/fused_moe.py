@@ -57,28 +57,16 @@ def write_zeros_to_output(
     BLOCK_SIZE_N,
     compute_type,
     num_valid_tokens,
-    # Tensor-descriptor store for the scattered zero write. False keeps the
-    # pointer path. When True, num_valid_tokens must fit in int32 (the
-    # scatter row index), enforced by the caller in
-    # invoke_fused_moe_triton_kernel.
+    # Scattered zero-write via tensor descriptor instead of masked pointer
+    # store. Requires num_valid_tokens to fit in int32 (enforced by the
+    # caller) and c_ptr to be contiguous/16-byte aligned (true for all
+    # current callers, unchecked).
     USE_TD: tl.constexpr = False,
 ):
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=compute_type)
     if USE_TD:
-        # C is viewed as a flat (num_valid_tokens, N) matrix; the zero block is
-        # scattered to the (non-contiguous) ``offs_token`` rows.
-        # ``tt.descriptor_scatter`` requires block_shape[0] == 1 and i32
-        # indices. Padded slots carry ``offs_token >= num_valid_tokens`` and
-        # are dropped by the descriptor's row-shape bound (the scatter API has
-        # no mask), so no out-of-bounds write occurs.
-        #
-        # Unasserted precondition: tl.make_tensor_descriptor requires the
-        # last dim to be contiguous (stride_cn == 1) and c_ptr to be
-        # 16-byte aligned. Every current caller passes a fresh contiguous
-        # cache with N a multiple of 128, so this holds today, but a
-        # future caller with a strided/unaligned C would silently
-        # miscompile or fail at compile time rather than fall back to the
-        # pointer path (which tolerates arbitrary strides).
+        # Padded slots (offs_token >= num_valid_tokens) are dropped by the
+        # descriptor's row-shape bound; the scatter API itself has no mask.
         c_desc = tl.make_tensor_descriptor(
             base=c_ptr,
             shape=(num_valid_tokens, N),
@@ -213,8 +201,6 @@ def fused_moe_kernel_gptq_awq(
             BLOCK_SIZE_N,
             compute_type,
             num_valid_tokens,
-            # Quantized kernel: TD load/store path is not enabled, so the
-            # zero store stays on the pointer path.
             USE_TD=False,
         )
         return
@@ -812,11 +798,7 @@ def invoke_fused_moe_triton_kernel(
 
     use_td = resolve_moe_write_zeros_use_td()
     if use_td:
-        # The TD store builds a tensor descriptor inside the kernel, which
-        # requires a PyTorch-backed scratch allocator to be registered
-        # (Triton raises "no allocator was set" otherwise on CUDA). Cached
-        # per device since triton.set_allocator is process-global state, not
-        # per-call configuration.
+        # tl.make_tensor_descriptor needs a registered allocator.
         _set_triton_allocator_once(A.device)
 
     if use_fp8_w8a8 or use_int8_w8a8:
@@ -837,12 +819,10 @@ def invoke_fused_moe_triton_kernel(
     M = A.size(0)
     num_tokens = M * top_k
     if use_td:
-        # write_zeros_to_output's TD scatter casts the row index
-        # (offs_token, which addresses num_valid_tokens rows) to int32.
+        # write_zeros_to_output's TD scatter casts the row index to int32.
         assert num_tokens < 2**31, (
-            f"num_valid_tokens={num_tokens} exceeds int32 range; the TD "
-            "scatter path in write_zeros_to_output casts the row index to "
-            "int32, disable it with VLLM_TRITON_USE_TD=0"
+            f"num_valid_tokens={num_tokens} exceeds int32 range for the TD "
+            "scatter path, disable it with VLLM_TRITON_USE_TD=0"
         )
     if sorted_token_ids is not None:
         EM = sorted_token_ids.size(0)

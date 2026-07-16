@@ -601,21 +601,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable batch-invariant mode: deterministic results regardless of
     # batch composition. Requires NVIDIA GPU with compute capability >= 9.0.
     "VLLM_BATCH_INVARIANT": lambda: bool(int(os.getenv("VLLM_BATCH_INVARIANT", "0"))),
-    # Use tensor descriptors for TD-eligible Triton kernel paths. Shared
-    # across two independent kernels: (1) Q/K/V loads and output stores in
-    # the Triton unified-attention kernel (enables HW 2D block reads on
-    # Intel XPU; the non-TD branch is dead-code-eliminated at Triton compile
-    # time so other platforms see no overhead), and (2) the tensor-descriptor
-    # scatter in the fused-MoE `write_zeros_to_output` zero-fill store for
-    # EP-pruned expert blocks. Setting this flag affects both paths -- there
-    # is no way to control them independently. Tri-state override: unset
-    # (default) lets each path auto-select per platform (attention: TD on
-    # for XPU only; MoE write_zeros: TD off everywhere -- microbenchmarks
-    # showed it slower than the pointer path at most problem sizes, see
-    # `moe_write_zeros_td_hw_supported`); ``1`` forces TD on for both paths
-    # (raises ``ValueError`` at call time for either path if the current
-    # hardware can't run it); ``0`` forces TD off for both. Useful for A/B
-    # benchmarking.
+    # Enables the tensor-descriptor (TD) path in TD-eligible Triton kernels.
+    # Tri-state: unset (default) auto-selects per platform, currently
+    # auto-on for XPU; ``1``/``0`` force TD on/off regardless of platform.
     "VLLM_TRITON_USE_TD": lambda: {"1": True, "0": False}.get(
         os.getenv("VLLM_TRITON_USE_TD", "").strip()
     ),

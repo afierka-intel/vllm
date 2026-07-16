@@ -472,9 +472,8 @@ def _write_zeros_to_output_launcher(
     BLOCK_SIZE_N: tl.constexpr,
     USE_TD: tl.constexpr,
 ):
-    """Thin single-block launcher exercising write_zeros_to_output in
-    isolation -- no GEMM, no fused_moe() overhead, no Python-side
-    intermediate_cache pre-zeroing. Mirrors
+    """Thin launcher exercising write_zeros_to_output in isolation, no
+    GEMM/fused_moe() overhead. Mirrors
     benchmarks/kernels/benchmark_moe_write_zeros_td.py."""
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
@@ -505,22 +504,10 @@ def test_write_zeros_to_output_scatter_targets_correct_rows(
     use_td: bool,
     workspace_init,
 ):
-    """Directly exercises write_zeros_to_output's scatter/store, pre-filled
-    with a non-zero sentinel -- unlike the end-to-end all-pruned tests
-    above, which read back an output that ``fused_experts_impl`` already
-    zeroed in Python (``intermediate_cache3.zero_()`` when ``expert_map is
-    not None``) before the kernel ever runs. That makes an all-zero
-    assertion on ``fused_moe()`` output pass identically whether the
-    scatter is correct, a no-op, or targets the wrong rows. Here the
-    sentinel is written by the test itself, immediately before the launch,
-    so only a correct row-scatter can produce the expected result.
-
-    ``(m, n)`` includes one case, (37, 104), where N is not a multiple of
-    BLOCK_SIZE_N=64 -- 104 is the smallest multiple of 8 bf16 elements (the
-    16-byte tensor-descriptor stride-alignment requirement) above 64 that
-    still isn't itself block-aligned -- to exercise the TD descriptor's
-    column-bound clamp on a tail tile. The pointer path's ``offs_cn < N``
-    mask has no TD equivalent test elsewhere.
+    """Directly exercises write_zeros_to_output's scatter/store against a
+    pre-filled non-zero sentinel, so a wrong-row or no-op scatter is
+    detectable (unlike asserting zero on `fused_moe()` output -- see PR
+    description). (37, 104) covers N not a multiple of BLOCK_SIZE_N=64.
     """
     if use_td and not hasattr(tl, "make_tensor_descriptor"):
         pytest.skip("Triton < 3.6 lacks tl.make_tensor_descriptor")
@@ -577,13 +564,10 @@ def test_fused_moe_mixed_ep_td_matches_pointer(
     monkeypatch,
     workspace_init,
 ):
-    """Mixed EP (some experts pruned, some local) end-to-end sanity check:
-    the TD and pointer store paths must produce bit-identical
-    ``fused_moe()`` output. This is a coarser, whole-pipeline companion to
-    ``test_write_zeros_to_output_scatter_targets_correct_rows`` above (which
-    is the one that can actually fail on a scatter defect, since
-    ``intermediate_cache3`` is pre-zeroed in Python before this test's
-    kernels ever run -- see that test's docstring)."""
+    """Mixed EP (some experts pruned, some local): TD and pointer store
+    paths must produce bit-identical `fused_moe()` output. Coarser
+    whole-pipeline companion to
+    `test_write_zeros_to_output_scatter_targets_correct_rows`."""
     if not hasattr(tl, "make_tensor_descriptor"):
         pytest.skip("Triton < 3.6 lacks tl.make_tensor_descriptor")
     if not moe_write_zeros_td_hw_supported():
@@ -634,17 +618,8 @@ def test_fused_moe_all_experts_pruned_int64_overflow(
     use_td: bool, monkeypatch, workspace_init
 ):
     """Regression test for int32 overflow in the TD scatter descriptor's
-    internal offset math.
-
-    ``test_fused_moe_int64_overflow`` below covers the pointer path's
-    ``offs_token.to(tl.int64)`` cast, but never exercises
-    ``write_zeros_to_output`` (no ``expert_map`` is passed, so
-    ``off_experts`` is never ``-1``). Mirrors that test's M/N so
-    ``row * N`` exceeds int32 max, but also prunes every expert so every
-    block hits the zero-write path with ``scatter_idx`` (cast to
-    ``tl.int32``, since it only needs to address the row count, not the
-    byte offset) landing near the overflow boundary.
-    """
+    row-index cast. Mirrors `test_fused_moe_int64_overflow`'s M/N, but also
+    prunes every expert so every block hits write_zeros_to_output."""
     if use_td and not hasattr(tl, "make_tensor_descriptor"):
         pytest.skip("Triton < 3.6 lacks tl.make_tensor_descriptor")
     if use_td and not moe_write_zeros_td_hw_supported():
