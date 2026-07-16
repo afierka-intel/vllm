@@ -923,11 +923,21 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             param: Parameter
             if "." in name:
                 submodule, _, attr = name.rpartition(".")
-                param = getattr(self.get_submodule(submodule), attr, self)
+                target = self.get_submodule(submodule)
+                param = getattr(target, attr, None)
             else:
-                param = getattr(self, name, self)
-            if param is None and name == "bias":
-                continue
+                target = self
+                param = getattr(self, name, None)
+            if param is None:
+                # Checkpoint provides a tensor this layer never registered
+                # as a param, e.g. bias when the layer was built with
+                # bias=False, or g_idx when desc_act=False (some GPTQ
+                # exporters still emit a trivial g_idx per layer regardless).
+                # Skip rather than crash.
+                leaf_name = name.rpartition(".")[-1]
+                if leaf_name in ("bias", "g_idx"):
+                    continue
+                param = target
             param.weight_loader(param, loaded_weight, shard_id)
             logger.debug(
                 "Loaded shard %s with shape %s into %s.%s",
@@ -1332,11 +1342,21 @@ class QKVParallelLinear(ColumnParallelLinear):
             param: Parameter
             if "." in name:
                 submodule, _, attr = name.rpartition(".")
-                param = getattr(self.get_submodule(submodule), attr, self)
+                target = self.get_submodule(submodule)
+                param = getattr(target, attr, None)
             else:
-                param = getattr(self, name, self)
-            if param is None and name == "bias":
-                continue
+                target = self
+                param = getattr(self, name, None)
+            if param is None:
+                # Checkpoint provides a tensor this layer never registered
+                # as a param, e.g. bias when the layer was built with
+                # bias=False, or g_idx when desc_act=False (some GPTQ
+                # exporters still emit a trivial g_idx per layer regardless).
+                # Skip rather than crash.
+                leaf_name = name.rpartition(".")[-1]
+                if leaf_name in ("bias", "g_idx"):
+                    continue
+                param = target
             param.weight_loader(param, loaded_weight, shard_id)
             logger.debug(
                 "Loaded shard %s with shape %s into %s.%s",
