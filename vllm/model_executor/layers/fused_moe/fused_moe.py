@@ -28,13 +28,20 @@ from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
 from vllm.model_executor.layers.fused_moe.utils import (
     enable_swap_ab,
     moe_kernel_quantize_input,
+    resolve_moe_write_zeros_use_td,
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.triton_utils.allocation import set_triton_allocator
 from vllm.utils.platform_utils import get_device_name_as_file_name
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
+
+
+@functools.lru_cache
+def _set_triton_allocator_once(device: torch.device) -> None:
+    set_triton_allocator(device)
 
 
 @triton.jit
@@ -49,12 +56,42 @@ def write_zeros_to_output(
     BLOCK_SIZE_M,
     BLOCK_SIZE_N,
     compute_type,
+    num_valid_tokens,
+    # Tensor-descriptor store for the scattered zero write. False keeps the
+    # pointer path. When True, num_valid_tokens must fit in int32 (the
+    # scatter row index), enforced by the caller in
+    # invoke_fused_moe_triton_kernel.
+    USE_TD: tl.constexpr = False,
 ):
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=compute_type)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, accumulator, mask=c_mask)
+    if USE_TD:
+        # C is viewed as a flat (num_valid_tokens, N) matrix; the zero block is
+        # scattered to the (non-contiguous) ``offs_token`` rows.
+        # ``tt.descriptor_scatter`` requires block_shape[0] == 1 and i32
+        # indices. Padded slots carry ``offs_token >= num_valid_tokens`` and
+        # are dropped by the descriptor's row-shape bound (the scatter API has
+        # no mask), so no out-of-bounds write occurs.
+        #
+        # Unasserted precondition: tl.make_tensor_descriptor requires the
+        # last dim to be contiguous (stride_cn == 1) and c_ptr to be
+        # 16-byte aligned. Every current caller passes a fresh contiguous
+        # cache with N a multiple of 128, so this holds today, but a
+        # future caller with a strided/unaligned C would silently
+        # miscompile or fail at compile time rather than fall back to the
+        # pointer path (which tolerates arbitrary strides).
+        c_desc = tl.make_tensor_descriptor(
+            base=c_ptr,
+            shape=(num_valid_tokens, N),
+            strides=(stride_cm, stride_cn),
+            block_shape=(1, BLOCK_SIZE_N),
+        )
+        scatter_idx = offs_token.to(tl.int32)
+        c_desc.scatter(accumulator, scatter_idx, pid_n * BLOCK_SIZE_N)
+    else:
+        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+        c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+        tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
 @triton.jit
@@ -175,6 +212,10 @@ def fused_moe_kernel_gptq_awq(
             BLOCK_SIZE_M,
             BLOCK_SIZE_N,
             compute_type,
+            num_valid_tokens,
+            # Quantized kernel: TD load/store path is not enabled, so the
+            # zero store stays on the pointer path.
+            USE_TD=False,
         )
         return
 
@@ -346,6 +387,9 @@ def fused_moe_kernel(
     per_channel_quant: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     SWAP_AB: tl.constexpr,
+    # Tensor-descriptor store path for write_zeros_to_output. False keeps
+    # the pointer path.
+    USE_TD: tl.constexpr = False,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -430,6 +474,8 @@ def fused_moe_kernel(
             BLOCK_SIZE_M,
             BLOCK_SIZE_N,
             compute_type,
+            num_valid_tokens,
+            USE_TD=USE_TD,
         )
         return
 
@@ -764,6 +810,15 @@ def invoke_fused_moe_triton_kernel(
     else:
         SWAP_AB = False
 
+    use_td = resolve_moe_write_zeros_use_td()
+    if use_td:
+        # The TD store builds a tensor descriptor inside the kernel, which
+        # requires a PyTorch-backed scratch allocator to be registered
+        # (Triton raises "no allocator was set" otherwise on CUDA). Cached
+        # per device since triton.set_allocator is process-global state, not
+        # per-call configuration.
+        _set_triton_allocator_once(A.device)
+
     if use_fp8_w8a8 or use_int8_w8a8:
         assert B_scale is not None
         assert block_shape is None or triton.cdiv(
@@ -781,6 +836,14 @@ def invoke_fused_moe_triton_kernel(
 
     M = A.size(0)
     num_tokens = M * top_k
+    if use_td:
+        # write_zeros_to_output's TD scatter casts the row index
+        # (offs_token, which addresses num_valid_tokens rows) to int32.
+        assert num_tokens < 2**31, (
+            f"num_valid_tokens={num_tokens} exceeds int32 range; the TD "
+            "scatter path in write_zeros_to_output casts the row index to "
+            "int32, disable it with VLLM_TRITON_USE_TD=0"
+        )
     if sorted_token_ids is not None:
         EM = sorted_token_ids.size(0)
         if A.size(0) < config["BLOCK_SIZE_M"]:
@@ -846,6 +909,7 @@ def invoke_fused_moe_triton_kernel(
         HAS_BIAS=HAS_BIAS,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         SWAP_AB=SWAP_AB,
+        USE_TD=use_td,
         **config,
     )
 

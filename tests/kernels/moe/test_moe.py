@@ -36,6 +36,10 @@ from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
     batched_fused_marlin_moe,
     fused_marlin_moe,
 )
+from vllm.model_executor.layers.fused_moe.fused_moe import write_zeros_to_output
+from vllm.model_executor.layers.fused_moe.utils import (
+    moe_write_zeros_td_hw_supported,
+)
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     marlin_permute_bias,
 )
@@ -53,6 +57,7 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils_test import (
 from vllm.model_executor.layers.quantization.utils.quant_utils import quantize_weights
 from vllm.platforms import current_platform
 from vllm.scalar_type import ScalarType, scalar_types
+from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import next_power_of_2
 from vllm.utils.torch_utils import set_random_seed
 
@@ -394,6 +399,298 @@ def test_fused_moe(
             use_compile=use_compile,
             use_cudagraph=use_cudagraph,
         )
+
+
+_TD_SCATTER_UNSUPPORTED_SKIP_REASON = (
+    "tensor_descriptor.scatter requires XPU or NVIDIA Blackwell "
+    "(sm100 family); lowers to tile::scatter4 (tcgen05/TMEM), which "
+    "ptxas rejects on Hopper (sm90) and earlier"
+)
+
+
+@pytest.mark.parametrize("m,n,k", [(83, 512, 256), (1, 1024, 512)])
+@pytest.mark.parametrize("e", [8])
+@pytest.mark.parametrize("topk", [2])
+@pytest.mark.parametrize("use_td", [False, True])
+def test_fused_moe_all_experts_pruned(
+    m: int,
+    n: int,
+    k: int,
+    e: int,
+    topk: int,
+    use_td: bool,
+    monkeypatch,
+    workspace_init,
+):
+    """All experts off the local EP rank -> every block hits
+    ``write_zeros_to_output``. Output must be exactly zero on both the
+    pointer and the tensor-descriptor (USE_TD) store paths."""
+    if use_td and not hasattr(tl, "make_tensor_descriptor"):
+        pytest.skip("Triton < 3.6 lacks tl.make_tensor_descriptor")
+    if use_td and not moe_write_zeros_td_hw_supported():
+        pytest.skip(_TD_SCATTER_UNSUPPORTED_SKIP_REASON)
+    monkeypatch.setenv("VLLM_TRITON_USE_TD", "1" if use_td else "0")
+    set_random_seed(7)
+
+    device = current_platform.device_type
+    a = torch.randn((m, k), device=device, dtype=torch.bfloat16) / 10
+    w1 = torch.randn((e, 2 * n, k), device=device, dtype=torch.bfloat16) / 10
+    w2 = torch.randn((e, k, n), device=device, dtype=torch.bfloat16) / 10
+    score = torch.randn((m, e), device=device, dtype=torch.bfloat16)
+
+    # Empty local rank: expert_map is all -1 so off_experts == -1 for every
+    # block, exercising only the zero-write path.
+    e_map = torch.full((e,), -1, device=device, dtype=torch.int32)
+
+    with set_current_vllm_config(vllm_config):
+        out = fused_moe(
+            a,
+            w1,
+            w2,
+            score,
+            topk,
+            renormalize=False,
+            global_num_experts=e,
+            expert_map=e_map,
+        )
+
+    assert torch.count_nonzero(out) == 0, (
+        f"expected all-zero output for pruned experts, got "
+        f"{torch.count_nonzero(out).item()} non-zero elements (use_td={use_td})"
+    )
+
+
+@triton.jit
+def _write_zeros_to_output_launcher(
+    c_ptr,
+    stride_cm,
+    stride_cn,
+    N,
+    sorted_token_ids_ptr,
+    num_valid_tokens,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    USE_TD: tl.constexpr,
+):
+    """Thin single-block launcher exercising write_zeros_to_output in
+    isolation -- no GEMM, no fused_moe() overhead, no Python-side
+    intermediate_cache pre-zeroing. Mirrors
+    benchmarks/kernels/benchmark_moe_write_zeros_td.py."""
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id).to(tl.int64)
+    token_mask = offs_token < num_valid_tokens
+    write_zeros_to_output(
+        c_ptr,
+        stride_cm,
+        stride_cn,
+        pid_n,
+        N,
+        offs_token,
+        token_mask,
+        BLOCK_SIZE_M,
+        BLOCK_SIZE_N,
+        tl.bfloat16,
+        num_valid_tokens,
+        USE_TD=USE_TD,
+    )
+
+
+@pytest.mark.parametrize("m,n", [(83, 512), (1, 1024), (37, 104)])
+@pytest.mark.parametrize("use_td", [False, True])
+def test_write_zeros_to_output_scatter_targets_correct_rows(
+    m: int,
+    n: int,
+    use_td: bool,
+    workspace_init,
+):
+    """Directly exercises write_zeros_to_output's scatter/store, pre-filled
+    with a non-zero sentinel -- unlike the end-to-end all-pruned tests
+    above, which read back an output that ``fused_experts_impl`` already
+    zeroed in Python (``intermediate_cache3.zero_()`` when ``expert_map is
+    not None``) before the kernel ever runs. That makes an all-zero
+    assertion on ``fused_moe()`` output pass identically whether the
+    scatter is correct, a no-op, or targets the wrong rows. Here the
+    sentinel is written by the test itself, immediately before the launch,
+    so only a correct row-scatter can produce the expected result.
+
+    ``(m, n)`` includes one case, (37, 104), where N is not a multiple of
+    BLOCK_SIZE_N=64 -- 104 is the smallest multiple of 8 bf16 elements (the
+    16-byte tensor-descriptor stride-alignment requirement) above 64 that
+    still isn't itself block-aligned -- to exercise the TD descriptor's
+    column-bound clamp on a tail tile. The pointer path's ``offs_cn < N``
+    mask has no TD equivalent test elsewhere.
+    """
+    if use_td and not hasattr(tl, "make_tensor_descriptor"):
+        pytest.skip("Triton < 3.6 lacks tl.make_tensor_descriptor")
+    if use_td and not moe_write_zeros_td_hw_supported():
+        pytest.skip(_TD_SCATTER_UNSUPPORTED_SKIP_REASON)
+
+    device = current_platform.device_type
+    set_random_seed(7)
+
+    block_m, block_n = 16, 64
+    em = triton.cdiv(m, block_m) * block_m  # padded, like moe_align_block_size
+
+    # sorted_token_ids: valid rows [0, m), padding sentinel = m (dropped by
+    # token_mask on the pointer path / the descriptor row bound on TD).
+    sorted_token_ids = torch.arange(em, device=device, dtype=torch.int64)
+    sorted_token_ids = torch.where(sorted_token_ids < m, sorted_token_ids, m)
+
+    SENTINEL = 7.0
+    c = torch.full((m + 1, n), SENTINEL, device=device, dtype=torch.bfloat16)
+    c_before = c.clone()
+
+    grid = (triton.cdiv(em, block_m), triton.cdiv(n, block_n))
+    _write_zeros_to_output_launcher[grid](
+        c,
+        c.stride(0),
+        c.stride(1),
+        n,
+        sorted_token_ids,
+        m,
+        BLOCK_SIZE_M=block_m,
+        BLOCK_SIZE_N=block_n,
+        USE_TD=use_td,
+    )
+
+    # Every valid row [0, m) must be zeroed...
+    assert torch.all(c[:m] == 0.0), (
+        f"expected rows [0:{m}] zeroed by write_zeros_to_output "
+        f"(use_td={use_td}), found non-zero values"
+    )
+    # ...and the guard row (m, the padding sentinel's target, out of the
+    # descriptor's row bound) must be untouched -- a scatter that ignores
+    # the row bound or drops the mask would corrupt it.
+    assert torch.equal(c[m], c_before[m]), (
+        f"padding row {m} was written to (use_td={use_td}); the descriptor "
+        "row bound / token_mask failed to drop the out-of-bounds index"
+    )
+
+
+@pytest.mark.parametrize("m,n,k", [(83, 512, 256), (1, 1024, 512)])
+def test_fused_moe_mixed_ep_td_matches_pointer(
+    m: int,
+    n: int,
+    k: int,
+    monkeypatch,
+    workspace_init,
+):
+    """Mixed EP (some experts pruned, some local) end-to-end sanity check:
+    the TD and pointer store paths must produce bit-identical
+    ``fused_moe()`` output. This is a coarser, whole-pipeline companion to
+    ``test_write_zeros_to_output_scatter_targets_correct_rows`` above (which
+    is the one that can actually fail on a scatter defect, since
+    ``intermediate_cache3`` is pre-zeroed in Python before this test's
+    kernels ever run -- see that test's docstring)."""
+    if not hasattr(tl, "make_tensor_descriptor"):
+        pytest.skip("Triton < 3.6 lacks tl.make_tensor_descriptor")
+    if not moe_write_zeros_td_hw_supported():
+        pytest.skip(_TD_SCATTER_UNSUPPORTED_SKIP_REASON)
+
+    e, topk = 8, 2
+    device = current_platform.device_type
+    set_random_seed(7)
+    a = torch.randn((m, k), device=device, dtype=torch.bfloat16) / 10
+    w1 = torch.randn((e, 2 * n, k), device=device, dtype=torch.bfloat16) / 10
+    w2 = torch.randn((e, k, n), device=device, dtype=torch.bfloat16) / 10
+    score = torch.randn((m, e), device=device, dtype=torch.bfloat16)
+
+    # Half the experts pruned from the local EP rank, half kept -- every
+    # launch mixes real GEMM blocks with write_zeros_to_output blocks.
+    local_e = e // 2
+    e_ids = torch.arange(local_e, device=device, dtype=torch.int32)
+    e_map = torch.full((e,), -1, device=device, dtype=torch.int32)
+    e_map[e_ids] = torch.arange(local_e, device=device, dtype=torch.int32)
+    w1_local = w1[e_ids]
+    w2_local = w2[e_ids]
+
+    def run(use_td: bool) -> torch.Tensor:
+        monkeypatch.setenv("VLLM_TRITON_USE_TD", "1" if use_td else "0")
+        with set_current_vllm_config(vllm_config):
+            return fused_moe(
+                a,
+                w1_local,
+                w2_local,
+                score,
+                topk,
+                renormalize=False,
+                global_num_experts=e,
+                expert_map=e_map,
+            )
+
+    out_pointer = run(use_td=False)
+    out_td = run(use_td=True)
+
+    assert torch.count_nonzero(out_pointer) > 0, (
+        "expected some non-zero output from local experts"
+    )
+    torch.testing.assert_close(out_pointer, out_td, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.parametrize("use_td", [False, True])
+def test_fused_moe_all_experts_pruned_int64_overflow(
+    use_td: bool, monkeypatch, workspace_init
+):
+    """Regression test for int32 overflow in the TD scatter descriptor's
+    internal offset math.
+
+    ``test_fused_moe_int64_overflow`` below covers the pointer path's
+    ``offs_token.to(tl.int64)`` cast, but never exercises
+    ``write_zeros_to_output`` (no ``expert_map`` is passed, so
+    ``off_experts`` is never ``-1``). Mirrors that test's M/N so
+    ``row * N`` exceeds int32 max, but also prunes every expert so every
+    block hits the zero-write path with ``scatter_idx`` (cast to
+    ``tl.int32``, since it only needs to address the row count, not the
+    byte offset) landing near the overflow boundary.
+    """
+    if use_td and not hasattr(tl, "make_tensor_descriptor"):
+        pytest.skip("Triton < 3.6 lacks tl.make_tensor_descriptor")
+    if use_td and not moe_write_zeros_td_hw_supported():
+        pytest.skip(_TD_SCATTER_UNSUPPORTED_SKIP_REASON)
+    monkeypatch.setenv("VLLM_TRITON_USE_TD", "1" if use_td else "0")
+
+    # ~12 GB GPU memory needed for intermediate caches
+    free_mem = torch.accelerator.get_memory_info()[0]
+    if free_mem < 12 * 1024**3:
+        pytest.skip("Insufficient GPU memory for overflow test")
+
+    set_random_seed(7)
+
+    m, n, k, e, topk = 100000, 2048, 1024, 8, 6
+    device = current_platform.device_type
+    dtype = torch.bfloat16
+
+    a = torch.randn((m, k), device=device, dtype=dtype) / 10
+    w1 = torch.randn((e, 2 * n, k), device=device, dtype=dtype) / 10
+    w2 = torch.randn((e, k, n), device=device, dtype=dtype) / 10
+    score = torch.randn((m, e), device=device, dtype=dtype)
+
+    # C has shape (M, topk, N) where N = w1.size(1) = 2*n; the scattered
+    # zero block's row offset (row * N) must exceed int32 max for this
+    # test to be meaningful.
+    N = w1.size(1)
+    assert N * m * topk > 2**31 - 1, "Test params don't trigger int32 overflow"
+
+    e_map = torch.full((e,), -1, device=device, dtype=torch.int32)
+
+    with set_current_vllm_config(vllm_config):
+        out = fused_moe(
+            a,
+            w1,
+            w2,
+            score,
+            topk,
+            renormalize=False,
+            global_num_experts=e,
+            expert_map=e_map,
+        )
+
+    assert torch.count_nonzero(out) == 0, (
+        f"expected all-zero output for pruned experts, got "
+        f"{torch.count_nonzero(out).item()} non-zero elements (use_td={use_td})"
+    )
 
 
 def test_fused_moe_int64_overflow(workspace_init):

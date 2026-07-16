@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn.functional as F
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
@@ -579,3 +580,68 @@ def enable_swap_ab(BLOCK_SIZE_M: int, BLOCK_SIZE_N: int) -> bool:
         and BLOCK_SIZE_M < 64
         and BLOCK_SIZE_N >= 64
     )
+
+
+def moe_write_zeros_td_hw_supported() -> bool:
+    """Whether the current device can run the TD path of
+    ``write_zeros_to_output`` (ignores the ``VLLM_TRITON_USE_TD`` override).
+
+    On CUDA, the TD path uses ``tensor_descriptor.scatter``, which lowers to
+    the PTX ``tile::scatter4`` instruction. That instruction is part of the
+    ``tcgen05``/Tensor Memory (TMEM) family introduced with Blackwell and has
+    no Hopper (sm90) equivalent -- ptxas rejects it there ("Feature
+    '.tile::scatter4' not supported on .target 'sm_90a'"). It is also
+    unsupported on consumer Blackwell (sm120/sm121, e.g. RTX 50-series, DGX
+    Spark): see triton-lang/triton#8498, which enables ``gather4`` on
+    sm120/sm121 but explicitly skips the ``scatter4`` test there ("unsupported
+    by hardware"). So this gates on the sm100 *family* specifically, not a
+    blanket ``>=100`` capability check -- mirrors the
+    ``has_tma_gather()``/``can_use_tma`` capability-gating pattern in
+    triton_kernels (triton-lang/triton#8484, fixing the identical class of
+    bug for gather4 on sm121, see triton-lang/triton#8335).
+
+    On XPU, `tensor_descriptor.scatter` has no equivalent hardware
+    instruction at all -- the Intel Triton backend's
+    ``triton-intel-rewrite-tensor-descriptor-to-pointer`` pass unconditionally
+    lowers every ``descriptor_scatter`` to a masked pointer store at the TTIR
+    level, for every XPU target (there is a single ``target_arch`` string
+    across generations, no per-generation dispatch in the backend as of the
+    triton-xpu version pinned in ``requirements/xpu.txt``). So unlike CUDA,
+    there's no hardware feature gap to gate on: the "TD path" on XPU is
+    always the same masked-store fallback the compiler would use anyway,
+    just reached through the tensor-descriptor API. If a future triton-xpu
+    release adds generation-conditional lowering for this op, this
+    blanket-enable will need revisiting.
+    """
+    if current_platform.is_xpu():
+        return True
+    if current_platform.is_cuda():
+        return current_platform.is_device_capability_family(100)
+    return False
+
+
+def resolve_moe_write_zeros_use_td() -> bool:
+    """Tri-state resolver for ``VLLM_TRITON_USE_TD``.
+
+    This flag is shared with the unified-attention TD path
+    (``vllm/v1/attention/backends/triton_attn.py``) -- setting it affects
+    both. Unset (default) keeps the pointer-store path everywhere for this
+    kernel: microbenchmarks of ``write_zeros_to_output`` in isolation showed
+    the TD path slower than the pointer path at all but the largest measured
+    problem size (+206%, +112%, +38% at three of four sizes; parity only at
+    the largest), so this is not auto-enabled by hardware capability alone.
+    ``1`` forces TD on, raising ``ValueError`` if the current hardware can't
+    run it (see ``moe_write_zeros_td_hw_supported``); ``0`` forces it off.
+    """
+    override = envs.VLLM_TRITON_USE_TD
+    if override is None:
+        return False
+    if override and not moe_write_zeros_td_hw_supported():
+        raise ValueError(
+            "VLLM_TRITON_USE_TD=1 forces the MoE write_zeros_to_output "
+            "tensor-descriptor scatter path on, but the current hardware "
+            "doesn't support tensor_descriptor.scatter (requires XPU or "
+            "NVIDIA Blackwell sm100 family). Unset VLLM_TRITON_USE_TD or "
+            "set it to 0."
+        )
+    return override

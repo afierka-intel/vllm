@@ -139,6 +139,10 @@ def fused_moe_nvfp4_emulation_kernel(
             BLOCK_SIZE_M,
             BLOCK_SIZE_N,
             compute_type,
+            num_valid_tokens,
+            # TD load/store path is not wired up for the NVFP4 emulation
+            # kernel, so the zero store stays on the pointer path.
+            USE_TD=False,
         )
         return
 
