@@ -884,6 +884,14 @@ class RoutedExperts(PluggableLayer):
                 matched = True
                 weight_name = qual_name.replace(weight_name, param_name)
                 param_name = weight_name.removeprefix(f"{self.layer_name}.")
+                if not hasattr(self, param_name):
+                    # Checkpoint provides a tensor (e.g. per-expert bias or
+                    # g_idx) that this layer never registered as a param --
+                    # the quant method didn't request it, so the tensor is
+                    # intentionally unused. Skip rather than crash.
+                    if matched and is_fused:
+                        break
+                    continue
                 param = getattr(self, param_name)
                 if is_fused:
                     # w1 and w3 share one fused tensor; use a local copy so the
