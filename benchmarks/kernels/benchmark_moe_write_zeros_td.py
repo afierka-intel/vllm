@@ -3,6 +3,14 @@
 """Microbenchmark: TD-scatter vs pointer-store for write_zeros_to_output
 (the fused-MoE zero-fill store for EP-pruned expert blocks).
 
+Per AGENTS.md, kernel perf work belongs in benchmarks/kernels/, not tests/.
+This script also makes the write_zeros_to_output TD-vs-pointer numbers
+independently reproducible: an earlier review round on this PR flagged that
+the original "TD path is slower at 3 of 4 sizes" claim came from a
+task-local script not checked into the PR, so it couldn't be re-run by a
+reviewer. This is the checked-in replacement, used to justify
+resolve_moe_write_zeros_use_td()'s default-off gating.
+
 Isolates write_zeros_to_output via a thin @triton.jit launcher (no GEMM, no
 fused_moe() overhead) with a synthetic sorted_token_ids array padded the
 same way moe_align_block_size() pads it: padding sentinel = num_valid_tokens,
@@ -23,17 +31,25 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.torch_utils import set_random_seed
 
-DEVICE = current_platform.device_type  # "cuda" or "xpu"
+DEVICE = current_platform.device_type  # "cuda" (also reported by ROCm) or "xpu"
 
-# (m, n, k): first two match test_fused_moe_all_experts_pruned exactly; the
-# larger two are illustrative EP-batch sizes, not derived from a specific
-# model. k has no effect on this kernel's cost (no arithmetic, pure zero
-# store) -- kept only for label parity with the unit test / config lookup.
+# (m, n, k): first row matches test_fused_moe_all_experts_pruned exactly. The
+# rest are real model (m, n) pairs -- m = small decode-like vs large EP-batch
+# token count, n = B.size(1) in fused_moe_kernel (either the gate_up
+# projection width 2 * intermediate_size, or the down projection width
+# hidden_size), per benchmark_moe.py's get_model_params() convention:
+#   - Mixtral-8x7B: hidden=4096, intermediate=14336
+#   - DeepSeek-V3:  hidden=7168, moe_intermediate=2048
+# k has no effect on this kernel's cost (no arithmetic, pure zero store) --
+# kept only as some value for label/config-lookup parity with the unit
+# test, using n's model's hidden_size. E/TOPK below are likewise fixed
+# (Mixtral-style) across all rows -- only get_default_config's tuning
+# heuristics consume them, not the benchmarked store itself.
 PROBLEM_SIZES = [
     (83, 512, 256),
-    (1, 1024, 512),
-    (2048, 4096, 4096),
-    (8192, 4096, 4096),
+    (32, 4096, 4096),  # Mixtral-8x7B down-proj, small decode-like batch
+    (2048, 28672, 4096),  # Mixtral-8x7B gate_up-proj, EP-realistic batch
+    (8192, 2048, 7168),  # DeepSeek-V3 gate_up-proj, large EP batch
 ]
 E, TOPK = 8, 2  # only feeds get_default_config's tuning heuristics
 
