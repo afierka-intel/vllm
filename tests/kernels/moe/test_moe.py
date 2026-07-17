@@ -584,6 +584,11 @@ def test_fused_moe_mixed_ep_td_matches_pointer(
     # Half the experts pruned from the local EP rank, half kept -- every
     # launch mixes real GEMM blocks with write_zeros_to_output blocks.
     local_e = e // 2
+    # Bias one local expert's score so it's always top-k-selected for every
+    # token: with small m, random routing can otherwise select only pruned
+    # experts for every token, making the output legitimately all-zero and
+    # failing the non-zero precondition below without any kernel defect.
+    score[:, local_e - 1] += 100.0
     e_ids = torch.arange(local_e, device=device, dtype=torch.int32)
     e_map = torch.full((e,), -1, device=device, dtype=torch.int32)
     e_map[e_ids] = torch.arange(local_e, device=device, dtype=torch.int32)
