@@ -1,0 +1,1 @@
+Qwen1.5-MoE-W4A16-TD-XPU.yaml
