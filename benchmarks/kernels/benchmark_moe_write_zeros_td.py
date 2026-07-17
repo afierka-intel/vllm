@@ -34,22 +34,24 @@ from vllm.utils.torch_utils import set_random_seed
 DEVICE = current_platform.device_type  # "cuda" (also reported by ROCm) or "xpu"
 
 # (m, n, k): first row matches test_fused_moe_all_experts_pruned exactly. The
-# rest are real model (m, n) pairs -- m = small decode-like vs large EP-batch
-# token count, n = B.size(1) in fused_moe_kernel (either the gate_up
-# projection width 2 * intermediate_size, or the down projection width
-# hidden_size), per benchmark_moe.py's get_model_params() convention:
+# rest are real model (m, n, k) triples -- m = small decode-like vs large
+# EP-batch token count; n = B.size(1) in fused_moe_kernel, the GEMM output
+# width (gate_up projection: 2 * intermediate_size, or down projection:
+# hidden_size); k = B.size(2), the corresponding GEMM reduction width
+# (hidden_size for gate_up, intermediate_size for down) -- per
+# benchmark_moe.py's get_model_params() convention:
 #   - Mixtral-8x7B: hidden=4096, intermediate=14336
 #   - DeepSeek-V3:  hidden=7168, moe_intermediate=2048
 # k has no effect on this kernel's cost (no arithmetic, pure zero store) --
-# kept only as some value for label/config-lookup parity with the unit
-# test, using n's model's hidden_size. E/TOPK below are likewise fixed
-# (Mixtral-style) across all rows -- only get_default_config's tuning
-# heuristics consume them, not the benchmarked store itself.
+# kept accurate to the real GEMM shape only for config-lookup parity with
+# get_default_config. E/TOPK below are likewise fixed (Mixtral-style) across
+# all rows -- only get_default_config's tuning heuristics consume them, not
+# the benchmarked store itself.
 PROBLEM_SIZES = [
     (83, 512, 256),
-    (32, 4096, 4096),  # Mixtral-8x7B down-proj, small decode-like batch
+    (32, 4096, 14336),  # Mixtral-8x7B down-proj, small decode-like batch
     (2048, 28672, 4096),  # Mixtral-8x7B gate_up-proj, EP-realistic batch
-    (8192, 2048, 7168),  # DeepSeek-V3 gate_up-proj, large EP batch
+    (8192, 4096, 7168),  # DeepSeek-V3 gate_up-proj, large EP batch
 ]
 E, TOPK = 8, 2  # only feeds get_default_config's tuning heuristics
 
