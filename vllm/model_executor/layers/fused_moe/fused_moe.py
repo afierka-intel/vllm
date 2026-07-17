@@ -28,6 +28,7 @@ from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
 from vllm.model_executor.layers.fused_moe.utils import (
     enable_swap_ab,
     moe_kernel_quantize_input,
+    resolve_moe_gptq_awq_use_td,
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -105,6 +106,15 @@ def fused_moe_kernel_gptq_awq(
     has_zp: tl.constexpr,
     use_int4_w4a16: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
+    # Tensor-descriptor path for the A gather and B load in the K-loop.
+    # int4_w4a16 only (packed-nibble unpack via tl.interleave): the launch
+    # site never sets USE_TD=True for use_int8_w8a16 (a Triton-XPU codegen
+    # bug corrupts a descriptor-loaded uint8 B tile multiplied by a dequant
+    # scale under tl.dot -- see the launch site in
+    # invoke_fused_moe_wna16_triton_kernel for detail), so USE_TD and
+    # use_int8_w8a16 are never both True and no int8 TD branch exists here.
+    # False keeps the pointer path.
+    USE_TD: tl.constexpr = False,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -180,25 +190,52 @@ def fused_moe_kernel_gptq_awq(
 
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a_ptrs = a_ptr + (
-        offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
-    )
 
-    if use_int4_w4a16:
-        b_ptrs = (
-            b_ptr
-            + off_experts * stride_be
-            + (offs_k[:, None] // 2) * stride_bk
-            + offs_bn[None, :] * stride_bn
+    if USE_TD:
+        # Only reachable for use_int4_w4a16 (see USE_TD's docstring above).
+        # A's layout is quantization-independent (activations are never
+        # quantized in this kernel).
+        m_td = num_valid_tokens // top_k
+        a_desc = tl.make_tensor_descriptor(
+            base=a_ptr,
+            shape=(m_td, K),
+            strides=(stride_am, stride_ak),
+            block_shape=(1, BLOCK_SIZE_K),
         )
-        b_shifter = (offs_k[:, None] % 2) * 4
-    elif use_int8_w8a16:
-        b_ptrs = (
-            b_ptr
-            + off_experts * stride_be
-            + offs_k[:, None] * stride_bk
-            + offs_bn[None, :] * stride_bn
+        # descriptor.gather() requires i32 indices; unlike the stride*offset
+        # products elsewhere in this kernel (kept int64 to avoid overflow
+        # for large tensors), a row index into the token table fits int32
+        # for any realistic num_valid_tokens.
+        gather_idx = (offs_token // top_k).to(tl.int32)
+        # B is packed 2 nibbles/byte along K: physical byte shape is
+        # (E, N, K // 2). Build the descriptor at half-K-width (byte
+        # granularity); nibbles are unpacked and reconstructed via
+        # tl.interleave inside the K-loop.
+        b_desc = tl.make_tensor_descriptor(
+            base=b_ptr + off_experts * stride_be,
+            shape=(N, K // 2),
+            strides=(stride_bn, stride_bk),
+            block_shape=(BLOCK_SIZE_N, BLOCK_SIZE_K // 2),
         )
+    else:
+        a_ptrs = a_ptr + (
+            offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
+        )
+        if use_int4_w4a16:
+            b_ptrs = (
+                b_ptr
+                + off_experts * stride_be
+                + (offs_k[:, None] // 2) * stride_bk
+                + offs_bn[None, :] * stride_bn
+            )
+            b_shifter = (offs_k[:, None] % 2) * 4
+        elif use_int8_w8a16:
+            b_ptrs = (
+                b_ptr
+                + off_experts * stride_be
+                + offs_k[:, None] * stride_bk
+                + offs_bn[None, :] * stride_bn
+            )
 
     if not has_zp and use_int4_w4a16:
         b_zp_num = 8
@@ -215,8 +252,11 @@ def fused_moe_kernel_gptq_awq(
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         # Load the next block of A and B, generate a mask by checking the
-        # K dimension.
-
+        # K dimension. b_scale/b_zp stay on the pointer path unconditionally
+        # (their broadcast-mod access pattern -- multiple K positions map to
+        # the same scale row -- doesn't form a dense tile a TD block can
+        # express without redundant loads), so k_mask/k_other are still
+        # needed regardless of USE_TD.
         if not block_k_diviable:
             k_mask = offs_k[:, None] < K - k * BLOCK_SIZE_K
             k_other = 0.0
@@ -224,14 +264,31 @@ def fused_moe_kernel_gptq_awq(
             k_mask = None
             k_other = None
 
-        a = tl.load(
-            a_ptrs,
-            mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
-            other=0.0,
-        )
-        b = tl.load(b_ptrs)
-        if use_int4_w4a16:
-            b = (b >> b_shifter) & 0xF
+        if USE_TD:
+            # Only reachable for use_int4_w4a16. A/B tail beyond K is
+            # handled by the descriptor's automatic HW zero-fill -- no
+            # k_mask needed here. Safe because the existing (pointer-path)
+            # K-tail correctness already relies entirely on A's mask
+            # zeroing OOB columns before tl.dot (B is never K-masked even
+            # in the pointer path); TD's zero-fill on the A gather
+            # preserves that same invariant.
+            a = a_desc.gather(gather_idx, k * BLOCK_SIZE_K)
+            # [BLOCK_SIZE_N, BLOCK_SIZE_K // 2] packed-byte tile, NOT yet
+            # transposed -- K // 2 must be the true last axis for
+            # tl.interleave to reconstruct K correctly.
+            b_packed = b_desc.load([pid_n * BLOCK_SIZE_N, (k * BLOCK_SIZE_K) // 2])
+            b_lo = b_packed & 0xF  # even k
+            b_hi = (b_packed >> 4) & 0xF  # odd k
+            b = tl.interleave(b_lo, b_hi).T
+        else:
+            a = tl.load(
+                a_ptrs,
+                mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
+                other=0.0,
+            )
+            b = tl.load(b_ptrs)
+            if use_int4_w4a16:
+                b = (b >> b_shifter) & 0xF
 
         b_scale_ptrs = (
             b_scale_ptr
@@ -271,12 +328,15 @@ def fused_moe_kernel_gptq_awq(
             b = ((b.to(tl.float32) - b_zp_num) * b_scale).to(compute_type)
         accumulator = tl.dot(a, b, acc=accumulator)
 
-        # Advance the ptrs to the next K block.
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        if use_int4_w4a16:
-            b_ptrs += (BLOCK_SIZE_K // 2) * stride_bk
-        else:
-            b_ptrs += BLOCK_SIZE_K * stride_bk
+        if not USE_TD:
+            # Advance the ptrs to the next K block. Under USE_TD, offsets
+            # are recomputed absolutely each iteration (k * BLOCK_SIZE_K),
+            # so no advance is needed.
+            a_ptrs += BLOCK_SIZE_K * stride_ak
+            if use_int4_w4a16:
+                b_ptrs += (BLOCK_SIZE_K // 2) * stride_bk
+            else:
+                b_ptrs += BLOCK_SIZE_K * stride_bk
 
     if MUL_ROUTED_WEIGHT:
         moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
@@ -694,6 +754,42 @@ def invoke_fused_moe_wna16_triton_kernel(
         )
     )
 
+    use_td = resolve_moe_gptq_awq_use_td()
+    if use_td and use_int8_w8a16:
+        # Triton-XPU 3.7.1 has a codegen bug (same family as the known
+        # unified-attention Q-scale-cast bug): a tensor-descriptor-loaded
+        # uint8 B tile, multiplied by a dequant scale and fed into tl.dot,
+        # produces garbage whenever BLOCK_SIZE_N >= 64 and BLOCK_SIZE_M !=
+        # 32 -- exactly this kernel's default wna16 config for int8, so it
+        # would silently corrupt output for the vast majority of real
+        # int8_w8a16 traffic. Force the pointer path for int8 until this is
+        # fixed upstream; int4 is unaffected (verified bit-exact, including
+        # the K-tail case) and keeps its TD path. There is no corresponding
+        # int8 branch in the kernel itself (use_td is always False here).
+        logger.warning_once(
+            "VLLM_TRITON_USE_TD is set but the tensor-descriptor path for "
+            "int8_w8a16 is disabled due to a known Triton-XPU codegen bug "
+            "(descriptor uint8 load * scale -> tl.dot corrupts output at "
+            "the default BLOCK_SIZE_N=64); falling back to the pointer "
+            "path. int4_w4a16 is unaffected and still uses TD."
+        )
+        use_td = False
+    elif use_td and use_int4_w4a16 and config["BLOCK_SIZE_K"] < 32:
+        # The int4 TD path's packed-byte descriptor needs its last dim
+        # (BLOCK_SIZE_K // 2 bytes) to be >= 16 bytes. get_moe_wna16_block_config
+        # never selects BLOCK_SIZE_K < 32 for this kernel, so this guard is
+        # currently unreachable in practice; kept defensive in case a
+        # caller supplies a smaller BLOCK_SIZE_K via override_config. Falls
+        # back to the pointer path rather than failing the launch -- TD is
+        # a perf opt-in, never a correctness requirement.
+        logger.warning_once(
+            "VLLM_TRITON_USE_TD is set but BLOCK_SIZE_K=%d is too small for "
+            "the int4 tensor-descriptor path (needs >= 32); falling back to "
+            "the pointer path for this launch.",
+            config["BLOCK_SIZE_K"],
+        )
+        use_td = False
+
     fused_moe_kernel_gptq_awq[grid](
         A,
         B,
@@ -729,6 +825,7 @@ def invoke_fused_moe_wna16_triton_kernel(
         has_zp=B_zp is not None,
         use_int4_w4a16=use_int4_w4a16,
         use_int8_w8a16=use_int8_w8a16,
+        USE_TD=use_td,
         **config,
     )
 

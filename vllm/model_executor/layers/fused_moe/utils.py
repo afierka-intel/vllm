@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn.functional as F
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
@@ -579,3 +580,26 @@ def enable_swap_ab(BLOCK_SIZE_M: int, BLOCK_SIZE_N: int) -> bool:
         and BLOCK_SIZE_M < 64
         and BLOCK_SIZE_N >= 64
     )
+
+
+def resolve_moe_gptq_awq_use_td() -> bool:
+    """Tri-state resolver for ``VLLM_TRITON_USE_TD`` (auto-on for XPU).
+
+    Gates the tensor-descriptor A/B load path in ``fused_moe_kernel_gptq_awq``
+    for ``use_int4_w4a16``. (``use_int8_w8a16`` is force-disabled at the
+    launch site regardless of this resolver's return value -- see
+    ``invoke_fused_moe_wna16_triton_kernel``.)
+
+    Only XPU is validated: on-device ``tl.make_tensor_descriptor(...).gather()``
+    requires Blackwell (sm_100+) on CUDA and fails PTX codegen on older
+    architectures (verified on H200/Hopper), so an explicit override can
+    never enable TD on a non-XPU platform even if the env var is set.
+    """
+    if not current_platform.is_xpu():
+        return False
+    if not hasattr(tl, "make_tensor_descriptor"):
+        return False
+    override = envs.VLLM_TRITON_USE_TD
+    if override is None:
+        return True
+    return override

@@ -1,0 +1,18 @@
+model_name: "Qwen/Qwen1.5-MoE-A2.7B-Chat-GPTQ-Int4"
+accuracy_threshold: 0.4473  # Measured on B70 (VLLM_TRITON_USE_TD=1,
+                            # --quantization moe_wna16), 1319 questions,
+                            # 5-shot, greedy decoding. Set to the baseline
+                            # measured value with the harness's own default
+                            # tolerance (0.08), matching the convention in
+                            # Qwen1.5-MoE-W4A16-CT.yaml.
+num_questions: 1319
+num_fewshot: 5
+startup_max_wait_seconds: 1800
+# --quantization moe_wna16 is required: this model's native shape is
+# Marlin-eligible, so without it MoE compute would dispatch to the native
+# XPUExpertsWNA16/Marlin path and never reach fused_moe_kernel_gptq_awq
+# (this PR's kernel) at all. See test_gptq_awq_moe_td.py's module docstring
+# for the full dispatch trace.
+server_args: "--enforce-eager --max-model-len 4096 --quantization moe_wna16"
+env:
+  VLLM_TRITON_USE_TD: "1"
