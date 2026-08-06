@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
+from packaging import version
 
 import vllm.envs as envs
 from vllm import _custom_ops as ops
@@ -591,6 +592,56 @@ def enable_swap_ab(BLOCK_SIZE_M: int, BLOCK_SIZE_N: int) -> bool:
     )
 
 
+_MIN_TRITON_XPU_FOR_INT8_TD = "3.7.2"
+
+# tensor_descriptor.gather() asserts at least this many rows in the gathered
+# tile, so a TD launch needs BLOCK_SIZE_M >= 8.
+TD_MIN_GATHER_ROWS = 8
+
+
+@functools.cache
+def xpu_int8_td_toolchain_unsupported_reason() -> str | None:
+    """Why int8 TD must not run on *this XPU toolchain*, or ``None`` if it can.
+
+    triton-xpu < 3.7.2 corrupts a descriptor-loaded uint8 B tile that is
+    multiplied by a dequant scale and fed to ``tl.dot`` whenever
+    ``BLOCK_SIZE_N >= 64`` and ``BLOCK_SIZE_M != 32`` -- exactly what
+    ``get_moe_wna16_block_config`` selects for int8 outside batch-1, so it
+    yields silently wrong numerics rather than failing. Fixed in 3.7.2, see
+    intel/intel-xpu-backend-for-triton#7510.
+
+    ``docker/Dockerfile.xpu`` pins 3.7.2, but ``requirements/xpu.txt`` does not
+    (Triton arrives via ``torch``'s XPU index), so a pip install can still land
+    on an affected version. Checked at runtime rather than trusting the pin,
+    since TD is auto-on for XPU. int4 is unaffected.
+
+    Deliberately XPU-scoped: the miscompile is in the Intel Triton backend, so
+    non-XPU toolchains are not checked here and return ``None``. Cached because
+    the answer cannot change within a process and this sits on a per-forward
+    launch path.
+    """
+    if not current_platform.is_xpu():
+        return None
+    unknown = "the installed Triton version could not be determined"
+    try:
+        import triton
+
+        installed = str(triton.__version__)
+        # Intel builds can carry non-PEP-440 suffixes (e.g. "3.7.2-xpu"), which
+        # make version.parse raise -- keep it inside the guard so an unparsable
+        # version falls back to the pointer path instead of crashing the engine.
+        too_old = version.parse(installed) < version.parse(_MIN_TRITON_XPU_FOR_INT8_TD)
+    except (ImportError, AttributeError, version.InvalidVersion):
+        return unknown
+    if too_old:
+        return (
+            f"triton-xpu {installed} miscompiles it (fixed in "
+            f"{_MIN_TRITON_XPU_FOR_INT8_TD}, see "
+            "intel/intel-xpu-backend-for-triton#7510)"
+        )
+    return None
+
+
 def moe_use_td_hw_supported() -> bool:
     """Whether the current device can run the TD (gather) path of
     ``fused_moe_kernel`` (ignores the ``VLLM_TRITON_USE_TD`` override).
@@ -637,9 +688,11 @@ def warn_if_moe_use_td_ineffective(
     """One-shot warning when ``VLLM_TRITON_USE_TD`` is set but ignored.
 
     Fires when the user set the env explicitly and either (a) the active
-    MoE backend is not the fused Triton kernel, or (b) the model is
-    quantized (the TD path falls back to the pointer path under any
-    quantization).
+    MoE backend is not the fused Triton kernel, or (b) the weights are
+    quantized in a scheme ``fused_moe_kernel`` has no TD path for -- which is
+    every scheme reaching it, including the ungrouped ``int8_w8a16`` produced
+    by ``oracle/int8.py``. Grouped WNA16 has a TD path, but it lives in
+    ``fused_moe_kernel_gptq_awq`` and is warned about by its own launcher.
     """
     global _warned_moe_use_td_ineffective
     if _warned_moe_use_td_ineffective:
@@ -656,9 +709,8 @@ def warn_if_moe_use_td_ineffective(
         )
     else:
         reason = (
-            "the model uses quantized MoE weights; the TD path is "
-            "currently restricted to non-quantized weights and falls "
-            "back to the pointer path"
+            "this MoE layer's quantization scheme has no tensor-descriptor "
+            "path in fused_moe_kernel and falls back to the pointer path"
         )
     logger.warning(
         "VLLM_TRITON_USE_TD is set to %s but %s.",
