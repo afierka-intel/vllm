@@ -71,6 +71,15 @@ def register_weight_loader_v2_supported_method(cls):
     return cls
 
 
+# Checkpoint tensors a layer may legitimately leave unregistered, and which are
+# therefore safe to skip rather than load. `bias` is the only such name today:
+# `ColumnParallelLinear` calls `register_parameter("bias", None)` when built with
+# `bias=False`, while exporters emit the tensor anyway. Every other unregistered
+# tensor carries information (a scale, a permutation, packed weights) that the
+# layer would silently run without, so it is rejected instead of skipped.
+_OPTIONAL_CHECKPOINT_TENSORS = frozenset(("bias",))
+
+
 def adjust_marlin_shard(
     param: Parameter,
     shard_size: int,
@@ -81,6 +90,47 @@ def adjust_marlin_shard(
         return shard_size, shard_offset
 
     return shard_size * marlin_tile_size, shard_offset * marlin_tile_size
+
+
+def _resolve_loadable_param(
+    layer: torch.nn.Module,
+    name: str,
+) -> Parameter | None:
+    """Resolve a checkpoint tensor name to the param it loads into.
+
+    Returns None for a tensor the caller should skip, i.e. a `bias` on a layer
+    built with `bias=False`. The allowlist is deliberately limited to that one
+    name: skipping anything else would drop information the layer needs and let
+    it run with silently wrong numerics, so unknown names are rejected instead.
+
+    Raises:
+        ValueError: if `name` is neither a registered param nor a known
+            optional tensor, since loading it would otherwise fail deep
+            inside `weight_loader` with an opaque AttributeError.
+    """
+    if "." in name:
+        submodule, _, attr = name.rpartition(".")
+        target = layer.get_submodule(submodule)
+    else:
+        attr = name
+        target = layer
+
+    # `register_parameter(name, None)` is how an unused optional param is
+    # declared, so absent and registered-as-None both mean "nothing to load".
+    param = getattr(target, attr, None)
+    if param is not None:
+        return param
+
+    if attr in _OPTIONAL_CHECKPOINT_TENSORS:
+        return None
+
+    raise ValueError(
+        f"Checkpoint tensor '{name}' does not match any parameter registered "
+        f"on {type(layer).__name__} '{layer.prefix}', so the checkpoint and the "
+        "layer's quantization config disagree. Add the name to "
+        "_OPTIONAL_CHECKPOINT_TENSORS only if this layer genuinely does not "
+        "consume the tensor."
+    )
 
 
 def adjust_block_scale_shard(
@@ -942,14 +992,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         for name, loaded_weight in weights:
             shard_id = getattr(loaded_weight, "shard_id", None)
             self.validate_shard_id(shard_id)
-            # Load into self if name is not an attr of self or its submodules
-            param: Parameter
-            if "." in name:
-                submodule, _, attr = name.rpartition(".")
-                param = getattr(self.get_submodule(submodule), attr, self)
-            else:
-                param = getattr(self, name, self)
-            if param is None and name == "bias":
+            param = _resolve_loadable_param(self, name)
+            if param is None:
                 continue
             param.weight_loader(param, loaded_weight, shard_id)
             logger.debug(
@@ -1296,14 +1340,8 @@ class QKVParallelLinear(ColumnParallelLinear):
         for name, loaded_weight in weights:
             shard_id = getattr(loaded_weight, "shard_id", None)
             self.validate_shard_id(shard_id)
-            # Load into self if name is not an attr of self or its submodules
-            param: Parameter
-            if "." in name:
-                submodule, _, attr = name.rpartition(".")
-                param = getattr(self.get_submodule(submodule), attr, self)
-            else:
-                param = getattr(self, name, self)
-            if param is None and name == "bias":
+            param = _resolve_loadable_param(self, name)
+            if param is None:
                 continue
             param.weight_loader(param, loaded_weight, shard_id)
             logger.debug(
