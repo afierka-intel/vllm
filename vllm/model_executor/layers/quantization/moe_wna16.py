@@ -159,7 +159,16 @@ class MoeWNA16Config(QuantizationConfig):
 
         awq_min_capability = AutoAWQConfig.get_min_capability()
 
-        gptq_compatible = quant_method == "gptq" and not desc_act and num_bits in [4, 8]
+        # MoeWNA16Method only supports per-channel int8 (see the group_size
+        # assert in MoeWNA16Method.__init__), so do not claim a grouped 8-bit
+        # checkpoint is convertible -- otherwise the failure surfaces as an
+        # assert deep in layer construction instead of a config error.
+        group_size = quant_config.get("group_size")
+        gptq_compatible = (
+            quant_method == "gptq"
+            and not desc_act
+            and (num_bits == 4 or (num_bits == 8 and group_size in (-1, None)))
+        )
         awq_compatible = (
             quant_method == "awq"
             and num_bits == 4
@@ -222,7 +231,12 @@ class MoeWNA16Method(FusedMoEMethodBase):
             else:
                 scale = kInt4StaticGroupScale
         elif num_bits == 8:
-            assert group_size == -1
+            if group_size != -1:
+                raise ValueError(
+                    "moe_wna16 supports int8 MoE weights only with "
+                    f"group_size=-1 (per-channel), got {group_size}. Use "
+                    "--quantization gptq_marlin for grouped int8 MoE."
+                )
             quant_type = INT8_DTYPE
             scale = kInt8StaticGroupScale
         else:
