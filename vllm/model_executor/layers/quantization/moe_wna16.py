@@ -222,7 +222,6 @@ class MoeWNA16Method(FusedMoEMethodBase):
             else:
                 scale = kInt4StaticGroupScale
         elif num_bits == 8:
-            assert group_size == -1
             quant_type = INT8_DTYPE
             scale = kInt8StaticGroupScale
         else:
@@ -253,6 +252,14 @@ class MoeWNA16Method(FusedMoEMethodBase):
         bit8_pack_factor = self.quant_config.bit8_pack_factor
         group_size = self.quant_config.group_size
         group_size_div_factor = 1
+
+        # group_size == -1 means per-channel: one scale per output row, i.e. a
+        # single group spanning the whole reduction axis. The loop below cannot
+        # normalise it (x % -1 == 0 for every x, so it exits immediately and
+        # leaves a negative divisor for the scale shapes), so map it to the
+        # axis length up front.
+        if group_size == -1:
+            group_size = min(intermediate_size_per_partition, hidden_size)
 
         # make intermediate_size and hidden_size divisible by group_size
         # we reduce the group size to ensure that
