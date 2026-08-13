@@ -203,3 +203,46 @@ def test_moe_wna16_uses_humming_quant_config(monkeypatch):
     )
 
     assert method.get_fused_moe_quant_config(layer) is quant_config
+
+
+@pytest.mark.parametrize("hidden,intermediate", [(2048, 768), (2048, 512)])
+def test_moe_wna16_grouped_int8_scale_group_counts(hidden, intermediate):
+    """Grouped int8 must allocate one scale group per group_size along each
+    reduction axis, independently for w13 (K=hidden) and w2 (K=intermediate).
+
+    Shapes use hidden != intermediate so a single shared divisor cannot satisfy
+    both, which is what makes the assertion meaningful.
+    """
+    group_size = 128
+    quant_config = MoeWNA16Config(
+        linear_quant_method="gptq",
+        weight_bits=8,
+        group_size=group_size,
+        has_zp=False,
+        lm_head_quantized=False,
+        modules_to_not_convert=None,
+        full_config={},
+    )
+    from tests.kernels.moe.utils import make_dummy_moe_config
+
+    # On XPU the WNA16 priority list is [XPU] alone and XPUExpertsWNA16 accepts
+    # int4 only, so request TRITON explicitly to keep this test device-neutral.
+    moe_config = make_dummy_moe_config(
+        num_experts=8, hidden_dim=hidden, intermediate_size=intermediate
+    )
+    moe_config.moe_backend = "triton"
+    method = moe_wna16.MoeWNA16Method(quant_config, moe_config)
+
+    layer = torch.nn.Module()
+    method.create_weights(
+        layer,
+        8,
+        hidden,
+        intermediate,
+        torch.bfloat16,
+        weight_loader=lambda *a, **k: None,
+    )
+
+    assert layer.group_size == group_size
+    assert layer.w13_scales.shape[-1] == hidden // group_size
+    assert layer.w2_scales.shape[-1] == intermediate // group_size
