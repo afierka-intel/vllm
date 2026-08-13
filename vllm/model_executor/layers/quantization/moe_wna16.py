@@ -222,7 +222,6 @@ class MoeWNA16Method(FusedMoEMethodBase):
             else:
                 scale = kInt4StaticGroupScale
         elif num_bits == 8:
-            assert group_size == -1
             quant_type = INT8_DTYPE
             scale = kInt8StaticGroupScale
         else:
@@ -254,17 +253,30 @@ class MoeWNA16Method(FusedMoEMethodBase):
         group_size = self.quant_config.group_size
         group_size_div_factor = 1
 
-        # make intermediate_size and hidden_size divisible by group_size
-        # we reduce the group size to ensure that
-        # and we would repeat the loaded_weight later
-        while intermediate_size_per_partition % group_size or hidden_size % group_size:
-            group_size = group_size // 2
-            group_size_div_factor *= 2
-            assert group_size >= 32
+        # group_size == -1 is per-channel: one scale per output row, i.e. a
+        # single group on each reduction axis independently. The loop below
+        # cannot express that (it shares one divisor between the two axes, and
+        # x % -1 == 0 makes it exit immediately), so handle it separately, as
+        # AutoGPTQMoEMethod and CompressedTensorsWNA16MoEMethod already do.
+        per_channel = group_size == -1
+        if per_channel:
+            num_groups_w13 = num_groups_w2 = 1
+            strategy = FusedMoeWeightScaleSupported.CHANNEL.value
+        else:
+            # make intermediate_size and hidden_size divisible by group_size
+            # we reduce the group size to ensure that
+            # and we would repeat the loaded_weight later
+            while (
+                intermediate_size_per_partition % group_size or hidden_size % group_size
+            ):
+                group_size = group_size // 2
+                group_size_div_factor *= 2
+                assert group_size >= 32
+            num_groups_w13 = hidden_size // group_size
+            num_groups_w2 = intermediate_size_per_partition // group_size
+            strategy = FusedMoeWeightScaleSupported.GROUP.value
         layer.group_size = group_size
         layer.group_size_div_factor = group_size_div_factor
-
-        strategy = FusedMoeWeightScaleSupported.GROUP.value
         extra_weight_attrs.update({"quant_method": strategy, "is_transposed": False})
 
         assert "weight_loader" in extra_weight_attrs
@@ -302,7 +314,7 @@ class MoeWNA16Method(FusedMoEMethodBase):
             torch.zeros(
                 num_experts,
                 self.moe.w13_num_shards * intermediate_size_per_partition,
-                hidden_size // group_size,
+                num_groups_w13,
                 dtype=params_dtype,
             ),
             requires_grad=False,
@@ -314,7 +326,7 @@ class MoeWNA16Method(FusedMoEMethodBase):
             torch.zeros(
                 num_experts,
                 hidden_size,
-                intermediate_size_per_partition // group_size,
+                num_groups_w2,
                 dtype=params_dtype,
             ),
             requires_grad=False,
@@ -329,7 +341,7 @@ class MoeWNA16Method(FusedMoEMethodBase):
                     self.moe.w13_num_shards
                     * intermediate_size_per_partition
                     // bit8_pack_factor,
-                    hidden_size // group_size,
+                    num_groups_w13,
                     dtype=torch.uint8,
                 ),
                 requires_grad=False,
@@ -341,7 +353,7 @@ class MoeWNA16Method(FusedMoEMethodBase):
                 torch.zeros(
                     num_experts,
                     hidden_size // bit8_pack_factor,
-                    intermediate_size_per_partition // group_size,
+                    num_groups_w2,
                     dtype=torch.uint8,
                 ),
                 requires_grad=False,
