@@ -16,6 +16,7 @@ from torch.nn import Parameter
 from torch.nn import functional as F
 
 import vllm.model_executor.layers.fused_moe  # noqa
+import vllm.model_executor.layers.fused_moe.fused_moe as fused_moe_module
 from tests.kernels.moe.utils import (
     fused_moe,
     make_dummy_moe_config,
@@ -416,6 +417,81 @@ def test_fused_moe(
             use_compile=use_compile,
             use_cudagraph=use_cudagraph,
         )
+
+
+def _record_use_td_kwarg(monkeypatch, hw_supported: bool) -> bool:
+    """Return the ``USE_TD`` kwarg the fused MoE launcher would pass.
+
+    The kernel launch itself is replaced by a recorder, so this exercises the
+    gating decision on any device capability -- including the one where the
+    TD path cannot compile, which is exactly where the gate matters.
+    """
+    recorded: dict[str, Any] = {}
+
+    class _KernelRecorder:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                recorded.update(kwargs)
+
+            return launch
+
+    monkeypatch.setattr(fused_moe_module, "fused_moe_kernel", _KernelRecorder())
+    monkeypatch.setattr(
+        fused_moe_module, "moe_use_td_hw_supported", lambda: hw_supported
+    )
+    monkeypatch.setenv("VLLM_TRITON_USE_TD", "1")
+    # Force the resolver too: an in-process EngineCore earlier in this pytest
+    # process calls envs.enable_envs_cache(), after which the setenv above is
+    # invisible and the resolver would report False. The subject here is the
+    # hardware gate, so pin its input rather than depend on test ordering.
+    monkeypatch.setattr(fused_moe_module, "resolve_moe_use_td", lambda: True)
+
+    m, n, k, e, topk = 8, 32, 64, 4, 2
+    dtype = torch.bfloat16
+    # K % BLOCK_SIZE_K == 0, so the K-alignment fallback further down the
+    # launcher cannot mask the hardware gate under test.
+    config = {
+        "BLOCK_SIZE_M": 16,
+        "BLOCK_SIZE_N": 32,
+        "BLOCK_SIZE_K": 32,
+        "GROUP_SIZE_M": 1,
+    }
+
+    fused_moe_module.invoke_fused_moe_triton_kernel(
+        torch.zeros((m, k), device=DEVICE_TYPE, dtype=dtype),
+        torch.zeros((e, n, k), device=DEVICE_TYPE, dtype=dtype),
+        torch.zeros((m, topk, n), device=DEVICE_TYPE, dtype=dtype),
+        None,  # A_scale
+        None,  # B_scale: None means unquantized, the only case with a TD path
+        torch.ones((m, topk), device=DEVICE_TYPE, dtype=torch.float32),
+        torch.zeros(m * topk, device=DEVICE_TYPE, dtype=torch.int32),
+        torch.zeros(1, device=DEVICE_TYPE, dtype=torch.int32),
+        torch.tensor([m * topk], device=DEVICE_TYPE, dtype=torch.int32),
+        mul_routed_weight=False,
+        top_k=topk,
+        config=config,
+        compute_type=tl.bfloat16,
+        use_fp8_w8a8=False,
+        use_int8_w8a8=False,
+        use_int8_w8a16=False,
+        use_int4_w4a16=False,
+        per_channel_quant=False,
+    )
+
+    assert "USE_TD" in recorded, "launcher did not reach the kernel"
+    return recorded["USE_TD"]
+
+
+def test_fused_moe_td_gated_on_hw_support(monkeypatch):
+    """``VLLM_TRITON_USE_TD=1`` must not enable TD where it cannot compile.
+
+    The A-load uses ``tensor_descriptor.gather``, which lowers to
+    ``tile::gather4`` (sm100+ or XPU). Before the gate, forcing the env var on
+    e.g. sm90 reached the kernel with ``USE_TD=True`` and died in ptxas.
+    """
+    # Control: the gate must not disable TD where the hardware supports it.
+    assert _record_use_td_kwarg(monkeypatch, hw_supported=True) is True
+    assert _record_use_td_kwarg(monkeypatch, hw_supported=False) is False
 
 
 def test_fused_moe_int64_overflow(workspace_init):

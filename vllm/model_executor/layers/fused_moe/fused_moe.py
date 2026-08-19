@@ -28,6 +28,7 @@ from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
 from vllm.model_executor.layers.fused_moe.utils import (
     enable_swap_ab,
     moe_kernel_quantize_input,
+    moe_use_td_hw_supported,
     resolve_moe_use_td,
     warn_if_moe_use_td_ineffective,
 )
@@ -798,6 +799,15 @@ def invoke_fused_moe_triton_kernel(
 
     # TD path is unvalidated under quantization; fall back to the pointer path.
     use_td = resolve_moe_use_td() and not is_quantized
+    if use_td and not moe_use_td_hw_supported():
+        # The A-load uses descriptor.gather(), which needs sm100+ or XPU --
+        # without this check, VLLM_TRITON_USE_TD=1 on sm90 fails in ptxas.
+        logger.warning_once(
+            "Disabling VLLM_TRITON_USE_TD for this MoE launch: the "
+            "tensor-descriptor path gathers A with tensor_descriptor.gather(), "
+            "which requires XPU or NVIDIA Blackwell (sm100+)."
+        )
+        use_td = False
     if use_td:
         # The TD path builds a tensor descriptor inside the kernel, which
         # requires a PyTorch-backed scratch allocator to be registered
