@@ -35,11 +35,14 @@ import torch
 from packaging import version
 
 from vllm.platforms import current_platform
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 
 is_hip_ = current_platform.is_rocm()
 
 logger = logging.getLogger(__name__)
+
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
 
 # Only print the following warnings when triton version < 3.2.0.
 # The issue won't affect performance or accuracy.
@@ -311,6 +314,7 @@ def _fwd_grouped_kernel_stage1(
     Lk: tl.constexpr,
     Lv: tl.constexpr,
     IS_MLA: tl.constexpr = False,
+    USE_TD: tl.constexpr = False,
 ):
     cur_batch = tl.program_id(0)
     cur_head_id = tl.program_id(1)
@@ -329,26 +333,55 @@ def _fwd_grouped_kernel_stage1(
     cur_batch_seq_len = tl.load(B_Seqlen + cur_batch)
     cur_batch_req_idx = cur_batch
 
-    offs_q = cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_d[None, :]
-    q = tl.load(
-        Q + offs_q,
-        mask=(mask_h[:, None]) & (mask_d[None, :]),
-        other=0.0,
-        cache_modifier=".ca",
-    )
+    if USE_TD:
+        # Q head-dim axis is contiguous, so the [BLOCK_H, BLOCK_DMODEL] tile is
+        # one descriptor load on the per-batch slice. Rows past q_head_num and
+        # columns past Lk read as 0, which is what mask_h/mask_d do. Rows inside
+        # the tile but past VALID_BLOCK_H hold neighbouring heads instead of 0;
+        # every consumer of them is masked (qk -> -inf, store masked by mask_h),
+        # and rows are independent in the dot/softmax/acc, so the result is
+        # unchanged.
+        q_desc = tl.make_tensor_descriptor(
+            Q + cur_batch * stride_qbs,
+            shape=[q_head_num, Lk],
+            strides=[stride_qh, 1],
+            block_shape=[BLOCK_H, BLOCK_DMODEL],
+        )
+        q = q_desc.load([cur_head_id * VALID_BLOCK_H, 0])
+    else:
+        offs_q = (
+            cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_d[None, :]
+        )
+        q = tl.load(
+            Q + offs_q,
+            mask=(mask_h[:, None]) & (mask_d[None, :]),
+            other=0.0,
+            cache_modifier=".ca",
+        )
 
     if BLOCK_DPE > 0:
         offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
         mask_dpe = offs_dpe < Lk
-        off_qpe = (
-            cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_dpe[None, :]
-        )
-        qpe = tl.load(
-            Q + off_qpe,
-            mask=(mask_h[:, None]) & (mask_dpe[None, :]),
-            other=0.0,
-            cache_modifier=".ca",
-        )
+        if USE_TD:
+            qpe_desc = tl.make_tensor_descriptor(
+                Q + cur_batch * stride_qbs,
+                shape=[q_head_num, Lk],
+                strides=[stride_qh, 1],
+                block_shape=[BLOCK_H, BLOCK_DPE],
+            )
+            qpe = qpe_desc.load([cur_head_id * VALID_BLOCK_H, BLOCK_DMODEL])
+        else:
+            off_qpe = (
+                cur_batch * stride_qbs
+                + cur_head[:, None] * stride_qh
+                + offs_dpe[None, :]
+            )
+            qpe = tl.load(
+                Q + off_qpe,
+                mask=(mask_h[:, None]) & (mask_dpe[None, :]),
+                other=0.0,
+                cache_modifier=".ca",
+            )
 
     kv_len_per_split = tl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
     split_kv_start = kv_len_per_split * split_kv_id
@@ -531,6 +564,28 @@ def _decode_grouped_att_m_fwd(
         # exceeds 101376 bytes limit
         num_stages = 1
 
+    # Tensor descriptors cover the Q / Q-PE tile loads only: their inner axis
+    # (head dim) is contiguous and the tile is exactly [BLOCK_H, BLOCK_DMODEL].
+    # K/V tiles are gathered page-by-page through Req_to_tokens, so they are
+    # not expressible as a descriptor and stay on the pointer path.
+    q_elem = q.element_size()
+    use_td = (
+        use_tensor_descriptor()
+        and q.stride(-1) == 1
+        and q.data_ptr() % 16 == 0
+        and (Lk * q_elem) % 16 == 0
+        and (q.stride(0) * q_elem) % 16 == 0
+        and (q.stride(1) * q_elem) % 16 == 0
+        and (BLOCK_H & (BLOCK_H - 1)) == 0
+        and (BLOCK_DMODEL & (BLOCK_DMODEL - 1)) == 0
+        and (BLOCK_DPE & (BLOCK_DPE - 1)) == 0
+        and BLOCK_DMODEL * q_elem >= 16
+        and (BLOCK_DPE == 0 or BLOCK_DPE * q_elem >= 16)
+    )
+    if use_td and q.device not in _TD_ALLOCATOR_DEVICES:
+        set_triton_allocator(q.device)
+        _TD_ALLOCATOR_DEVICES.add(q.device)
+
     _fwd_grouped_kernel_stage1[grid](
         q,
         k_buffer,
@@ -568,6 +623,7 @@ def _decode_grouped_att_m_fwd(
         Lk=Lk,
         Lv=Lv,
         IS_MLA=is_mla,
+        USE_TD=use_td,
         **extra_kargs,
     )
 
