@@ -5,8 +5,11 @@ import torch
 from einops import rearrange
 
 from vllm.platforms import current_platform
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
 
 
 @triton.jit
@@ -609,6 +612,7 @@ def _linear_attn_decode_kernel(
     cache_d1_stride,
     pad_slot_id: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     """
     Kernel for linear attention decoding with KV cache.
@@ -662,7 +666,18 @@ def _linear_attn_decode_kernel(
     # Apply decay to previous KV cache
     ratio = tl.exp(-ratio)
     kv_ptr = kv_cache_ptr + cache_offset + cache_d_offsets
-    kv_cache_old = tl.load(kv_ptr, mask=kv_mask, other=0.0)
+    if USE_TD:
+        # [D, D] state slab of this (slot, head); the descriptor tile is the
+        # same [D, BLOCK_SIZE] window the pointer path loads and stores.
+        kv_desc = tl.make_tensor_descriptor(
+            base=kv_cache_ptr + cache_offset,
+            shape=(D, D),
+            strides=(cache_d0_stride, 1),
+            block_shape=(D, BLOCK_SIZE),
+        )
+        kv_cache_old = kv_desc.load([0, pid_d * BLOCK_SIZE])
+    else:
+        kv_cache_old = tl.load(kv_ptr, mask=kv_mask, other=0.0)
     kv_outer = kv_outer + ratio * kv_cache_old
 
     # Compute attention output
@@ -670,7 +685,13 @@ def _linear_attn_decode_kernel(
     output = tl.sum(output, axis=0)
 
     # Update KV cache and store output
-    tl.store(kv_ptr, kv_outer, mask=kv_mask)
+    if USE_TD:
+        kv_desc.store(
+            [0, pid_d * BLOCK_SIZE],
+            kv_outer.to(kv_cache_ptr.dtype.element_ty),
+        )
+    else:
+        tl.store(kv_ptr, kv_outer, mask=kv_mask)
     tl.store(output_ptr + q_offset + v_d_offsets, output, mask=v_mask)
 
 
@@ -682,6 +703,7 @@ def linear_decode_forward_triton(
     slope_rate: torch.Tensor,
     slot_idx: torch.Tensor,
     BLOCK_SIZE: int = 32,
+    use_td: bool | None = None,
 ) -> torch.Tensor:
     """
     Perform linear attention decoding using Triton kernels.
@@ -694,6 +716,7 @@ def linear_decode_forward_triton(
         slope_rate: Decay rate tensor
         slot_idx: Slot indices for batches
         BLOCK_SIZE: Size of blocks for processing
+        use_td: Force the tensor-descriptor path on/off (None = auto)
 
     Returns:
         output: Attention output tensor
@@ -717,6 +740,25 @@ def linear_decode_forward_triton(
     cache_d0_stride = kv_caches.stride(2)
     cache_d1_stride = kv_caches.stride(3)
 
+    # TD covers the [D, BLOCK_SIZE] KV-state tile, which dominates this
+    # kernel's traffic. Gated on inner-dim contiguity plus 16-byte alignment
+    # of the tile, the row stride and the per-(slot, head) base offset.
+    cache_esize = kv_caches.element_size()
+    use_td = (
+        use_tensor_descriptor(use_td)
+        and cache_d1_stride == 1
+        and (D & (D - 1)) == 0
+        and (BLOCK_SIZE & (BLOCK_SIZE - 1)) == 0
+        and D % BLOCK_SIZE == 0
+        and (BLOCK_SIZE * cache_esize) % 16 == 0
+        and (cache_d0_stride * cache_esize) % 16 == 0
+        and (cache_h_stride * cache_esize) % 16 == 0
+        and (cache_b_stride * cache_esize) % 16 == 0
+    )
+    if use_td and kv_caches.device not in _TD_ALLOCATOR_DEVICES:
+        set_triton_allocator(kv_caches.device)
+        _TD_ALLOCATOR_DEVICES.add(kv_caches.device)
+
     # Launch the kernel
     _linear_attn_decode_kernel[grid](
         q,
@@ -735,6 +777,7 @@ def linear_decode_forward_triton(
         cache_d1_stride,
         pad_slot_id=PAD_SLOT_ID,
         BLOCK_SIZE=BLOCK_SIZE,
+        USE_TD=use_td,
     )
 
     # Reshape output and return
