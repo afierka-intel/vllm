@@ -9,8 +9,11 @@ import numpy as np
 import torch
 
 from vllm.platforms import current_platform
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
+
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
 
 
 @triton.jit(do_not_specialize_on_alignment=["num_cache_lines"])
@@ -60,6 +63,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     launch_pdl: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     conv_states_ptr = initial_states_ptr
     conv_state_indices_ptr = cache_indices_ptr
@@ -81,7 +85,8 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     chunk_offset = tl.load(token_chunk_offset_ptr + tl.program_id(0))
 
     # BLOCK_N elements along the feature-dimension (channel)
-    idx_feats = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    idx_feats_base = tl.program_id(1) * BLOCK_N
+    idx_feats = idx_feats_base + tl.arange(0, BLOCK_N)
 
     if idx_seq == pad_slot_id:
         if launch_pdl:
@@ -154,6 +159,22 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
 
     w_base = w_ptr + (idx_feats * stride_w_dim)  # [BLOCK_N,]
 
+    if USE_TD:
+        # 'x' and 'o' are channel-last, so describe the [seqlen, dim] plane of
+        # this sequence: descriptor bounds then match the token/feature masks.
+        x_desc_state = tl.make_tensor_descriptor(
+            x_ptr + sequence_start_index * stride_x_token,
+            shape=[seqlen, dim],
+            strides=[stride_x_token, 1],
+            block_shape=[NP2_STATELEN, BLOCK_N],
+        )
+        o_desc_row = tl.make_tensor_descriptor(
+            o_ptr + sequence_start_index * stride_o_token,
+            shape=[seqlen, dim],
+            strides=[stride_o_token, 1],
+            block_shape=[1, BLOCK_N],
+        )
+
     # Does 2 things:
     # 1. READ prior-block init-state data - [done by every Triton programs]
     # 2. update conv_state with new data [only by the Triton program handles chunk_offset=0]
@@ -211,17 +232,22 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
             idx_tokens_last = (seqlen - state_len) + tl.arange(
                 0, NP2_STATELEN
             )  # [BLOCK_M]
-            x_ptrs = (
-                x_ptr
-                + ((sequence_start_index + idx_tokens_last) * stride_x_token)[:, None]
-                + (idx_feats * stride_x_dim)[None, :]
-            )  # [BLOCK_M,BLOCK_N,]
-            mask_x = (
-                (idx_tokens_last >= 0)[:, None]
-                & (idx_tokens_last < seqlen)[:, None]
-                & (idx_feats < dim)[None, :]
-            )  # token-index  # token-index  # feature-index
-            loaded_x = tl.load(x_ptrs, mask_x, 0.0)
+            if USE_TD:
+                loaded_x = x_desc_state.load([seqlen - state_len, idx_feats_base])
+            else:
+                x_ptrs = (
+                    x_ptr
+                    + ((sequence_start_index + idx_tokens_last) * stride_x_token)[
+                        :, None
+                    ]
+                    + (idx_feats * stride_x_dim)[None, :]
+                )  # [BLOCK_M,BLOCK_N,]
+                mask_x = (
+                    (idx_tokens_last >= 0)[:, None]
+                    & (idx_tokens_last < seqlen)[:, None]
+                    & (idx_feats < dim)[None, :]
+                )  # token-index  # token-index  # feature-index
+                loaded_x = tl.load(x_ptrs, mask_x, 0.0)
             idx_tokens_conv = tl.arange(0, NP2_STATELEN)  # [BLOCK_M]
 
             # Compute the offset where the last block should be written in the conv_states
@@ -469,13 +495,19 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         mask_1d = (idx_token < segment_len) & (
             idx_feats < dim
         )  # token-index  # feature-index
-        o_ptrs = (
-            o_ptr
-            + (sequence_start_index + token_offset + idx_token) * stride_o_token
-            + (idx_feats * stride_o_dim)
-        )
+        if USE_TD:
+            o_desc_row.store(
+                [token_offset + idx_token, idx_feats_base],
+                acc.to(o_ptr.dtype.element_ty)[None, :],
+            )
+        else:
+            o_ptrs = (
+                o_ptr
+                + (sequence_start_index + token_offset + idx_token) * stride_o_token
+                + (idx_feats * stride_o_dim)
+            )
 
-        tl.store(o_ptrs, acc, mask=mask_1d)
+            tl.store(o_ptrs, acc, mask=mask_1d)
 
 
 def causal_conv1d_fn(
@@ -709,6 +741,23 @@ def causal_conv1d_fn(
         batch_ptr = batch_ptr.to(x.device)
         token_chunk_offset_ptr = token_chunk_offset_ptr.to(x.device)
 
+    # TD path needs channel-last 'x'/'o' (innermost stride 1) plus 16B-aligned
+    # bases and row pitches.
+    elem_size = x.element_size()
+    use_td = (
+        use_tensor_descriptor()
+        and stride_x_dim == 1
+        and out.stride(0) == 1
+        and (dim * elem_size) % 16 == 0
+        and (stride_x_token * elem_size) % 16 == 0
+        and (stride_o_token * elem_size) % 16 == 0
+        and (x.data_ptr() % 16) == 0
+        and (out.data_ptr() % 16) == 0
+    )
+    if use_td and x.device not in _TD_ALLOCATOR_DEVICES:
+        set_triton_allocator(x.device)
+        _TD_ALLOCATOR_DEVICES.add(x.device)
+
     _causal_conv1d_fwd_kernel[grid](
         # Pointers to matrices
         x,
@@ -753,6 +802,7 @@ def causal_conv1d_fn(
         # launch_cooperative_grid=True
         BLOCK_M=BLOCK_M,
         BLOCK_N=256,
+        USE_TD=use_td,
         num_stages=2,
         launch_pdl=current_platform.is_arch_support_pdl(),
     )
