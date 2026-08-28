@@ -5,8 +5,11 @@ import torch
 from einops import rearrange
 
 from vllm.platforms import current_platform
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
 
 
 @triton.jit
@@ -156,6 +159,7 @@ def _fwd_kv_parallel(
     NUM_FBLOCK: tl.constexpr,
     CBLOCK: tl.constexpr,
     NUM_CBLOCK: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     # This kernel computes the key-value outer
     # products for each block in parallel
@@ -213,20 +217,55 @@ def _fwd_kv_parallel(
     num_blocks = min(tl.cdiv(split_n, CBLOCK), NUM_CBLOCK)
     k_decay_ptr += (NUM_CBLOCK - num_blocks) * CBLOCK
 
+    if USE_TD:
+        # K / V / KV are contiguous in their feature dim, so describe the
+        # [n, d] / [n, e] / [NUM_BLOCK * d, e] view of this batch-head
+        # slice.  Feature offsets are always 0 here (NUM_FBLOCK == 1, gated
+        # host side).  The j == 0 tile starts at a negative row when the
+        # block is ragged; descriptor reads outside ``shape`` return zeros
+        # and those rows are masked out below in either case.
+        k_desc = tl.make_tensor_descriptor(
+            K + k_offset,
+            shape=[n, d],
+            strides=[d, 1],
+            block_shape=[CBLOCK, D_FBLOCK],
+        )
+        v_desc = tl.make_tensor_descriptor(
+            V + v_offset,
+            shape=[n, e],
+            strides=[e, 1],
+            block_shape=[CBLOCK, E_FBLOCK],
+        )
+        kv_desc = tl.make_tensor_descriptor(
+            KV + kv_offset,
+            shape=[NUM_BLOCK * d, e],
+            strides=[e, 1],
+            block_shape=[D_FBLOCK, E_FBLOCK],
+        )
+        td_row = block_offset - left_shift
+
     # Process all sub-blocks in the current block
     for j in range(num_blocks):
         left_bound = (1 - j) * left_shift
         # Load key and value, handling boundary conditions
-        k_trans = tl.load(
-            K_trans_block_ptr - left_shift * d,
-            mask=kv_index[None, :] >= left_bound,
-            other=0.0,
-        )
-        v = tl.load(
-            V_block_ptr - left_shift * e,
-            mask=kv_index[:, None] >= left_bound,
-            other=0.0,
-        )
+        if USE_TD:
+            k_trans = tl.trans(k_desc.load([td_row + j * CBLOCK, 0]))
+            k_trans = tl.where(
+                kv_index[None, :] >= left_bound, k_trans, tl.zeros_like(k_trans)
+            )
+            v = v_desc.load([td_row + j * CBLOCK, 0])
+            v = tl.where(kv_index[:, None] >= left_bound, v, tl.zeros_like(v))
+        else:
+            k_trans = tl.load(
+                K_trans_block_ptr - left_shift * d,
+                mask=kv_index[None, :] >= left_bound,
+                other=0.0,
+            )
+            v = tl.load(
+                V_block_ptr - left_shift * e,
+                mask=kv_index[:, None] >= left_bound,
+                other=0.0,
+            )
 
         # Load decay factor and compute weighted key-value outer product
         k_decay = tl.load(k_decay_ptr)
@@ -244,7 +283,10 @@ def _fwd_kv_parallel(
         k_decay_ptr += CBLOCK
 
     # Store the result
-    tl.store(KV_block_ptr, kv.to(KV_block_ptr.dtype.element_ty))
+    if USE_TD:
+        kv_desc.store([off_block * d, 0], kv.to(KV.dtype.element_ty))
+    else:
+        tl.store(KV_block_ptr, kv.to(KV_block_ptr.dtype.element_ty))
 
 
 @triton.jit
@@ -465,6 +507,24 @@ class _attention(torch.autograd.Function):
 
         # Step 2: Compute key-value outer products for each block in parallel
         kv = torch.empty((b, h, NUM_BLOCK, d, e), dtype=torch.float32, device=q.device)
+
+        # Tensor descriptors need a unit inner stride (k/v/kv are contiguous),
+        # power-of-two block shapes and 16-byte aligned rows. NUM_FBLOCK == 1
+        # is required because the kernel indexes the full feature dim.
+        use_td = (
+            use_tensor_descriptor()
+            and NUM_FBLOCK == 1
+            and (CBLOCK & (CBLOCK - 1)) == 0
+            and (D_FBLOCK & (D_FBLOCK - 1)) == 0
+            and (E_FBLOCK & (E_FBLOCK - 1)) == 0
+            and (d * k.element_size()) % 16 == 0
+            and (e * v.element_size()) % 16 == 0
+            and (e * kv.element_size()) % 16 == 0
+        )
+        if use_td and q.device not in _TD_ALLOCATOR_DEVICES:
+            set_triton_allocator(q.device)
+            _TD_ALLOCATOR_DEVICES.add(q.device)
+
         grid = (b * h, NUM_BLOCK)
         _fwd_kv_parallel[grid](
             k,
@@ -483,6 +543,7 @@ class _attention(torch.autograd.Function):
             NUM_FBLOCK=NUM_FBLOCK,
             CBLOCK=CBLOCK,
             NUM_CBLOCK=NUM_CBLOCK,
+            USE_TD=use_td,
         )
 
         # Step 3: Reduce key-value outer products
