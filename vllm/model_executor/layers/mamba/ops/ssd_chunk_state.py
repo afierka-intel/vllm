@@ -9,9 +9,12 @@
 import torch
 
 from vllm.model_executor.layers.mamba.ops.triton_helpers import fast_exp
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 
 from .mamba_ssm import softplus
+
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
 
 
 @triton.autotune(
@@ -55,6 +58,7 @@ def _chunk_cumsum_fwd_kernel(
     HAS_DT_BIAS: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr,
     BLOCK_SIZE_CHUNK: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     # if dt is long, may cause problems, so use 64 bit
     # https://github.com/triton-lang/triton/issues/1058
@@ -82,6 +86,25 @@ def _chunk_cumsum_fwd_kernel(
     )
     chunk_size_limit = chunk_seqlen_end - chunk_seqlen_start
 
+    if USE_TD:
+        # Both outputs are (nheads, nchunks, chunk_size) with a unit csize
+        # stride, so the per-chunk slice is a plain (nheads, chunk_size) 2D
+        # descriptor. The wrapper gates on BLOCK_SIZE_CHUNK == chunk_size so
+        # the inner axis matches exactly; descriptor stores do not mask a
+        # padded inner tail.
+        dt_out_desc = tl.make_tensor_descriptor(
+            base=dt_out_ptr,
+            shape=(nheads, chunk_size),
+            strides=(stride_dt_out_head, 1),
+            block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_CHUNK),
+        )
+        dA_cs_desc = tl.make_tensor_descriptor(
+            base=dA_cumsum_ptr,
+            shape=(nheads, chunk_size),
+            strides=(stride_dA_cs_head, 1),
+            block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_CHUNK),
+        )
+
     dt = tl.load(
         dt_ptrs,
         mask=(offs_h[:, None] < nheads) & (offs_c[None, :] < chunk_size_limit),
@@ -99,19 +122,27 @@ def _chunk_cumsum_fwd_kernel(
     dt = tl.where(
         (offs_h[:, None] < nheads) & (offs_c[None, :] < chunk_size_limit), dt, 0.0
     )
-    tl.store(
-        dt_out_ptrs,
-        dt,
-        mask=(offs_h[:, None] < nheads) & (offs_c[None, :] < chunk_size),
-    )
+    if USE_TD:
+        dt_out_desc.store([pid_h * BLOCK_SIZE_H, 0], dt.to(dt_out_ptr.dtype.element_ty))
+    else:
+        tl.store(
+            dt_out_ptrs,
+            dt,
+            mask=(offs_h[:, None] < nheads) & (offs_c[None, :] < chunk_size),
+        )
     A = tl.load(A_ptrs, mask=offs_h < nheads, other=0.0).to(tl.float32)
     dA = dt * A[:, None]
     dA_cs = tl.cumsum(dA, axis=1)
-    tl.store(
-        dA_cs_ptrs,
-        dA_cs,
-        mask=(offs_h[:, None] < nheads) & (offs_c[None, :] < chunk_size),
-    )
+    if USE_TD:
+        dA_cs_desc.store(
+            [pid_h * BLOCK_SIZE_H, 0], dA_cs.to(dA_cumsum_ptr.dtype.element_ty)
+        )
+    else:
+        tl.store(
+            dA_cs_ptrs,
+            dA_cs,
+            mask=(offs_h[:, None] < nheads) & (offs_c[None, :] < chunk_size),
+        )
 
 
 @triton.autotune(
@@ -308,6 +339,7 @@ def _chunk_cumsum_fwd(
     dt_bias=None,
     dt_softplus=False,
     dt_limit=(0.0, float("inf")),
+    use_td=None,
 ):
     seqlen, nheads = dt.shape
     assert A.shape == (nheads,)
@@ -321,6 +353,25 @@ def _chunk_cumsum_fwd(
         nheads, nchunks, chunk_size, device=dt.device, dtype=torch.float32
     )
     grid_chunk_cs = lambda META: (nchunks, triton.cdiv(nheads, META["BLOCK_SIZE_H"]))
+
+    block_size_chunk = triton.next_power_of_2(chunk_size)
+    # TD output stores; gated on unit csize stride, an exact inner-axis match
+    # (descriptor stores do not mask a padded inner tail) and 16-byte aligned
+    # outer strides.
+    use_td = (
+        use_tensor_descriptor(use_td)
+        and block_size_chunk == chunk_size
+        and dt_out.stride(2) == 1
+        and dA_cumsum.stride(2) == 1
+        and (dt_out.stride(0) * dt_out.element_size()) % 16 == 0
+        and (dt_out.stride(1) * dt_out.element_size()) % 16 == 0
+        and (dA_cumsum.stride(0) * dA_cumsum.element_size()) % 16 == 0
+        and (dA_cumsum.stride(1) * dA_cumsum.element_size()) % 16 == 0
+    )
+    if use_td and dt.device not in _TD_ALLOCATOR_DEVICES:
+        set_triton_allocator(dt.device)
+        _TD_ALLOCATOR_DEVICES.add(dt.device)
+
     with torch.accelerator.device_index(dt.device.index):
         _chunk_cumsum_fwd_kernel[grid_chunk_cs](
             dt_ptr=dt,
@@ -345,7 +396,8 @@ def _chunk_cumsum_fwd(
             stride_dA_cs_csize=dA_cumsum.stride(2),
             DT_SOFTPLUS=dt_softplus,
             HAS_DT_BIAS=dt_bias is not None,
-            BLOCK_SIZE_CHUNK=triton.next_power_of_2(chunk_size),
+            BLOCK_SIZE_CHUNK=block_size_chunk,
+            USE_TD=use_td,
         )
     return dA_cumsum, dt_out
 
