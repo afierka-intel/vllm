@@ -5,8 +5,11 @@ import torch
 from einops import rearrange
 
 from vllm.platforms import current_platform
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
 
 
 @triton.jit
@@ -24,6 +27,7 @@ def _fwd_diag_kernel(
     BLOCK: tl.constexpr,
     NUM_BLOCK,
     CBLOCK: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     # This kernel computes the diagonal blocks of the attention matrix
     # Each diagonal block represents attention
@@ -83,6 +87,30 @@ def _fwd_diag_kernel(
         + tl.arange(0, e)[None, :]
     )
 
+    # Describe only the [n, d] / [n, e] slice owned by this batch-head, so that
+    # rows past the sequence end are zero-filled exactly like the masks below.
+    if USE_TD:
+        q_desc = tl.make_tensor_descriptor(
+            Q + qk_offset,
+            shape=[n, d],
+            strides=[d, 1],
+            block_shape=[CBLOCK, d],
+        )
+        # K is read transposed, whose innermost stride is d, so describe the
+        # row-major buffer and transpose each tile instead.
+        k_desc = tl.make_tensor_descriptor(
+            K + qk_offset,
+            shape=[n, d],
+            strides=[d, 1],
+            block_shape=[CBLOCK, d],
+        )
+        v_desc = tl.make_tensor_descriptor(
+            V + v_offset,
+            shape=[n, e],
+            strides=[e, 1],
+            block_shape=[CBLOCK, e],
+        )
+
     # Load the decay rate for the current head
     S_block_ptr = S + off_h
     s = tl.load(S_block_ptr)
@@ -91,9 +119,12 @@ def _fwd_diag_kernel(
     q_index = tl.arange(0, CBLOCK) + i * CBLOCK
 
     # Load query values
-    q = tl.load(Q_block_ptr, mask=block_offset + q_index[:, None] < n, other=0.0).to(
-        tl.float32
-    )
+    if USE_TD:
+        q = q_desc.load([block_offset + cblock_offset, 0]).to(tl.float32)
+    else:
+        q = tl.load(
+            Q_block_ptr, mask=block_offset + q_index[:, None] < n, other=0.0
+        ).to(tl.float32)
 
     # Initialize output accumulator
     qkv = tl.zeros([CBLOCK, e], dtype=tl.float32)
@@ -109,16 +140,21 @@ def _fwd_diag_kernel(
         decay = tl.exp(s_index)
 
         # Load key and value
-        k_trans = tl.load(
-            K_trans_block_ptr,
-            mask=block_offset + kv_index[None, :] < n,
-            other=0.0,
-        ).to(tl.float32)
-        v = tl.load(
-            V_block_ptr,
-            mask=block_offset + kv_index[:, None] < n,
-            other=0.0,
-        ).to(tl.float32)
+        if USE_TD:
+            kv_row = block_offset + j * CBLOCK
+            k_trans = tl.trans(k_desc.load([kv_row, 0])).to(tl.float32)
+            v = v_desc.load([kv_row, 0]).to(tl.float32)
+        else:
+            k_trans = tl.load(
+                K_trans_block_ptr,
+                mask=block_offset + kv_index[None, :] < n,
+                other=0.0,
+            ).to(tl.float32)
+            v = tl.load(
+                V_block_ptr,
+                mask=block_offset + kv_index[:, None] < n,
+                other=0.0,
+            ).to(tl.float32)
 
         # Compute attention scores and apply decay
         qk = tl.dot(q, k_trans) * decay
@@ -435,6 +471,22 @@ class _attention(torch.autograd.Function):
         k_decay = torch.exp(-s * (BLOCK - array.reshape(1, -1)))
 
         # Step 1: Compute diagonal blocks of attention
+        # TD tiles span the whole feature dim, so gate on inner-dim contiguity,
+        # power-of-two features and 16-byte row alignment.
+        diag_use_td = (
+            use_tensor_descriptor()
+            and q.stride(-1) == 1
+            and k.stride(-1) == 1
+            and v.stride(-1) == 1
+            and (d & (d - 1)) == 0
+            and (e & (e - 1)) == 0
+            and (d * q.element_size()) % 16 == 0
+            and (e * v.element_size()) % 16 == 0
+        )
+        if diag_use_td and q.device not in _TD_ALLOCATOR_DEVICES:
+            set_triton_allocator(q.device)
+            _TD_ALLOCATOR_DEVICES.add(q.device)
+
         grid = (b * h * NUM_BLOCK, NUM_CBLOCK)
         _fwd_diag_kernel[grid](
             q,
@@ -450,6 +502,7 @@ class _attention(torch.autograd.Function):
             BLOCK=BLOCK,
             NUM_BLOCK=NUM_BLOCK,
             CBLOCK=CBLOCK,
+            USE_TD=diag_use_td,
         )
 
         # Set feature block sizes
