@@ -11,11 +11,14 @@ import os
 
 import torch
 
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 
 BT_LIST = [8, 16, 32, 64, 128]
 
 USE_DEFAULT_FLA_NORM = int(os.getenv("USE_DEFAULT_FLA_NORM", "0"))
+
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
 
 
 @triton.autotune(
@@ -65,14 +68,27 @@ def l2norm_fwd_kernel(
     D: tl.constexpr,
     BT: tl.constexpr,
     BD: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     i_t = tl.program_id(0)
-    p_x = tl.make_block_ptr(x, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    b_x = tl.load(p_x, boundary_check=(0, 1)).to(tl.float32)
+    if USE_TD:
+        x_desc = tl.make_tensor_descriptor(
+            x, shape=[T, D], strides=[D, 1], block_shape=[BT, BD]
+        )
+        b_x = x_desc.load([i_t * BT, 0]).to(tl.float32)
+    else:
+        p_x = tl.make_block_ptr(x, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
+        b_x = tl.load(p_x, boundary_check=(0, 1)).to(tl.float32)
     b_var = tl.sum(b_x * b_x, axis=1)
     b_y = b_x / tl.sqrt(b_var + eps)[:, None]
-    p_y = tl.make_block_ptr(y, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
+    if USE_TD:
+        y_desc = tl.make_tensor_descriptor(
+            y, shape=[T, D], strides=[D, 1], block_shape=[BT, BD]
+        )
+        y_desc.store([i_t * BT, 0], b_y.to(y.dtype.element_ty))
+    else:
+        p_y = tl.make_block_ptr(y, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
+        tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
 
 
 @triton.jit
@@ -130,6 +146,24 @@ def l2norm_fwd(
             def grid(meta):
                 return (triton.cdiv(T, meta["BT"]),)
 
+            # Descriptors need unit inner stride, a row stride that is a whole
+            # number of 16B lines, and 16B-aligned tiles for both operands.
+            use_td = (
+                use_tensor_descriptor()
+                and x.stride(-1) == 1
+                and y.stride(-1) == 1
+                and x.stride(0) == D
+                and y.stride(0) == D
+                and (D * x.element_size()) % 16 == 0
+                and (D * y.element_size()) % 16 == 0
+                and (BD * x.element_size()) % 16 == 0
+                and (BD * y.element_size()) % 16 == 0
+                and (BD & (BD - 1)) == 0
+            )
+            if use_td and x.device not in _TD_ALLOCATOR_DEVICES:
+                set_triton_allocator(x.device)
+                _TD_ALLOCATOR_DEVICES.add(x.device)
+
             l2norm_fwd_kernel[grid](
                 x,
                 y,
@@ -138,6 +172,7 @@ def l2norm_fwd(
                 T=T,
                 D=D,
                 BD=BD,
+                USE_TD=use_td,
             )
         else:
             l2norm_fwd_kernel1[(T,)](
