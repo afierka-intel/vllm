@@ -11,9 +11,12 @@ import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.utils import count_expert_num_tokens
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 from vllm.utils.deep_gemm import get_mk_alignment_for_contiguous_layout
 from vllm.utils.math_utils import round_up
+
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
 
 
 def expert_num_tokens_round_up_and_sum(
@@ -120,15 +123,26 @@ def _fwd_kernel_ep_scatter_1(
     BLOCK_E: tl.constexpr,
     BLOCK_EXPERT_NUM: tl.constexpr,
     ALIGN_M: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     cur_expert = tl.program_id(0)
 
     offset_cumsum = tl.arange(0, BLOCK_EXPERT_NUM)
-    tokens_per_expert = tl.load(
-        num_recv_tokens_per_expert + offset_cumsum,
-        mask=offset_cumsum < num_experts,
-        other=0,
-    )
+    if USE_TD:
+        # Descriptor reads past `num_experts` return 0, same as other=0.
+        ent_desc = tl.make_tensor_descriptor(
+            num_recv_tokens_per_expert,
+            shape=[num_experts],
+            strides=[1],
+            block_shape=[BLOCK_EXPERT_NUM],
+        )
+        tokens_per_expert = ent_desc.load([0])
+    else:
+        tokens_per_expert = tl.load(
+            num_recv_tokens_per_expert + offset_cumsum,
+            mask=offset_cumsum < num_experts,
+            other=0,
+        )
     # Round up to ALIGN_M so cumsum matches the workspace's per-expert slices.
     tokens_per_expert = ((tokens_per_expert + ALIGN_M - 1) // ALIGN_M) * ALIGN_M
     cumsum = tl.cumsum(tokens_per_expert) - tokens_per_expert
@@ -144,17 +158,34 @@ def _fwd_kernel_ep_scatter_1(
     m_indices_start_ptr = m_indices + cur_expert_start
     off_expert = tl.arange(0, BLOCK_E)
 
+    if USE_TD:
+        # cur_expert_start is a multiple of ALIGN_M, so the slice base keeps
+        # the descriptor 16B-aligned. Bounding the descriptor at the real
+        # token count makes the out-of-range tail stores drop, which is what
+        # the masked store below does.
+        mi_desc = tl.make_tensor_descriptor(
+            m_indices_start_ptr,
+            shape=[tl.maximum(cur_expert_token_num, 1)],
+            strides=[1],
+            block_shape=[BLOCK_E],
+        )
+        expert_tile = tl.zeros([BLOCK_E], dtype=m_indices.dtype.element_ty)
+        expert_tile += cur_expert.to(m_indices.dtype.element_ty)
+
     # any rows in the per-expert aligned region that do not correspond to
     # real tokens are left untouched here and should remain initialized to
     # -1 so DeepGEMM can skip them
     for start_m in tl.range(0, cur_expert_token_num, BLOCK_E):
-        offs = start_m + off_expert
-        mask = offs < cur_expert_token_num
-        tl.store(
-            m_indices_start_ptr + offs,
-            cur_expert,
-            mask=mask,
-        )
+        if USE_TD:
+            mi_desc.store([start_m], expert_tile)
+        else:
+            offs = start_m + off_expert
+            mask = offs < cur_expert_token_num
+            tl.store(
+                m_indices_start_ptr + offs,
+                cur_expert,
+                mask=mask,
+            )
 
 
 @triton.jit
@@ -286,6 +317,7 @@ def ep_scatter(
     align_m: int = 128,
     block_size: int = 128,
     pack_ue8m0: bool = False,
+    use_td: bool | None = None,
 ):
     # BLOCK_E is the m_indices fill-loop tile (masked), independent of align_m.
     BLOCK_E = 128
@@ -303,6 +335,28 @@ def ep_scatter(
     scale_hidden_size = hidden_size // BLOCK_D
     scale_packed_size = (scale_hidden_size + 3) // 4 if pack_ue8m0 else 1
 
+    # 1-D descriptors over the expert-count vector and the per-expert
+    # m_indices slice; both need a contiguous, 16B-aligned, <=256-element
+    # tile whose byte size is a multiple of 16.
+    block_expert_num = triton.next_power_of_2(num_experts)
+    ent_elem = num_recv_tokens_per_expert.element_size()
+    mi_elem = m_indices.element_size()
+    use_td = (
+        use_tensor_descriptor(use_td)
+        and num_recv_tokens_per_expert.stride(0) == 1
+        and m_indices.stride(0) == 1
+        and num_recv_tokens_per_expert.data_ptr() % 16 == 0
+        and m_indices.data_ptr() % 16 == 0
+        and block_expert_num <= 256
+        and (block_expert_num * ent_elem) % 16 == 0
+        and BLOCK_E <= 256
+        and (BLOCK_E * mi_elem) % 16 == 0
+        and (align_m * mi_elem) % 16 == 0
+    )
+    if use_td and m_indices.device not in _TD_ALLOCATOR_DEVICES:
+        set_triton_allocator(m_indices.device)
+        _TD_ALLOCATOR_DEVICES.add(m_indices.device)
+
     _fwd_kernel_ep_scatter_1[(grid,)](
         num_recv_tokens_per_expert,
         expert_start_loc,
@@ -310,8 +364,9 @@ def ep_scatter(
         num_experts=num_experts,
         num_warps=num_warps,
         BLOCK_E=BLOCK_E,
-        BLOCK_EXPERT_NUM=triton.next_power_of_2(num_experts),
+        BLOCK_EXPERT_NUM=block_expert_num,
         ALIGN_M=align_m,
+        USE_TD=use_td,
     )
 
     grid = min(recv_topk.shape[0], 1024 * 8)
