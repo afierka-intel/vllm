@@ -19,13 +19,16 @@ from vllm.third_party.flash_linear_attention.ops.index import prepare_chunk_indi
 from vllm.third_party.flash_linear_attention.ops.l2norm import l2norm_fwd
 from vllm.third_party.flash_linear_attention.ops.op import exp2, log
 from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE, is_amd
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 from vllm.utils.math_utils import RCP_LN2, cdiv, next_power_of_2
 
 from .chunk_intra import chunk_kda_fwd_intra
 
 BT_LIST_AUTOTUNE = [32, 64, 128]
 NUM_WARPS_AUTOTUNE = [2, 4, 8, 16] if is_amd else [4, 8, 16, 32]
+
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
 
 
 # num_stages=4 is excluded. The `u` loop has a trip count of 2 (V / BV), and a
@@ -853,6 +856,7 @@ def kda_gate_fwd_kernel(
     BD: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     i_t, i_h = tl.program_id(0), tl.program_id(1)
     n_t = i_t * BT
@@ -862,25 +866,42 @@ def kda_gate_fwd_kernel(
     stride_row = H * D
     stride_col = 1
 
-    g_ptr = tl.make_block_ptr(
-        base=g + i_h * D,
-        shape=(T, D),
-        strides=(stride_row, stride_col),
-        offsets=(n_t, 0),
-        block_shape=(BT, BD),
-        order=(1, 0),
-    )
+    if USE_TD:
+        # Head slice of the [T, H*D] buffer: rows are stride_row apart, the
+        # D columns are contiguous, so the head sub-tensor is describable.
+        g_desc = tl.make_tensor_descriptor(
+            g + i_h * D,
+            shape=[T, D],
+            strides=[stride_row, 1],
+            block_shape=[BT, BD],
+        )
+        y_desc = tl.make_tensor_descriptor(
+            y + i_h * D,
+            shape=[T, D],
+            strides=[stride_row, 1],
+            block_shape=[BT, BD],
+        )
+        b_g = g_desc.load([n_t, 0]).to(tl.float32)
+    else:
+        g_ptr = tl.make_block_ptr(
+            base=g + i_h * D,
+            shape=(T, D),
+            strides=(stride_row, stride_col),
+            offsets=(n_t, 0),
+            block_shape=(BT, BD),
+            order=(1, 0),
+        )
 
-    y_ptr = tl.make_block_ptr(
-        base=y + i_h * D,
-        shape=(T, D),
-        strides=(stride_row, stride_col),
-        offsets=(n_t, 0),
-        block_shape=(BT, BD),
-        order=(1, 0),
-    )
+        y_ptr = tl.make_block_ptr(
+            base=y + i_h * D,
+            shape=(T, D),
+            strides=(stride_row, stride_col),
+            offsets=(n_t, 0),
+            block_shape=(BT, BD),
+            order=(1, 0),
+        )
 
-    b_g = tl.load(g_ptr, boundary_check=(0, 1)).to(tl.float32)
+        b_g = tl.load(g_ptr, boundary_check=(0, 1)).to(tl.float32)
 
     if HAS_BIAS:
         n_d = tl.arange(0, BD)
@@ -898,7 +919,10 @@ def kda_gate_fwd_kernel(
         sp = tl.where(use_linear, b_g, (1.0 / beta) * log(1.0 + tl.exp(g_scaled)))
         b_y = -b_a * sp
 
-    tl.store(y_ptr, b_y.to(y.dtype.element_ty), boundary_check=(0, 1))
+    if USE_TD:
+        y_desc.store([n_t, 0], b_y.to(y.dtype.element_ty))
+    else:
+        tl.store(y_ptr, b_y.to(y.dtype.element_ty), boundary_check=(0, 1))
 
 
 def fused_kda_gate(
@@ -931,6 +955,22 @@ def fused_kda_gate(
     def grid(meta):
         return (cdiv(T, meta["BT"]), H)
 
+    bd = next_power_of_2(head_k_dim)
+    # TD tiles the [T, D] head slice; needs a contiguous inner dim plus
+    # 16B-aligned head offset, row pitch and tile width for both operands.
+    td_extents = (HD, head_k_dim, bd)
+    use_td = (
+        use_tensor_descriptor()
+        and g.stride() == (HD, 1)
+        and y.stride() == (HD, 1)
+        and (g.storage_offset() * g.element_size()) % 16 == 0
+        and all((n * g.element_size()) % 16 == 0 for n in td_extents)
+        and all((n * y.element_size()) % 16 == 0 for n in td_extents)
+    )
+    if use_td and g.device not in _TD_ALLOCATOR_DEVICES:
+        set_triton_allocator(g.device)
+        _TD_ALLOCATOR_DEVICES.add(g.device)
+
     kda_gate_fwd_kernel[grid](
         g,
         A,
@@ -942,9 +982,10 @@ def fused_kda_gate(
         T,
         H,
         head_k_dim,
-        BD=next_power_of_2(head_k_dim),
+        BD=bd,
         HAS_BIAS=g_bias is not None,
         USE_LOWER_BOUND=lower_bound is not None,
+        USE_TD=use_td,
     )
 
     y = y.view(*orig_shape, H, head_k_dim)
