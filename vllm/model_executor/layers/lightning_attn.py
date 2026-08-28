@@ -5,8 +5,11 @@ import torch
 from einops import rearrange
 
 from vllm.platforms import current_platform
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
 
 
 @triton.jit
@@ -328,6 +331,7 @@ def _fwd_none_diag_kernel(
     E_FBLOCK: tl.constexpr,
     CBLOCK: tl.constexpr,
     NUM_CBLOCK: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     # This kernel computes the non-diagonal blocks of the attention matrix
     # Each non-diagonal block represents attention
@@ -346,9 +350,12 @@ def _fwd_none_diag_kernel(
     block_offset = n_offset + c_offset
 
     # Calculate offsets for the current batch, head, and block
-    q_offset = off_bh * n * d + (n_offset + c_offset) * d
-    o_offset = off_bh * n * e + (n_offset + c_offset) * e + e_offset
-    kv_offset = off_bh * NUM_BLOCK * d * e + off_n * d * e + e_offset
+    q_base_offset = off_bh * n * d
+    o_base_offset = off_bh * n * e
+    kv_base_offset = off_bh * NUM_BLOCK * d * e + off_n * d * e
+    q_offset = q_base_offset + (n_offset + c_offset) * d
+    o_offset = o_base_offset + (n_offset + c_offset) * e + e_offset
+    kv_offset = kv_base_offset + e_offset
 
     # Calculate pointers to the query, output, and key-value tensors
     Q_block_ptr = (
@@ -364,6 +371,29 @@ def _fwd_none_diag_kernel(
         KV + kv_offset + tl.arange(0, d)[:, None] * e + tl.arange(0, E_FBLOCK)[None, :]
     )
 
+    # Q/Out/KV are inner-dim contiguous, so each tile maps 1:1 onto a
+    # descriptor over the [n, d] / [n, e] / [d, e] slice of this batch-head.
+    # Row clamping by the descriptor shape reproduces the q_index < n mask.
+    if USE_TD:
+        q_desc = tl.make_tensor_descriptor(
+            Q + q_base_offset,
+            shape=[n, d],
+            strides=[d, 1],
+            block_shape=[CBLOCK, d],
+        )
+        o_desc = tl.make_tensor_descriptor(
+            Out + o_base_offset,
+            shape=[n, e],
+            strides=[e, 1],
+            block_shape=[CBLOCK, E_FBLOCK],
+        )
+        kv_desc = tl.make_tensor_descriptor(
+            KV + kv_base_offset,
+            shape=[d, e],
+            strides=[e, 1],
+            block_shape=[d, E_FBLOCK],
+        )
+
     # Load the decay rate for the current head
     S_block_ptr = S + off_h
     s = tl.load(S_block_ptr)
@@ -371,11 +401,17 @@ def _fwd_none_diag_kernel(
     c_array = tl.arange(0, CBLOCK)
 
     # Load the key-value outer product for the current block
-    kv = tl.load(KV_block_ptr).to(tl.float32)
+    if USE_TD:
+        kv = kv_desc.load([0, e_offset]).to(tl.float32)
+    else:
+        kv = tl.load(KV_block_ptr).to(tl.float32)
     q_index = block_offset + tl.arange(0, CBLOCK)
 
     # Load query values
-    q = tl.load(Q_block_ptr, mask=q_index[:, None] < n, other=0.0).to(tl.float32)
+    if USE_TD:
+        q = q_desc.load([block_offset, 0]).to(tl.float32)
+    else:
+        q = tl.load(Q_block_ptr, mask=q_index[:, None] < n, other=0.0).to(tl.float32)
 
     # Compute decay factors for the current sub-block
     q_decay = tl.exp(-s.to(tl.float32) * (off_c * CBLOCK + c_array[:, None]))
@@ -384,15 +420,23 @@ def _fwd_none_diag_kernel(
     qkv_none_diag = tl.dot(q, kv) * q_decay
 
     # Load diagonal attention output (computed by _fwd_diag_kernel)
-    qkv_diag = tl.load(O_block_ptr, mask=q_index[:, None] < n, other=0.0).to(tl.float32)
+    if USE_TD:
+        qkv_diag = o_desc.load([block_offset, e_offset]).to(tl.float32)
+    else:
+        qkv_diag = tl.load(O_block_ptr, mask=q_index[:, None] < n, other=0.0).to(
+            tl.float32
+        )
 
     # Combine diagonal and non-diagonal attention outputs
     qkv = qkv_diag + qkv_none_diag
 
     # Store the result
-    tl.store(
-        O_block_ptr, qkv.to(O_block_ptr.dtype.element_ty), mask=q_index[:, None] < n
-    )
+    if USE_TD:
+        o_desc.store([block_offset, e_offset], qkv.to(Out.dtype.element_ty))
+    else:
+        tl.store(
+            O_block_ptr, qkv.to(O_block_ptr.dtype.element_ty), mask=q_index[:, None] < n
+        )
 
 
 class _attention(torch.autograd.Function):
@@ -504,6 +548,24 @@ class _attention(torch.autograd.Function):
         )
 
         # Step 4: Compute non-diagonal blocks of attention
+        # TD path needs fully contiguous Q/Out/KV plus 16-byte aligned rows
+        # and power-of-two descriptor block shapes.
+        use_td = (
+            use_tensor_descriptor()
+            and q.is_contiguous()
+            and o.is_contiguous()
+            and kv.is_contiguous()
+            and (d * q.element_size()) % 16 == 0
+            and (e * q.element_size()) % 16 == 0
+            and (e * kv.element_size()) % 16 == 0
+            and (d & (d - 1)) == 0
+            and (E_FBLOCK & (E_FBLOCK - 1)) == 0
+            and (CBLOCK & (CBLOCK - 1)) == 0
+        )
+        if use_td and q.device not in _TD_ALLOCATOR_DEVICES:
+            set_triton_allocator(q.device)
+            _TD_ALLOCATOR_DEVICES.add(q.device)
+
         grid = (b * h, NUM_BLOCK * NUM_CBLOCK)
         _fwd_none_diag_kernel[grid](
             q,
@@ -520,6 +582,7 @@ class _attention(torch.autograd.Function):
             E_FBLOCK=E_FBLOCK,
             CBLOCK=CBLOCK,
             NUM_CBLOCK=NUM_CBLOCK,
+            USE_TD=use_td,
         )
 
         # Save tensors for backward pass
