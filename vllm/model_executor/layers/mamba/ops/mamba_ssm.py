@@ -18,7 +18,8 @@ from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.ops.triton_helpers import fast_exp
 from vllm.platforms import current_platform
-from vllm.triton_utils import HAS_TRITON, tl, triton
+from vllm.triton_utils import HAS_TRITON, tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 from vllm.utils.platform_utils import get_device_name_as_file_name
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
@@ -28,6 +29,8 @@ if current_platform.is_xpu():
 logger = init_logger(__name__)
 
 TRITON3 = HAS_TRITON and (version.parse(triton.__version__) >= version.parse("3.0.0"))
+
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
 
 
 # ---------------------------------------------------------------------------
@@ -309,6 +312,8 @@ def _selective_scan_update_kernel(
     BLOCK_SIZE_DSTATE: tl.constexpr,
     USE_RS_ROUNDING: tl.constexpr,
     PHILOX_ROUNDS: tl.constexpr,
+    USE_TD: tl.constexpr = False,
+    USE_TD_A: tl.constexpr = False,
 ):
     pid_m = tl.program_id(axis=0)
     pid_b = tl.program_id(axis=1)
@@ -382,7 +387,29 @@ def _selective_scan_update_kernel(
     mask = (offs_m[:, None] < dim) & (offs_n[None, :] < dstate)
     if HAS_STATE_BATCH_INDICES:
         mask &= state_batch_idx != null_block_id
-    state = tl.load(state_ptrs, mask=mask, other=0.0).to(tl.float32)
+    if USE_TD:
+        if HAS_STATE_BATCH_INDICES:
+            # Null entries are zeroed below; clamp the descriptor base to block
+            # 0 so it never addresses outside the state tensor.
+            td_state_batch_idx = tl.where(
+                state_batch_idx == null_block_id, 0, state_batch_idx
+            )
+            td_state_ptr = state_ptr_base + (
+                td_state_batch_idx * stride_state_batch + pid_h * stride_state_head
+            )
+        else:
+            td_state_ptr = state_ptr
+        state_desc = tl.make_tensor_descriptor(
+            td_state_ptr,
+            shape=[dim, dstate],
+            strides=[stride_state_dim, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_DSTATE],
+        )
+        state = state_desc.load([pid_m * BLOCK_SIZE_M, 0]).to(tl.float32)
+        if HAS_STATE_BATCH_INDICES:
+            state = tl.where(state_batch_idx == null_block_id, 0.0, state)
+    else:
+        state = tl.load(state_ptrs, mask=mask, other=0.0).to(tl.float32)
 
     if HAS_DT_BIAS:
         dt_bias_ptrs = dt_bias_ptr + offs_m * stride_dt_bias_dim
@@ -390,6 +417,13 @@ def _selective_scan_update_kernel(
         D_ptr += pid_h * stride_D_head
         D_ptrs = D_ptr + offs_m * stride_D_dim
     A_ptrs = A_ptr + offs_m[:, None] * stride_A_dim + offs_n[None, :] * stride_A_dstate
+    if USE_TD_A:
+        A_desc = tl.make_tensor_descriptor(
+            A_ptr,
+            shape=[dim, dstate],
+            strides=[stride_A_dim, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_DSTATE],
+        )
 
     for i_t in range(seq_len):
         x_ptrs = x_ptr + offs_m * stride_x_dim
@@ -407,11 +441,14 @@ def _selective_scan_update_kernel(
                 dt += tl.load(dt_bias_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
             if DT_SOFTPLUS:
                 dt = softplus(dt)
-            A = tl.load(
-                A_ptrs,
-                mask=(offs_m[:, None] < dim) & (offs_n[None, :] < dstate),
-                other=0.0,
-            ).to(tl.float32)
+            if USE_TD_A:
+                A = A_desc.load([pid_m * BLOCK_SIZE_M, 0]).to(tl.float32)
+            else:
+                A = tl.load(
+                    A_ptrs,
+                    mask=(offs_m[:, None] < dim) & (offs_n[None, :] < dstate),
+                    other=0.0,
+                ).to(tl.float32)
             dA = fast_exp(A * dt[:, None])
         else:
             dt = tl.load(dt_ptr).to(tl.float32)
@@ -491,7 +528,21 @@ def _selective_scan_update_kernel(
             )
         else:
             state = state.to(dst_state_ptrs.dtype.element_ty)
-        tl.store(dst_state_ptrs, state, mask=mask)
+        if USE_TD:
+            dst_state_desc = tl.make_tensor_descriptor(
+                dst_state_ptr,
+                shape=[dim, dstate],
+                strides=[stride_state_dim, 1],
+                block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_DSTATE],
+            )
+            if HAS_STATE_BATCH_INDICES:
+                # Padded (null) entries must leave the state tensor untouched.
+                if state_batch_idx != null_block_id:
+                    dst_state_desc.store([pid_m * BLOCK_SIZE_M, 0], state)
+            else:
+                dst_state_desc.store([pid_m * BLOCK_SIZE_M, 0], state)
+        else:
+            tl.store(dst_state_ptrs, state, mask=mask)
 
 
 def selective_state_update(
@@ -636,6 +687,38 @@ def selective_state_update(
         else None
     )
 
+    # TD covers the [dim, dstate] state tile (load + write-back) and, when A is
+    # a real matrix, the A tile. Descriptors need an innermost stride of 1 plus
+    # 16-byte aligned base/strides and a 16-byte multiple innermost tile.
+    block_dstate = triton.next_power_of_2(dstate)
+    state_esz = state.element_size()
+    use_td = (
+        use_tensor_descriptor()
+        and BLOCK_SIZE_M <= 256
+        and (BLOCK_SIZE_M & (BLOCK_SIZE_M - 1)) == 0
+        and block_dstate <= 256
+        and state.stride(3) == 1
+        and state.stride(2) >= dstate
+        and state.data_ptr() % 16 == 0
+        and (block_dstate * state_esz) % 16 == 0
+        and (state.stride(0) * state_esz) % 16 == 0
+        and (state.stride(1) * state_esz) % 16 == 0
+        and (state.stride(2) * state_esz) % 16 == 0
+    )
+    A_esz = A.element_size()
+    use_td_A = (
+        use_td
+        and A.stride(2) == 1
+        and A.stride(1) >= dstate
+        and A.data_ptr() % 16 == 0
+        and (block_dstate * A_esz) % 16 == 0
+        and (A.stride(0) * A_esz) % 16 == 0
+        and (A.stride(1) * A_esz) % 16 == 0
+    )
+    if use_td and state.device not in _TD_ALLOCATOR_DEVICES:
+        set_triton_allocator(state.device)
+        _TD_ALLOCATOR_DEVICES.add(state.device)
+
     with torch.accelerator.device_index(x.device.index):
         _selective_scan_update_kernel[grid](
             state,
@@ -698,6 +781,8 @@ def selective_state_update(
             num_warps=num_warps,
             USE_RS_ROUNDING=enable_stochastic_rounding,
             PHILOX_ROUNDS=cache_philox_rounds,
+            USE_TD=use_td,
+            USE_TD_A=use_td_A,
         )
 
 
