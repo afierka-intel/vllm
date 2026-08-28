@@ -11,11 +11,14 @@ import os
 
 import torch
 
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 
 BT_LIST = [8, 16, 32, 64, 128]
 
 USE_DEFAULT_FLA_NORM = int(os.getenv("USE_DEFAULT_FLA_NORM", "0"))
+
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
 
 
 @triton.autotune(
@@ -77,7 +80,14 @@ def l2norm_fwd_kernel(
 
 @triton.jit
 def l2norm_fwd_kernel2(
-    X, Y, eps, M, N: tl.constexpr, BD: tl.constexpr, MBLOCK: tl.constexpr
+    X,
+    Y,
+    eps,
+    M,
+    N: tl.constexpr,
+    BD: tl.constexpr,
+    MBLOCK: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     xoffset = tl.program_id(0) * MBLOCK
     row_idx = xoffset + tl.arange(0, MBLOCK)[:, None]
@@ -85,11 +95,31 @@ def l2norm_fwd_kernel2(
     rindex = tl.arange(0, BD)[None, :]
     cmask = rindex < N
     mask = xmask & cmask
-    xs = tl.load(X + (rindex + N * row_idx), mask, other=0.0).to(tl.float32)
+    if USE_TD:
+        # Host gates TD on BD == N, so the row tail is the only masked edge and
+        # the descriptor clips/zero-fills it for us.
+        x_desc = tl.make_tensor_descriptor(
+            X,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[MBLOCK, BD],
+        )
+        xs = x_desc.load([xoffset, 0]).to(tl.float32)
+    else:
+        xs = tl.load(X + (rindex + N * row_idx), mask, other=0.0).to(tl.float32)
     square = tl.broadcast_to(xs * xs, [MBLOCK, BD])
     square_sum = tl.sum(tl.where(xmask, square, 0), 1)[:, None]
     rsqrt = tl.rsqrt(square_sum + eps)
-    tl.store(Y + (rindex + N * row_idx), xs * rsqrt, mask)
+    if USE_TD:
+        y_desc = tl.make_tensor_descriptor(
+            Y,
+            shape=[M, N],
+            strides=[N, 1],
+            block_shape=[MBLOCK, BD],
+        )
+        y_desc.store([xoffset, 0], (xs * rsqrt).to(Y.dtype.element_ty))
+    else:
+        tl.store(Y + (rindex + N * row_idx), xs * rsqrt, mask)
 
 
 def l2norm_fwd(
@@ -114,6 +144,21 @@ def l2norm_fwd(
     if not USE_DEFAULT_FLA_NORM:
         MBLOCK = 32
         # M, N = x.shape
+        # Descriptors need a unit inner stride, a 16B-aligned base and row
+        # pitch, an exact [MBLOCK, BD] tile (BD == D, so D a power of two)
+        # and an inner block within the 256-element descriptor box limit.
+        use_td = (
+            use_tensor_descriptor()
+            and x.stride(-1) == 1
+            and D == BD
+            and D <= 256
+            and (D * x.element_size()) % 16 == 0
+            and (D * y.element_size()) % 16 == 0
+            and x.data_ptr() % 16 == 0
+        )
+        if use_td and x.device not in _TD_ALLOCATOR_DEVICES:
+            set_triton_allocator(x.device)
+            _TD_ALLOCATOR_DEVICES.add(x.device)
         l2norm_fwd_kernel2[(triton.cdiv(T, MBLOCK),)](
             x,
             y,
@@ -122,6 +167,7 @@ def l2norm_fwd(
             D,
             BD,
             MBLOCK,
+            USE_TD=use_td,
         )
     else:
         if D <= 512:
