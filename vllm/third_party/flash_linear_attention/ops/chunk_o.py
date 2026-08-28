@@ -12,7 +12,8 @@
 
 import torch
 
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 
 from .index import prepare_chunk_indices
 from .op import exp
@@ -20,6 +21,18 @@ from .utils import FLA_CHUNK_SIZE, check_shared_mem, is_nvidia_hopper
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
+
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
+
+
+def _td_ok(t: torch.Tensor, *dims: int) -> bool:
+    # Descriptors need unit inner stride and 16-byte aligned base/rows.
+    es = t.element_size()
+    return (
+        t.stride(-1) == 1
+        and (t.storage_offset() * es) % 16 == 0
+        and all((d * es) % 16 == 0 for d in dims)
+    )
 
 
 @triton.heuristics(
@@ -59,6 +72,7 @@ def chunk_fwd_kernel_o(
     BV: tl.constexpr,
     USE_G: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
@@ -90,22 +104,43 @@ def chunk_fwd_kernel_o(
     b_o = tl.zeros([BT, BV], dtype=tl.float32)
     b_A = tl.zeros([BT, BT], dtype=tl.float32)
 
+    if USE_TD:
+        desc_q = tl.make_tensor_descriptor(
+            q, shape=[T, K], strides=[Hg * K, 1], block_shape=[BT, BK]
+        )
+        # k is consumed as [BK, BT]; describe the T-major buffer and transpose
+        # each tile, since the [K, T] view is not contiguous in its last dim.
+        desc_k = tl.make_tensor_descriptor(
+            k, shape=[T, K], strides=[Hg * K, 1], block_shape=[BT, BK]
+        )
+        desc_h = tl.make_tensor_descriptor(
+            h, shape=[V, K], strides=[K, 1], block_shape=[BV, BK]
+        )
+
     for i_k in range(tl.cdiv(K, BK)):
-        p_q = tl.make_block_ptr(
-            q, (T, K), (Hg * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
-        )
-        p_k = tl.make_block_ptr(
-            k, (K, T), (1, Hg * K), (i_k * BK, i_t * BT), (BK, BT), (0, 1)
-        )
-        p_h = tl.make_block_ptr(
-            h, (V, K), (K, 1), (i_v * BV, i_k * BK), (BV, BK), (1, 0)
-        )
-        # [BT, BK]
-        b_q = tl.load(p_q, boundary_check=(0, 1))
-        # [BK, BT]
-        b_k = tl.load(p_k, boundary_check=(0, 1))
-        # [BV, BK]
-        b_h = tl.load(p_h, boundary_check=(0, 1))
+        if USE_TD:
+            # [BT, BK]
+            b_q = desc_q.load([i_t * BT, i_k * BK])
+            # [BK, BT]
+            b_k = tl.trans(desc_k.load([i_t * BT, i_k * BK]))
+            # [BV, BK]
+            b_h = desc_h.load([i_v * BV, i_k * BK])
+        else:
+            p_q = tl.make_block_ptr(
+                q, (T, K), (Hg * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
+            )
+            p_k = tl.make_block_ptr(
+                k, (K, T), (1, Hg * K), (i_k * BK, i_t * BT), (BK, BT), (0, 1)
+            )
+            p_h = tl.make_block_ptr(
+                h, (V, K), (K, 1), (i_v * BV, i_k * BK), (BV, BK), (1, 0)
+            )
+            # [BT, BK]
+            b_q = tl.load(p_q, boundary_check=(0, 1))
+            # [BK, BT]
+            b_k = tl.load(p_k, boundary_check=(0, 1))
+            # [BV, BK]
+            b_h = tl.load(p_h, boundary_check=(0, 1))
 
         # [BT, BK] @ [BK, BV] -> [BT, BV]
         b_o += tl.dot(b_q, tl.trans(b_h))
@@ -124,18 +159,30 @@ def chunk_fwd_kernel_o(
     m_A = (o_t[:, None] >= o_t[None, :]) & (m_t[:, None] & m_t)
     b_A = tl.where(m_A, b_A, 0)
 
-    p_v = tl.make_block_ptr(
-        v, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
-    )
-    p_o = tl.make_block_ptr(
-        o, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
-    )
-    b_v = tl.load(p_v, boundary_check=(0, 1))
+    if USE_TD:
+        desc_v = tl.make_tensor_descriptor(
+            v, shape=[T, V], strides=[H * V, 1], block_shape=[BT, BV]
+        )
+        b_v = desc_v.load([i_t * BT, i_v * BV])
+    else:
+        p_v = tl.make_block_ptr(
+            v, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
+        )
+        b_v = tl.load(p_v, boundary_check=(0, 1))
 
     # to fix mma -> mma layout conversion
     # already solved by triton v3.2 or higher
     b_o = b_o * scale + tl.dot(b_A.to(b_v.dtype), b_v) * scale
-    tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+    if USE_TD:
+        desc_o = tl.make_tensor_descriptor(
+            o, shape=[T, V], strides=[H * V, 1], block_shape=[BT, BV]
+        )
+        desc_o.store([i_t * BT, i_v * BV], b_o.to(o.dtype.element_ty))
+    else:
+        p_o = tl.make_block_ptr(
+            o, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
+        )
+        tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
 def chunk_fwd_o(
@@ -170,6 +217,22 @@ def chunk_fwd_o(
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), NT, B * H)
 
+    # Descriptors cover q/k/v/o/h. g keeps block pointers: its stride is H,
+    # so no descriptor can describe it.
+    use_td = (
+        use_tensor_descriptor()
+        and BT & (BT - 1) == 0
+        and _td_ok(q, Hg * K, K)
+        and _td_ok(k, Hg * K, K)
+        and _td_ok(v, H * V, V)
+        and _td_ok(o, H * V, V)
+        and _td_ok(h, K)
+        and h.stride(-2) == K
+    )
+    if use_td and q.device not in _TD_ALLOCATOR_DEVICES:
+        set_triton_allocator(q.device)
+        _TD_ALLOCATOR_DEVICES.add(q.device)
+
     chunk_fwd_kernel_o[grid](
         q,
         k,
@@ -186,5 +249,6 @@ def chunk_fwd_o(
         K=K,
         V=V,
         BT=BT,
+        USE_TD=use_td,
     )
     return o
