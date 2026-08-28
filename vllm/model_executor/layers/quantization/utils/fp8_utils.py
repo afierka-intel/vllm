@@ -28,7 +28,8 @@ from vllm.model_executor.parameter import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 from vllm.utils.deep_gemm import (
     get_tma_aligned_size,
     is_deep_gemm_e8m0_used,
@@ -69,6 +70,8 @@ def _per_token_group_quant_fp8(
     # Num columns of y
     y_num_columns,
     y_row_stride,
+    # Num rows of y; only read by the tensor-descriptor path
+    y_num_rows,
     # Avoid to divide zero
     eps,
     # Information for float8
@@ -77,6 +80,7 @@ def _per_token_group_quant_fp8(
     use_ue8m0: tl.constexpr,
     # Meta-parameters
     BLOCK: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     """A Triton-accelerated function to perform per-token-group
     quantization on a tensor.
@@ -88,6 +92,23 @@ def _per_token_group_quant_fp8(
     g_id = tl.program_id(0)
     row = g_id // groups_per_row
     row_g_id = g_id % groups_per_row
+
+    if USE_TD:
+        # Built from the base pointers, before the offset math below. The host
+        # gate guarantees BLOCK == group_size, a stride-1 inner dim and 16-byte
+        # aligned rows, so each program covers one in-bounds, unmasked tile.
+        y_desc = tl.make_tensor_descriptor(
+            y_ptr,
+            shape=[y_num_rows, y_num_columns],
+            strides=[y_row_stride, 1],
+            block_shape=[1, BLOCK],
+        )
+        y_q_desc = tl.make_tensor_descriptor(
+            y_q_ptr,
+            shape=[y_num_rows, y_num_columns],
+            strides=[y_num_columns, 1],
+            block_shape=[1, BLOCK],
+        )
 
     # Ensure offset calculations use int64 to prevent overflow
     y_ptr_offset = (row.to(tl.int64) * y_row_stride) + (
@@ -102,7 +123,10 @@ def _per_token_group_quant_fp8(
     cols = tl.arange(0, BLOCK)  # N <= BLOCK
     mask = cols < group_size
 
-    y = tl.load(y_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    if USE_TD:
+        y = y_desc.load([row, row_g_id * group_size]).reshape(BLOCK).to(tl.float32)
+    else:
+        y = tl.load(y_ptr + cols, mask=mask, other=0.0).to(tl.float32)
     # Quant
     # Use multiply-by-reciprocal instead of division to match PyTorch's
     # tensor/scalar division precision (GPU fast-division for constexpr
@@ -113,7 +137,10 @@ def _per_token_group_quant_fp8(
     y_s = tl.math.exp2(tl.ceil(tl.log2(scale_raw))) if use_ue8m0 else scale_raw
     y_q = tl.clamp(y / y_s, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
 
-    tl.store(y_q_ptr + cols, y_q, mask=mask)
+    if USE_TD:
+        y_q_desc.store([row, row_g_id * group_size], y_q.reshape(1, BLOCK))
+    else:
+        tl.store(y_q_ptr + cols, y_q, mask=mask)
     tl.store(y_s_ptr, y_s)
 
 
@@ -641,6 +668,24 @@ def per_token_group_quant_fp8(
             num_stages=num_stages,
         )
     else:
+        # Descriptors need a stride-1 inner dim, a tile that covers the group
+        # exactly (so the masked load/store can be dropped) and 16-byte aligned
+        # rows and base pointers for both operands. N % 16 covers the tile and
+        # x.shape[1] % 16 the fp8 row pitch of the contiguous x_q.
+        use_td = (
+            use_tensor_descriptor()
+            and x.dim() == 2
+            and x_q.is_contiguous()
+            and BLOCK == N
+            and N % 16 == 0
+            and x.shape[1] % 16 == 0
+            and (x.stride(0) * x.element_size()) % 16 == 0
+            and x.data_ptr() % 16 == 0
+            and x_q.data_ptr() % 16 == 0
+        )
+        if use_td:
+            # Building a descriptor in-kernel needs a Triton scratch allocator.
+            set_triton_allocator(x.device)
         _per_token_group_quant_fp8[(M,)](
             x,
             x_q,
@@ -648,11 +693,13 @@ def per_token_group_quant_fp8(
             group_size,
             x.shape[1],
             x.stride(0),
+            x.shape[0],
             eps,
             fp8_min=fp8_min,
             fp8_max=fp8_max,
             use_ue8m0=use_ue8m0,
             BLOCK=BLOCK,
+            USE_TD=use_td,
             num_warps=num_warps,
             num_stages=num_stages,
         )
