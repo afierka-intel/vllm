@@ -7,9 +7,12 @@ import logging
 import torch
 
 from vllm.platforms import current_platform
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 
 logger = logging.getLogger(__name__)
+
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
 
 
 def block_dequant(
@@ -130,8 +133,11 @@ def _per_token_group_quant_int8(
     # Information for int8
     int8_min,
     int8_max,
+    # Rows (groups) of input, only used to size the tensor descriptors
+    M,
     # Meta-parameters
     BLOCK: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     """A Triton-accelerated function to perform per-token-group
     quantization on a tensor.
@@ -140,20 +146,38 @@ def _per_token_group_quant_int8(
     """
     # Map the program id to the row of X and Y it should compute.
     g_id = tl.program_id(0)
-    y_ptr += g_id * y_stride
-    y_q_ptr += g_id * y_stride
     y_s_ptr += g_id
 
     cols = tl.arange(0, BLOCK)  # N <= BLOCK
     mask = cols < N
 
-    y = tl.load(y_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    if USE_TD:
+        # The flattened input/output are contiguous [M, N] buffers with
+        # y_stride == N, so a [1, BLOCK] tile is exactly one group.
+        y_desc = tl.make_tensor_descriptor(
+            y_ptr,
+            shape=[M, N],
+            strides=[y_stride, 1],
+            block_shape=[1, BLOCK],
+        )
+        y_q_desc = tl.make_tensor_descriptor(
+            y_q_ptr,
+            shape=[M, N],
+            strides=[y_stride, 1],
+            block_shape=[1, BLOCK],
+        )
+        y = y_desc.load([g_id, 0]).to(tl.float32)
+    else:
+        y = tl.load(y_ptr + g_id * y_stride + cols, mask=mask, other=0.0).to(tl.float32)
     # Quant
     _absmax = tl.maximum(tl.max(tl.abs(y)), eps)
     y_s = _absmax / int8_max
     y_q = tl.clamp(y / y_s, int8_min, int8_max).to(y_q_ptr.dtype.element_ty)
 
-    tl.store(y_q_ptr + cols, y_q, mask=mask)
+    if USE_TD:
+        y_q_desc.store([g_id, 0], y_q)
+    else:
+        tl.store(y_q_ptr + g_id * y_stride + cols, y_q, mask=mask)
     tl.store(y_s_ptr, y_s)
 
 
@@ -162,6 +186,7 @@ def per_token_group_quant_int8(
     group_size: int,
     eps: float = 1e-10,
     dtype: torch.dtype = torch.int8,
+    use_td: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Function to perform per-token-group quantization on an input tensor `x`.
 
@@ -208,6 +233,19 @@ def per_token_group_quant_int8(
     # heuristics for number of warps
     num_warps = min(max(BLOCK // 256, 1), 8)
     num_stages = 1
+    # TD needs a fully covered tile (no column mask) plus 16-byte aligned
+    # bases and row pitches for both the input and the int8 output.
+    use_td = (
+        use_tensor_descriptor(use_td)
+        and BLOCK == N
+        and (N * x.element_size()) % 16 == 0
+        and (N * x_q.element_size()) % 16 == 0
+        and x.data_ptr() % 16 == 0
+        and x_q.data_ptr() % 16 == 0
+    )
+    if use_td and x.device not in _TD_ALLOCATOR_DEVICES:
+        set_triton_allocator(x.device)
+        _TD_ALLOCATOR_DEVICES.add(x.device)
     _per_token_group_quant_int8[(M,)](
         x,
         x_q,
@@ -217,7 +255,9 @@ def per_token_group_quant_int8(
         eps,
         int8_min=int8_min,
         int8_max=int8_max,
+        M=M,
         BLOCK=BLOCK,
+        USE_TD=use_td,
         num_warps=num_warps,
         num_stages=num_stages,
     )
