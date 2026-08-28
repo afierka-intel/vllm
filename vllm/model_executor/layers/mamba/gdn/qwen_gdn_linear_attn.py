@@ -58,7 +58,8 @@ from vllm.third_party.flash_linear_attention.ops import (
 from vllm.third_party.flash_linear_attention.ops.chunk import l2norm_fwd
 from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
 from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
@@ -1982,6 +1983,9 @@ direct_register_custom_op(
 )
 
 
+_GDN_GATING_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
+
+
 @triton.jit
 def fused_gdn_gating_kernel(
     g,
@@ -1995,14 +1999,47 @@ def fused_gdn_gating_kernel(
     beta: tl.constexpr,
     threshold: tl.constexpr,
     BLK_HEADS: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     i_b, i_s, i_d = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     head_off = i_d * BLK_HEADS + tl.arange(0, BLK_HEADS)
     off = i_b * seq_len * NUM_HEADS + i_s * NUM_HEADS + head_off
     mask = head_off < NUM_HEADS
     blk_A_log = tl.load(A_log + head_off, mask=mask)
-    blk_a = tl.load(a + off, mask=mask)
-    blk_b = tl.load(b + off, mask=mask)
+    if USE_TD:
+        # a/b/g/beta_output are row-major [batch * seq_len, NUM_HEADS]; describe
+        # the single row this program touches so the inner stride stays 1.
+        row_off = (i_b * seq_len + i_s) * NUM_HEADS
+        col_off = i_d * BLK_HEADS
+        a_desc = tl.make_tensor_descriptor(
+            a + row_off,
+            shape=[1, NUM_HEADS],
+            strides=[NUM_HEADS, 1],
+            block_shape=[1, BLK_HEADS],
+        )
+        b_desc = tl.make_tensor_descriptor(
+            b + row_off,
+            shape=[1, NUM_HEADS],
+            strides=[NUM_HEADS, 1],
+            block_shape=[1, BLK_HEADS],
+        )
+        g_desc = tl.make_tensor_descriptor(
+            g + row_off,
+            shape=[1, NUM_HEADS],
+            strides=[NUM_HEADS, 1],
+            block_shape=[1, BLK_HEADS],
+        )
+        beta_desc = tl.make_tensor_descriptor(
+            beta_output + row_off,
+            shape=[1, NUM_HEADS],
+            strides=[NUM_HEADS, 1],
+            block_shape=[1, BLK_HEADS],
+        )
+        blk_a = a_desc.load([0, col_off]).reshape(BLK_HEADS)
+        blk_b = b_desc.load([0, col_off]).reshape(BLK_HEADS)
+    else:
+        blk_a = tl.load(a + off, mask=mask)
+        blk_b = tl.load(b + off, mask=mask)
     blk_bias = tl.load(dt_bias + head_off, mask=mask)
     # If the model is loaded in fp16, without the .float() here, A might be -inf
     x = blk_a.to(tl.float32) + blk_bias.to(tl.float32)
@@ -2010,12 +2047,23 @@ def fused_gdn_gating_kernel(
         beta * x <= threshold, (1 / beta) * tl.log(1 + tl.exp(beta * x)), x
     )
     blk_g = -tl.exp(blk_A_log.to(tl.float32)) * softplus_x
-    tl.store(g + off, blk_g.to(g.dtype.element_ty), mask=mask)
     # compute beta_output = sigmoid(b)
     blk_beta_output = tl.sigmoid(blk_b.to(tl.float32))
-    tl.store(
-        beta_output + off, blk_beta_output.to(beta_output.dtype.element_ty), mask=mask
-    )
+    if USE_TD:
+        # Descriptor stores drop lanes past the declared NUM_HEADS extent, so
+        # the tail block needs no explicit mask.
+        g_desc.store([0, col_off], blk_g.to(g.dtype.element_ty).reshape(1, BLK_HEADS))
+        beta_desc.store(
+            [0, col_off],
+            blk_beta_output.to(beta_output.dtype.element_ty).reshape(1, BLK_HEADS),
+        )
+    else:
+        tl.store(g + off, blk_g.to(g.dtype.element_ty), mask=mask)
+        tl.store(
+            beta_output + off,
+            blk_beta_output.to(beta_output.dtype.element_ty),
+            mask=mask,
+        )
 
 
 def fused_gdn_gating(
@@ -2025,6 +2073,7 @@ def fused_gdn_gating(
     dt_bias: torch.Tensor,
     beta: float = 1.0,
     threshold: float = 20.0,
+    use_td: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Fused computation of g and beta for Gated Delta Net.
@@ -2034,9 +2083,27 @@ def fused_gdn_gating(
     """
     batch, num_heads = a.shape
     seq_len = 1
-    grid = (batch, seq_len, triton.cdiv(num_heads, 8))
+    BLK_HEADS = 8
+    grid = (batch, seq_len, triton.cdiv(num_heads, BLK_HEADS))
     g = torch.empty(1, batch, num_heads, dtype=torch.float32, device=a.device)
     beta_output = torch.empty(1, batch, num_heads, dtype=b.dtype, device=b.device)
+    # TD path needs the flat row-major layout the kernel already assumes, a
+    # 16B-aligned base, 16B-multiple row strides and a 16B-multiple inner tile.
+    use_td = (
+        use_tensor_descriptor(use_td)
+        and a.is_contiguous()
+        and b.is_contiguous()
+        and (BLK_HEADS & (BLK_HEADS - 1)) == 0
+        and all(
+            t.data_ptr() % 16 == 0
+            and (num_heads * t.element_size()) % 16 == 0
+            and (BLK_HEADS * t.element_size()) % 16 == 0
+            for t in (a, b, g, beta_output)
+        )
+    )
+    if use_td and a.device not in _GDN_GATING_TD_ALLOCATOR_DEVICES:
+        set_triton_allocator(a.device)
+        _GDN_GATING_TD_ALLOCATOR_DEVICES.add(a.device)
     fused_gdn_gating_kernel[grid](
         g,
         beta_output,
@@ -2048,7 +2115,8 @@ def fused_gdn_gating(
         num_heads,
         beta,
         threshold,
-        8,
+        BLK_HEADS,
+        USE_TD=use_td,
         num_warps=1,
     )
     return g, beta_output
