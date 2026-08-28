@@ -19,13 +19,16 @@ from vllm.third_party.flash_linear_attention.ops.index import prepare_chunk_indi
 from vllm.third_party.flash_linear_attention.ops.l2norm import l2norm_fwd
 from vllm.third_party.flash_linear_attention.ops.op import exp2, log
 from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE, is_amd
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 from vllm.utils.math_utils import RCP_LN2, cdiv, next_power_of_2
 
 from .chunk_intra import chunk_kda_fwd_intra
 
 BT_LIST_AUTOTUNE = [32, 64, 128]
 NUM_WARPS_AUTOTUNE = [2, 4, 8, 16] if is_amd else [4, 8, 16, 32]
+
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
 
 
 # num_stages=4 is excluded. The `u` loop has a trip count of 2 (V / BV), and a
@@ -271,6 +274,7 @@ def chunk_gla_fwd_kernel_o(
     BK: tl.constexpr,
     BV: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
@@ -294,70 +298,136 @@ def chunk_gla_fwd_kernel_o(
     m_s = tl.arange(0, BT)[:, None] >= tl.arange(0, BT)[None, :]
 
     b_o = tl.zeros([BT, BV], dtype=tl.float32)
-    for i_k in range(tl.cdiv(K, BK)):
-        p_q = tl.make_block_ptr(
+    if USE_TD:
+        # Every described tile is already inner-dim contiguous (the block-ptr
+        # path declares stride 1 there too), so no per-tile transpose is
+        # needed beyond the `tl.trans(b_h)` the kernel already performs.
+        q_desc = tl.make_tensor_descriptor(
             q + (bos * H + i_h) * K,
-            (T, K),
-            (H * K, 1),
-            (i_t * BT, i_k * BK),
-            (BT, BK),
-            (1, 0),
+            shape=[T, K],
+            strides=[H * K, 1],
+            block_shape=[BT, BK],
         )
-        p_g = tl.make_block_ptr(
+        g_desc = tl.make_tensor_descriptor(
             g + (bos * H + i_h) * K,
-            (T, K),
-            (H * K, 1),
-            (i_t * BT, i_k * BK),
-            (BT, BK),
-            (1, 0),
+            shape=[T, K],
+            strides=[H * K, 1],
+            block_shape=[BT, BK],
         )
-        p_h = tl.make_block_ptr(
+        h_desc = tl.make_tensor_descriptor(
             h + (i_tg * H + i_h) * K * V,
-            (V, K),
-            (K, 1),
-            (i_v * BV, i_k * BK),
-            (BV, BK),
-            (1, 0),
+            shape=[V, K],
+            strides=[K, 1],
+            block_shape=[BV, BK],
         )
+    for i_k in range(tl.cdiv(K, BK)):
+        if not USE_TD:
+            p_q = tl.make_block_ptr(
+                q + (bos * H + i_h) * K,
+                (T, K),
+                (H * K, 1),
+                (i_t * BT, i_k * BK),
+                (BT, BK),
+                (1, 0),
+            )
+            p_g = tl.make_block_ptr(
+                g + (bos * H + i_h) * K,
+                (T, K),
+                (H * K, 1),
+                (i_t * BT, i_k * BK),
+                (BT, BK),
+                (1, 0),
+            )
+            p_h = tl.make_block_ptr(
+                h + (i_tg * H + i_h) * K * V,
+                (V, K),
+                (K, 1),
+                (i_v * BV, i_k * BK),
+                (BV, BK),
+                (1, 0),
+            )
 
         # [BT, BK]
-        b_q = tl.load(p_q, boundary_check=(0, 1))
+        if USE_TD:
+            b_q = q_desc.load([i_t * BT, i_k * BK])
+        else:
+            b_q = tl.load(p_q, boundary_check=(0, 1))
         b_q = (b_q * scale).to(b_q.dtype)
         # [BT, BK]
-        b_g = tl.load(p_g, boundary_check=(0, 1))
+        if USE_TD:
+            b_g = g_desc.load([i_t * BT, i_k * BK])
+        else:
+            b_g = tl.load(p_g, boundary_check=(0, 1))
         # [BT, BK]
         b_qg = (b_q * exp2(b_g)).to(b_q.dtype)
         # [BV, BK]
-        b_h = tl.load(p_h, boundary_check=(0, 1))
+        if USE_TD:
+            b_h = h_desc.load([i_v * BV, i_k * BK])
+        else:
+            b_h = tl.load(p_h, boundary_check=(0, 1))
         # [BT, BV]
         if i_k >= 0:
             b_o += tl.dot(b_qg, tl.trans(b_h).to(b_qg.dtype))
-    p_v = tl.make_block_ptr(
-        v + (bos * H + i_h) * V,
-        (T, V),
-        (H * V, 1),
-        (i_t * BT, i_v * BV),
-        (BT, BV),
-        (1, 0),
-    )
-    p_o = tl.make_block_ptr(
-        o + (bos * H + i_h) * V,
-        (T, V),
-        (H * V, 1),
-        (i_t * BT, i_v * BV),
-        (BT, BV),
-        (1, 0),
-    )
-    p_A = tl.make_block_ptr(
-        A + (bos * H + i_h) * BT, (T, BT), (H * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0)
-    )
+    if USE_TD:
+        v_desc = tl.make_tensor_descriptor(
+            v + (bos * H + i_h) * V,
+            shape=[T, V],
+            strides=[H * V, 1],
+            block_shape=[BT, BV],
+        )
+        o_desc = tl.make_tensor_descriptor(
+            o + (bos * H + i_h) * V,
+            shape=[T, V],
+            strides=[H * V, 1],
+            block_shape=[BT, BV],
+        )
+        A_desc = tl.make_tensor_descriptor(
+            A + (bos * H + i_h) * BT,
+            shape=[T, BT],
+            strides=[H * BT, 1],
+            block_shape=[BT, BT],
+        )
+    else:
+        p_v = tl.make_block_ptr(
+            v + (bos * H + i_h) * V,
+            (T, V),
+            (H * V, 1),
+            (i_t * BT, i_v * BV),
+            (BT, BV),
+            (1, 0),
+        )
+        p_o = tl.make_block_ptr(
+            o + (bos * H + i_h) * V,
+            (T, V),
+            (H * V, 1),
+            (i_t * BT, i_v * BV),
+            (BT, BV),
+            (1, 0),
+        )
+        p_A = tl.make_block_ptr(
+            A + (bos * H + i_h) * BT,
+            (T, BT),
+            (H * BT, 1),
+            (i_t * BT, 0),
+            (BT, BT),
+            (1, 0),
+        )
     # [BT, BV]
-    b_v = tl.load(p_v, boundary_check=(0, 1))
+    if USE_TD:
+        b_v = v_desc.load([i_t * BT, i_v * BV])
+    else:
+        b_v = tl.load(p_v, boundary_check=(0, 1))
     # [BT, BT]
-    b_A = tl.load(p_A, boundary_check=(0, 1))
+    if USE_TD:
+        b_A = A_desc.load([i_t * BT, 0])
+    else:
+        b_A = tl.load(p_A, boundary_check=(0, 1))
     b_A = tl.where(m_s, b_A, 0.0).to(b_v.dtype)
     b_o += tl.dot(b_A, b_v, allow_tf32=False)
-    tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+    if USE_TD:
+        o_desc.store([i_t * BT, i_v * BV], b_o.to(o_desc.dtype))
+    else:
+        tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
 def chunk_gla_fwd_o_gk(
@@ -382,6 +452,32 @@ def chunk_gla_fwd_o_gk(
     def grid(meta):
         return (cdiv(V, meta["BV"]), NT, B * H)
 
+    # Descriptors need a unit inner stride, the exact row stride the kernel
+    # already assumes, and 16B-aligned rows. BT/BK/BV are powers of two by
+    # construction (autotune configs + FLA_CHUNK_SIZE).
+    def _td_ok(t: torch.Tensor, dim: int, row: int, inner: int) -> bool:
+        nbytes = t.element_size()
+        return (
+            t.stride(-1) == 1
+            and t.stride(dim) == row
+            and (row * nbytes) % 16 == 0
+            and (inner * nbytes) % 16 == 0
+        )
+
+    use_td = (
+        use_tensor_descriptor()
+        and A.shape[-1] == BT
+        and _td_ok(q, -3, H * K, K)
+        and _td_ok(g, -3, H * K, K)
+        and _td_ok(h, -2, K, K)
+        and _td_ok(v, -3, H * V, V)
+        and _td_ok(o, -3, H * V, V)
+        and _td_ok(A, -3, H * BT, BT)
+    )
+    if use_td and q.device not in _TD_ALLOCATOR_DEVICES:
+        set_triton_allocator(q.device)
+        _TD_ALLOCATOR_DEVICES.add(q.device)
+
     chunk_gla_fwd_kernel_o[grid](
         q=q,
         v=v,
@@ -397,6 +493,7 @@ def chunk_gla_fwd_o_gk(
         K=K,
         V=V,
         BT=BT,
+        USE_TD=use_td,
     )
     return o
 
