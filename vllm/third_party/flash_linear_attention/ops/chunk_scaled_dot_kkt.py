@@ -11,7 +11,8 @@
 import torch
 
 from vllm.platforms import current_platform
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 
 from .index import prepare_chunk_indices
 from .op import exp
@@ -26,6 +27,8 @@ if current_platform.is_rocm():
     from vllm.platforms.rocm import on_gfx1x
 
     _CAST_DOT_TO_K_DTYPE = on_gfx1x()
+
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
 
 
 @triton.heuristics(
@@ -60,6 +63,7 @@ def chunk_scaled_dot_kkt_fwd_kernel(
     IS_VARLEN: tl.constexpr,
     USE_G: tl.constexpr,
     CAST_DOT_TO_K_DTYPE: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
@@ -83,17 +87,30 @@ def chunk_scaled_dot_kkt_fwd_kernel(
     )
     b_beta = tl.load(p_beta, boundary_check=(0,))
 
+    if USE_TD:
+        # k rows are [T, K] with unit K stride, so the [BT, BK] tile the loop
+        # already walks maps 1:1 onto a descriptor block.
+        k_desc = tl.make_tensor_descriptor(
+            k + (bos * Hg + i_h // (H // Hg)) * K,
+            shape=[T, K],
+            strides=[Hg * K, 1],
+            block_shape=[BT, BK],
+        )
+
     b_A = tl.zeros([BT, BT], dtype=tl.float32)
     for i_k in range(tl.cdiv(K, BK)):
-        p_k = tl.make_block_ptr(
-            k + (bos * Hg + i_h // (H // Hg)) * K,
-            (T, K),
-            (Hg * K, 1),
-            (i_t * BT, i_k * BK),
-            (BT, BK),
-            (1, 0),
-        )
-        b_k = tl.load(p_k, boundary_check=(0, 1))
+        if USE_TD:
+            b_k = k_desc.load([i_t * BT, i_k * BK])
+        else:
+            p_k = tl.make_block_ptr(
+                k + (bos * Hg + i_h // (H // Hg)) * K,
+                (T, K),
+                (Hg * K, 1),
+                (i_t * BT, i_k * BK),
+                (BT, BK),
+                (1, 0),
+            )
+            b_k = tl.load(p_k, boundary_check=(0, 1))
         b_kb = b_k * b_beta[:, None]
         if CAST_DOT_TO_K_DTYPE:
             # RDNA: force operands to k's native dtype so WMMA is used.
@@ -110,10 +127,24 @@ def chunk_scaled_dot_kkt_fwd_kernel(
 
     m_A = (o_t[:, None] > o_t[None, :]) & (m_t[:, None] & m_t)
     b_A = tl.where(m_A, b_A, 0)
-    p_A = tl.make_block_ptr(
-        A + (bos * H + i_h) * BT, (T, BT), (BT * H, 1), (i_t * BT, 0), (BT, BT), (1, 0)
-    )
-    tl.store(p_A, b_A.to(p_A.dtype.element_ty), boundary_check=(0, 1))
+    if USE_TD:
+        A_desc = tl.make_tensor_descriptor(
+            A + (bos * H + i_h) * BT,
+            shape=[T, BT],
+            strides=[BT * H, 1],
+            block_shape=[BT, BT],
+        )
+        A_desc.store([i_t * BT, 0], b_A.to(A.dtype.element_ty))
+    else:
+        p_A = tl.make_block_ptr(
+            A + (bos * H + i_h) * BT,
+            (T, BT),
+            (BT * H, 1),
+            (i_t * BT, 0),
+            (BT, BT),
+            (1, 0),
+        )
+        tl.store(p_A, b_A.to(p_A.dtype.element_ty), boundary_check=(0, 1))
 
 
 def chunk_scaled_dot_kkt_fwd(
@@ -124,6 +155,7 @@ def chunk_scaled_dot_kkt_fwd(
     chunk_indices: torch.Tensor | None = None,
     chunk_size: int = FLA_CHUNK_SIZE,
     output_dtype: torch.dtype = torch.float32,
+    use_td: bool | None = None,
 ) -> torch.Tensor:
     r"""
     Compute beta * K * K^T.
@@ -159,6 +191,25 @@ def chunk_scaled_dot_kkt_fwd(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
     A = torch.empty(B, T, H, BT, device=k.device, dtype=output_dtype)
+
+    # Descriptors need unit inner stride, power-of-two tiles and 16B-aligned
+    # bases/rows. In-kernel bases are multiples of K (k) and BT (A), so the
+    # per-row byte checks below cover every program's offset.
+    k_es, A_es = k.element_size(), A.element_size()
+    use_td = (
+        use_tensor_descriptor(use_td)
+        and k.stride(-1) == 1
+        and (BT & (BT - 1)) == 0
+        and k.data_ptr() % 16 == 0
+        and (K * k_es) % 16 == 0
+        and (Hg * K * k_es) % 16 == 0
+        and (BT * A_es) % 16 == 0
+        and (BT * H * A_es) % 16 == 0
+    )
+    if use_td and k.device not in _TD_ALLOCATOR_DEVICES:
+        set_triton_allocator(k.device)
+        _TD_ALLOCATOR_DEVICES.add(k.device)
+
     chunk_scaled_dot_kkt_fwd_kernel[(NT, B * H)](
         k=k,
         g=g,
@@ -172,5 +223,6 @@ def chunk_scaled_dot_kkt_fwd(
         K=K,
         BT=BT,
         CAST_DOT_TO_K_DTYPE=_CAST_DOT_TO_K_DTYPE,
+        USE_TD=use_td,
     )
     return A
