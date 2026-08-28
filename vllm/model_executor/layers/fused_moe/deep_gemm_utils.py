@@ -11,9 +11,26 @@ import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.utils import count_expert_num_tokens
-from vllm.triton_utils import tl, triton
+from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 from vllm.utils.deep_gemm import get_mk_alignment_for_contiguous_layout
 from vllm.utils.math_utils import round_up
+
+
+def _td_rowwise_ok(t: torch.Tensor, inner_block: int) -> bool:
+    # make_tensor_descriptor needs a stride-1 last dim, >=16B in the block's
+    # last dim, and a 16B-aligned base pointer / row stride. TMA additionally
+    # caps every box dim at 256 elements; XPU lowers descriptors to masked
+    # pointer arithmetic instead and has no such cap.
+    es = t.element_size()
+    return (
+        t.stride(1) == 1
+        and inner_block * es >= 16
+        and (t.stride(0) * es) % 16 == 0
+        and t.data_ptr() % 16 == 0
+        and (inner_block <= 256 or current_platform.is_xpu())
+    )
 
 
 def expert_num_tokens_round_up_and_sum(
@@ -189,6 +206,9 @@ def _fwd_kernel_ep_scatter_2(
     PACK_UE8M0: tl.constexpr,
     SCALE_PACKED_SIZE: tl.constexpr,
     SCALE_PACKED_SIZE_PAD: tl.constexpr,
+    output_num_rows=0,
+    USE_TD: tl.constexpr = False,
+    USE_TD_SCALE: tl.constexpr = False,
 ):
     start_token_id = tl.program_id(0)
     grid_num = tl.num_programs(0)
@@ -197,6 +217,40 @@ def _fwd_kernel_ep_scatter_2(
     mask = offset_in < HIDDEN_SIZE
 
     output_tensor_stride0 = output_tensor_stride0.to(tl.int64)
+
+    # The packed UE8M0 scale is MN-major and gathered in stride-4 groups, so it
+    # can never take the descriptor path.
+    tl.static_assert(not (USE_TD_SCALE and PACK_UE8M0))
+
+    if USE_TD:
+        # One-row tiles; the launcher only enables USE_TD when the source and
+        # destination are contiguous in their last dim.
+        x_desc = tl.make_tensor_descriptor(
+            recv_x,
+            shape=[total_token_num, HIDDEN_SIZE],
+            strides=[recv_x_stride0, 1],
+            block_shape=[1, HIDDEN_SIZE_PAD],
+        )
+        out_desc = tl.make_tensor_descriptor(
+            output_tensor,
+            shape=[output_num_rows, HIDDEN_SIZE],
+            strides=[output_tensor_stride0, 1],
+            block_shape=[1, HIDDEN_SIZE_PAD],
+        )
+
+    if USE_TD_SCALE:
+        xs_desc = tl.make_tensor_descriptor(
+            recv_x_scale,
+            shape=[total_token_num, SCALE_HIDDEN_SIZE],
+            strides=[recv_x_scale_stride0, 1],
+            block_shape=[1, SCALE_HIDDEN_SIZE_PAD],
+        )
+        out_s_desc = tl.make_tensor_descriptor(
+            output_tensor_scale,
+            shape=[output_num_rows, SCALE_HIDDEN_SIZE],
+            strides=[output_tensor_scale_stride0, 1],
+            block_shape=[1, SCALE_HIDDEN_SIZE_PAD],
+        )
 
     if PACK_UE8M0:
         # One int32 per 4 consecutive 32-wide UE8M0 groups, stored MN-major.
@@ -207,7 +261,10 @@ def _fwd_kernel_ep_scatter_2(
         mask_s = offset_in_s < SCALE_HIDDEN_SIZE
 
     for token_id in range(start_token_id, total_token_num, grid_num):
-        to_copy = tl.load(recv_x + token_id * recv_x_stride0 + offset_in, mask=mask)
+        if USE_TD:
+            to_copy = x_desc.load([token_id, 0])
+        else:
+            to_copy = tl.load(recv_x + token_id * recv_x_stride0 + offset_in, mask=mask)
 
         if PACK_UE8M0:
             # Pack 4 UE8M0 bytes into one int32 (byte j = group 4*pk+j).
@@ -232,6 +289,8 @@ def _fwd_kernel_ep_scatter_2(
                 | (b2.to(tl.int32) << 16)
                 | (b3.to(tl.int32) << 24)
             )
+        elif USE_TD_SCALE:
+            to_copy_s = xs_desc.load([token_id, 0])
         else:
             to_copy_s = tl.load(
                 recv_x_scale + token_id * recv_x_scale_stride0 + offset_in_s,
@@ -251,10 +310,13 @@ def _fwd_kernel_ep_scatter_2(
                     output_index + token_id * output_index_stride0 + topk_index,
                     dest_token_index,
                 )
-                output_tensor_ptr = (
-                    output_tensor + dest_token_index_i64 * output_tensor_stride0
-                )
-                tl.store(output_tensor_ptr + offset_in, to_copy, mask=mask)
+                if USE_TD:
+                    out_desc.store([dest_token_index, 0], to_copy)
+                else:
+                    output_tensor_ptr = (
+                        output_tensor + dest_token_index_i64 * output_tensor_stride0
+                    )
+                    tl.store(output_tensor_ptr + offset_in, to_copy, mask=mask)
 
                 output_tensor_scale_ptr = (
                     output_tensor_scale + dest_token_index * output_tensor_scale_stride0
@@ -265,6 +327,8 @@ def _fwd_kernel_ep_scatter_2(
                         packed_s,
                         mask=mask_pk,
                     )
+                elif USE_TD_SCALE:
+                    out_s_desc.store([dest_token_index, 0], to_copy_s)
                 else:
                     tl.store(
                         output_tensor_scale_ptr + offset_in_s, to_copy_s, mask=mask_s
@@ -316,6 +380,27 @@ def ep_scatter(
 
     grid = min(recv_topk.shape[0], 1024 * 8)
 
+    hidden_size_pad = triton.next_power_of_2(hidden_size)
+    scale_hidden_size_pad = triton.next_power_of_2(scale_hidden_size)
+    # TD describes the [rows, hidden] activation and its scatter destination as
+    # one-row tiles; the scale pair is gated separately so a too-narrow scale
+    # row does not disable TD for the (much larger) activation copy.
+    td = use_tensor_descriptor()
+    use_td = (
+        td
+        and _td_rowwise_ok(recv_x, hidden_size_pad)
+        and _td_rowwise_ok(output_tensor, hidden_size_pad)
+    )
+    use_td_scale = (
+        td
+        and not pack_ue8m0
+        and _td_rowwise_ok(recv_x_scale, scale_hidden_size_pad)
+        and _td_rowwise_ok(output_tensor_scale, scale_hidden_size_pad)
+    )
+    if use_td or use_td_scale:
+        # Device-side descriptors need a PyTorch-backed scratch allocator.
+        set_triton_allocator(recv_x.device)
+
     _fwd_kernel_ep_scatter_2[(grid,)](
         recv_topk.shape[0],
         expert_start_loc,
@@ -342,12 +427,15 @@ def ep_scatter(
         HAS_EXPERT_MAP=expert_map is not None,
         num_warps=num_warps,
         HIDDEN_SIZE=hidden_size,
-        HIDDEN_SIZE_PAD=triton.next_power_of_2(hidden_size),
+        HIDDEN_SIZE_PAD=hidden_size_pad,
         SCALE_HIDDEN_SIZE=scale_hidden_size,
-        SCALE_HIDDEN_SIZE_PAD=triton.next_power_of_2(scale_hidden_size),
+        SCALE_HIDDEN_SIZE_PAD=scale_hidden_size_pad,
         PACK_UE8M0=pack_ue8m0,
         SCALE_PACKED_SIZE=scale_packed_size,
         SCALE_PACKED_SIZE_PAD=triton.next_power_of_2(scale_packed_size),
+        output_num_rows=output_tensor.shape[0],
+        USE_TD=use_td,
+        USE_TD_SCALE=use_td_scale,
     )
     return
 
