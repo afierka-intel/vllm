@@ -12,7 +12,8 @@ import os
 
 import torch
 
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 
 from .index import prepare_chunk_indices
 from .op import make_tensor_descriptor
@@ -23,6 +24,8 @@ ALLOWED_TRIL_PRECISIONS = ["ieee", "tf32"] if is_amd else ["ieee", "tf32", "tf32
 assert FLA_TRIL_PRECISION in ALLOWED_TRIL_PRECISIONS, (
     f"FLA_TRIL_PRECISION must be one of {ALLOWED_TRIL_PRECISIONS}, but got {FLA_TRIL_PRECISION}"
 )
+
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
@@ -121,6 +124,7 @@ def merge_16x16_to_32x32_inverse_kernel(
     USE_TMA: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
@@ -143,7 +147,17 @@ def merge_16x16_to_32x32_inverse_kernel(
     A += (bos * H + i_h) * BT
     Ai += (bos * H + i_h) * BT
 
-    if not USE_TMA:
+    if USE_TD:
+        # A/Ai are [T, BT] row-major views (inner stride 1) of the (b, h) slice.
+        td = tl.make_tensor_descriptor(
+            A, shape=[T, BT], strides=[H * BT, 1], block_shape=[16, 16]
+        )
+        td_o = tl.make_tensor_descriptor(
+            Ai, shape=[T, BT], strides=[H * BT, 1], block_shape=[16, 16]
+        )
+        b_Ai_11 = td.load([i_t * BT + 0, 0]).to(tl.float32)
+        b_Ai_22 = td.load([i_t * BT + 16, 16]).to(tl.float32)
+    elif not USE_TMA:
         p_A_11 = tl.make_block_ptr(
             A, (T, BT), (H * BT, 1), (i_t * BT, 0), (16, 16), (1, 0)
         )
@@ -174,7 +188,9 @@ def merge_16x16_to_32x32_inverse_kernel(
     b_Ai_11 += m_I
     b_Ai_22 += m_I
 
-    if not USE_TMA:
+    if USE_TD:
+        b_A_21 = td.load([i_t * BT + 16, 0]).to(tl.float32)
+    elif not USE_TMA:
         p_A_21 = tl.make_block_ptr(
             A, (T, BT), (H * BT, 1), (i_t * BT + 16, 0), (16, 16), (1, 0)
         )
@@ -188,7 +204,21 @@ def merge_16x16_to_32x32_inverse_kernel(
         input_precision=DOT_PRECISION,
     )
 
-    if not USE_TMA:
+    if USE_TD:
+        o_dtype = Ai.dtype.element_ty
+        td_o.store(
+            [i_t * BT + 0, 0],
+            b_Ai_11.to(o_dtype, fp_downcast_rounding="rtne"),
+        )
+        td_o.store(
+            [i_t * BT + 16, 16],
+            b_Ai_22.to(o_dtype, fp_downcast_rounding="rtne"),
+        )
+        td_o.store(
+            [i_t * BT + 16, 0],
+            b_Ai_21.to(o_dtype, fp_downcast_rounding="rtne"),
+        )
+    elif not USE_TMA:
         p_Ai_11 = tl.make_block_ptr(
             Ai, (T, BT), (H * BT, 1), (i_t * BT, 0), (16, 16), (1, 0)
         )
@@ -537,10 +567,27 @@ def solve_tril(
     NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, BT)
 
     Ai = torch.zeros_like(A, dtype=output_dtype)
+    extra_kwargs: dict[str, bool] = {}
     if BT == 16:
         merge_fn = solve_tril_16x16_kernel
     elif BT == 32:
         merge_fn = merge_16x16_to_32x32_inverse_kernel
+        # TD tiles are [16, 16] over the [T, BT] (b, h) slice; needs inner
+        # stride 1 on both operands and a 16B-aligned row pitch.
+        use_td = (
+            use_tensor_descriptor()
+            and not is_tma_supported
+            and A.stride(-1) == 1
+            and Ai.stride(-1) == 1
+            and A.stride(1) == H * BT
+            and Ai.stride(1) == H * BT
+            and (H * BT * A.element_size()) % 16 == 0
+            and (H * BT * Ai.element_size()) % 16 == 0
+        )
+        if use_td and A.device not in _TD_ALLOCATOR_DEVICES:
+            set_triton_allocator(A.device)
+            _TD_ALLOCATOR_DEVICES.add(A.device)
+        extra_kwargs["USE_TD"] = use_td
     elif BT == 64:
         merge_fn = merge_16x16_to_64x64_inverse_kernel
 
@@ -554,5 +601,6 @@ def solve_tril(
         BT=BT,
         USE_TMA=is_tma_supported,
         DOT_PRECISION=FLA_TRIL_PRECISION,
+        **extra_kwargs,
     )
     return Ai
