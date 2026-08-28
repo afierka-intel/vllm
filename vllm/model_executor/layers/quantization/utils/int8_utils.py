@@ -7,9 +7,12 @@ import logging
 import torch
 
 from vllm.platforms import current_platform
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 
 logger = logging.getLogger(__name__)
+
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
 
 
 def block_dequant(
@@ -68,8 +71,10 @@ def _per_token_quant_int8(
     scale_ptr,
     stride_x,
     stride_xq,
+    M,
     N,
     BLOCK: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     # Adapted from https://github.com/InternLM/lmdeploy/blob/086481ed84b59bee3b8e4274e5fc69620040c048/lmdeploy/pytorch/kernels/cuda/w8a8_triton_kernels.py#L282
     row_id = tl.program_id(0)
@@ -77,17 +82,39 @@ def _per_token_quant_int8(
     cols = tl.arange(0, BLOCK)
     mask = cols < N
 
-    x = tl.load(x_ptr + row_id * stride_x + cols, mask=mask, other=0.0).to(tl.float32)
+    if USE_TD:
+        # One row per program, so the tile is [1, BLOCK]; descriptor
+        # padding covers the N < BLOCK tail that the mask covers below.
+        x_desc = tl.make_tensor_descriptor(
+            x_ptr,
+            shape=[M, N],
+            strides=[stride_x, 1],
+            block_shape=[1, BLOCK],
+        )
+        xq_desc = tl.make_tensor_descriptor(
+            xq_ptr,
+            shape=[M, N],
+            strides=[stride_xq, 1],
+            block_shape=[1, BLOCK],
+        )
+        x = x_desc.load([row_id, 0]).to(tl.float32)
+    else:
+        x = tl.load(x_ptr + row_id * stride_x + cols, mask=mask, other=0.0).to(
+            tl.float32
+        )
     absmax = tl.maximum(tl.max(tl.abs(x)), 1e-10)
     scale_x = absmax / 127
     x_q = x * (127 / absmax)
     x_q = round_int8(x_q)
 
-    tl.store(xq_ptr + row_id * stride_xq + cols, x_q, mask=mask)
+    if USE_TD:
+        xq_desc.store([row_id, 0], x_q)
+    else:
+        tl.store(xq_ptr + row_id * stride_xq + cols, x_q, mask=mask)
     tl.store(scale_ptr + row_id, scale_x)
 
 
-def per_token_quant_int8(x):
+def per_token_quant_int8(x, use_td: bool | None = None):
     original_shape = x.shape
     if x.dim() > 2:
         x = x.view(-1, original_shape[-1])
@@ -99,14 +126,29 @@ def per_token_quant_int8(x):
     # heuristics for number of warps
     num_warps = min(max(BLOCK // 256, 1), 8)
     x = x.contiguous()
+    # Descriptors need unit inner stride, a 16B-aligned base and 16B-aligned
+    # rows; the int8 output makes N % 16 the binding constraint.
+    use_td = (
+        use_tensor_descriptor(use_td)
+        and x.stride(-1) == 1
+        and x_q.stride(-1) == 1
+        and N % 16 == 0
+        and BLOCK * x.element_size() >= 16
+        and x.data_ptr() % 16 == 0
+    )
+    if use_td and x.device not in _TD_ALLOCATOR_DEVICES:
+        set_triton_allocator(x.device)
+        _TD_ALLOCATOR_DEVICES.add(x.device)
     _per_token_quant_int8[(M,)](
         x,
         x_q,
         scales,
         stride_x=x.stride(-2),
         stride_xq=x_q.stride(-2),
+        M=M,
         N=N,
         BLOCK=BLOCK,
+        USE_TD=use_td,
         num_warps=num_warps,
         num_stages=1,
     )
