@@ -3,9 +3,12 @@
 
 import torch
 
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 
 AWQ_TRITON_SUPPORTED_GROUP_SIZES = [-1, 32, 64, 128]
+
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
 
 
 @triton.jit
@@ -19,10 +22,39 @@ def awq_dequantize_kernel(
     num_rows,  # input num rows in qweight
     BLOCK_SIZE_X: tl.constexpr,
     BLOCK_SIZE_Y: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     # Set up the pids.
     pid_x = tl.program_id(axis=0)
     pid_y = tl.program_id(axis=1)
+
+    if USE_TD:
+        # All four tensors are row-major with unit stride in the last dim, so
+        # each tile the kernel already touches maps 1:1 onto a descriptor.
+        qweight_desc = tl.make_tensor_descriptor(
+            qweight_ptr,
+            shape=[num_rows, num_cols],
+            strides=[num_cols, 1],
+            block_shape=[BLOCK_SIZE_Y, BLOCK_SIZE_X],
+        )
+        zeros_desc = tl.make_tensor_descriptor(
+            zeros_ptr,
+            shape=[num_rows // group_size, num_cols],
+            strides=[num_cols, 1],
+            block_shape=[1, BLOCK_SIZE_X],
+        )
+        scales_desc = tl.make_tensor_descriptor(
+            scales_ptr,
+            shape=[num_rows // group_size, num_cols * 8],
+            strides=[num_cols * 8, 1],
+            block_shape=[1, BLOCK_SIZE_X * 8],
+        )
+        result_desc = tl.make_tensor_descriptor(
+            result_ptr,
+            shape=[num_rows, num_cols * 8],
+            strides=[num_cols * 8, 1],
+            block_shape=[BLOCK_SIZE_Y, BLOCK_SIZE_X * 8],
+        )
 
     # Compute offsets and masks for qweight_ptr.
     offsets_y = pid_y * BLOCK_SIZE_Y + tl.arange(0, BLOCK_SIZE_Y)
@@ -46,7 +78,10 @@ def awq_dequantize_kernel(
     result_masks = result_masks_y[:, None] & result_masks_x[None, :]
 
     # Load the weights.
-    iweights = tl.load(qweight_ptr + offsets, masks, 0.0)
+    if USE_TD:
+        iweights = qweight_desc.load([pid_y * BLOCK_SIZE_Y, pid_x * BLOCK_SIZE_X])
+    else:
+        iweights = tl.load(qweight_ptr + offsets, masks, 0.0)
     iweights = tl.interleave(iweights, iweights)
     iweights = tl.interleave(iweights, iweights)
     iweights = tl.interleave(iweights, iweights)
@@ -76,7 +111,12 @@ def awq_dequantize_kernel(
     zero_masks = zero_masks_y[:, None] & zero_masks_x[None, :]
 
     # Load the zeros.
-    zeros = tl.load(zeros_ptr + zero_offsets, zero_masks, 0.0)
+    if USE_TD:
+        zeros = zeros_desc.load(
+            [pid_y * BLOCK_SIZE_Y // group_size, pid_x * BLOCK_SIZE_X]
+        )
+    else:
+        zeros = tl.load(zeros_ptr + zero_offsets, zero_masks, 0.0)
     zeros = tl.interleave(zeros, zeros)
     zeros = tl.interleave(zeros, zeros)
     zeros = tl.interleave(zeros, zeros)
@@ -94,7 +134,12 @@ def awq_dequantize_kernel(
     scale_masks = scale_masks_y[:, None] & scale_masks_x[None, :]
 
     # Load the scales.
-    scales = tl.load(scales_ptr + scale_offsets, scale_masks, 0.0)
+    if USE_TD:
+        scales = scales_desc.load(
+            [pid_y * BLOCK_SIZE_Y // group_size, pid_x * BLOCK_SIZE_X * 8]
+        )
+    else:
+        scales = tl.load(scales_ptr + scale_offsets, scale_masks, 0.0)
     scales = tl.broadcast_to(scales, (BLOCK_SIZE_Y, BLOCK_SIZE_X * 8))
 
     # Dequantize.
@@ -102,7 +147,10 @@ def awq_dequantize_kernel(
     iweights = iweights.to(result_ptr.type.element_ty)
 
     # Finally, store.
-    tl.store(result_ptr + result_offsets, iweights, result_masks)
+    if USE_TD:
+        result_desc.store([pid_y * BLOCK_SIZE_Y, pid_x * BLOCK_SIZE_X * 8], iweights)
+    else:
+        tl.store(result_ptr + result_offsets, iweights, result_masks)
 
 
 @triton.jit
@@ -236,6 +284,7 @@ def awq_dequantize_triton(
     zeros: torch.Tensor,
     block_size_x: int = 32,
     block_size_y: int = 32,
+    use_td: bool | None = None,
 ) -> torch.Tensor:
     K = qweight.shape[0]
     M = scales.shape[1]
@@ -264,6 +313,30 @@ def awq_dequantize_triton(
         triton.cdiv(X, META["BLOCK_SIZE_X"]),
         triton.cdiv(Y, META["BLOCK_SIZE_Y"]),
     )
+
+    # TD needs unit stride in the last dim, row strides that are a multiple of
+    # 16 bytes, power-of-two tiles and at most 256 elements along the
+    # contiguous dim of each descriptor tile.
+    is_pow2 = lambda v: v > 0 and (v & (v - 1)) == 0
+    use_td = (
+        use_tensor_descriptor(use_td)
+        and qweight.stride(1) == 1
+        and scales.stride(1) == 1
+        and zeros.stride(1) == 1
+        and qweight.stride(0) == X
+        and zeros.stride(0) == X
+        and scales.stride(0) == X * 8
+        and (X * qweight.element_size()) % 16 == 0
+        and (X * zeros.element_size()) % 16 == 0
+        and (X * 8 * scales.element_size()) % 16 == 0
+        and is_pow2(block_size_x)
+        and is_pow2(block_size_y)
+        and block_size_x * 8 <= 256
+    )
+    if use_td and qweight.device not in _TD_ALLOCATOR_DEVICES:
+        set_triton_allocator(qweight.device)
+        _TD_ALLOCATOR_DEVICES.add(qweight.device)
+
     awq_dequantize_kernel[grid](
         qweight,
         scales,
@@ -274,6 +347,7 @@ def awq_dequantize_triton(
         Y,
         BLOCK_SIZE_X=block_size_x,
         BLOCK_SIZE_Y=block_size_y,
+        USE_TD=use_td,
     )
 
     return result
