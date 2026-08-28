@@ -8,7 +8,8 @@
 
 import torch
 
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 
 
 @triton.autotune(
@@ -59,7 +60,7 @@ from vllm.triton_utils import tl, triton
             num_warps=2,
         ),
     ],
-    key=["chunk_size", "K", "IS_CAUSAL"],
+    key=["chunk_size", "K", "IS_CAUSAL", "USE_TD"],
 )
 @triton.jit
 def _bmm_chunk_fwd_kernel(
@@ -88,6 +89,7 @@ def _bmm_chunk_fwd_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     pid_ch = tl.program_id(axis=1).to(tl.int64)
     pid_c = pid_ch // ngroups
@@ -114,20 +116,44 @@ def _bmm_chunk_fwd_kernel(
 
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
+    if USE_TD:
+        # Descriptor shapes are the same masks the pointer path applies:
+        # rows are clamped to the live part of the chunk, columns to K.
+        a_desc = tl.make_tensor_descriptor(
+            a_ptr,
+            shape=[chunk_size_limit, K],
+            strides=[stride_a_seqlen, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K],
+        )
+        # b is seqlen-major like a, but the dot needs b.T tiles, so describe
+        # the underlying buffer and transpose each loaded tile.
+        b_desc = tl.make_tensor_descriptor(
+            b_ptr,
+            shape=[chunk_size_limit, K],
+            strides=[stride_b_seqlen, 1],
+            block_shape=[BLOCK_SIZE_N, BLOCK_SIZE_K],
+        )
+
     # compute a * b.T
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a = tl.load(
-            a_ptrs,
-            mask=(offs_m[:, None] < chunk_size_limit)
-            & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
-            other=0.0,
-        ).to(dot_dtype)
-        b = tl.load(
-            b_ptrs,
-            mask=(offs_k[:, None] < K - k * BLOCK_SIZE_K)
-            & (offs_n[None, :] < chunk_size_limit),
-            other=0.0,
-        ).to(dot_dtype)
+        if USE_TD:
+            a = a_desc.load([pid_m * BLOCK_SIZE_M, k * BLOCK_SIZE_K]).to(dot_dtype)
+            b = tl.trans(
+                b_desc.load([pid_n * BLOCK_SIZE_N, k * BLOCK_SIZE_K]).to(dot_dtype)
+            )
+        else:
+            a = tl.load(
+                a_ptrs,
+                mask=(offs_m[:, None] < chunk_size_limit)
+                & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
+                other=0.0,
+            ).to(dot_dtype)
+            b = tl.load(
+                b_ptrs,
+                mask=(offs_k[:, None] < K - k * BLOCK_SIZE_K)
+                & (offs_n[None, :] < chunk_size_limit),
+                other=0.0,
+            ).to(dot_dtype)
         acc += tl.dot(a, b)
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
@@ -145,7 +171,9 @@ def _bmm_chunk_fwd_kernel(
     )
 
 
-def _bmm_chunk_fwd(a, b, chunk_size, cu_chunk_seqlens, causal=False, output_dtype=None):
+def _bmm_chunk_fwd(
+    a, b, chunk_size, cu_chunk_seqlens, causal=False, output_dtype=None, use_td=None
+):
     """
     Argument:
         a: (seqlen, ngroups, k)
@@ -184,6 +212,22 @@ def _bmm_chunk_fwd(a, b, chunk_size, cu_chunk_seqlens, causal=False, output_dtyp
         * triton.cdiv(chunk_size, META["BLOCK_SIZE_N"]),
         nchunks * ngroups,
     )
+    # TD operand loads: descriptors need a unit innermost stride plus a
+    # 16-byte aligned base, row pitch and k extent on both operands.
+    a_esz, b_esz = a.element_size(), b.element_size()
+    use_td = (
+        use_tensor_descriptor(use_td)
+        and a.stride(2) == 1
+        and b.stride(2) == 1
+        and (k * a_esz) % 16 == 0
+        and (k * b_esz) % 16 == 0
+        and all((s * a_esz) % 16 == 0 for s in a.stride()[:2])
+        and all((s * b_esz) % 16 == 0 for s in b.stride()[:2])
+        and a.data_ptr() % 16 == 0
+        and b.data_ptr() % 16 == 0
+    )
+    if use_td:
+        set_triton_allocator(a.device)
     with torch.accelerator.device_index(a.device.index):
         _bmm_chunk_fwd_kernel[grid](
             a_ptr=a,
@@ -205,5 +249,6 @@ def _bmm_chunk_fwd(a, b, chunk_size, cu_chunk_seqlens, causal=False, output_dtyp
             stride_outn=out.stride(-1),
             IS_CAUSAL=causal,
             dot_dtype=dot_dtype,
+            USE_TD=use_td,
         )
     return out
