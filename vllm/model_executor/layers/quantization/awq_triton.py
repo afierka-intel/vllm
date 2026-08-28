@@ -3,9 +3,12 @@
 
 import torch
 
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 
 AWQ_TRITON_SUPPORTED_GROUP_SIZES = [-1, 32, 64, 128]
+
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
 
 
 @triton.jit
@@ -120,6 +123,7 @@ def awq_gemm_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     SPLIT_K: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     pid = tl.program_id(axis=0)
     pid_z = tl.program_id(1)
@@ -172,16 +176,37 @@ def awq_gemm_kernel(
     a_ptrs = a_ptr + offsets_a
     b_ptrs = b_ptr + offsets_b
 
+    if USE_TD:
+        a_desc = tl.make_tensor_descriptor(
+            a_ptr,
+            shape=[M, K],
+            strides=[K, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K],
+        )
+        # qweight packs 8 4-bit values per int32, so the descriptor covers the
+        # packed [K, N // 8] buffer and unpacking stays unchanged below.
+        b_desc = tl.make_tensor_descriptor(
+            b_ptr,
+            shape=[K, N // 8],
+            strides=[N // 8, 1],
+            block_shape=[BLOCK_SIZE_K, BLOCK_SIZE_N // 8],
+        )
+
     # NOTE: Use this in TRITON_INTERPRET=1 mode instead of tl.cdiv
     # block_offset = BLOCK_SIZE_K * SPLIT_K
     # for k in range(0, (K + block_offset - 1) // (block_offset)):
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K * SPLIT_K)):
-        masks_k = offsets_k < K
-        masks_a = masks_am[:, None] & masks_k[None, :]
-        a = tl.load(a_ptrs, mask=masks_a, other=0.0)
+        if USE_TD:
+            off_k = pid_z * BLOCK_SIZE_K + k * BLOCK_SIZE_K * SPLIT_K
+            a = a_desc.load([pid_m * BLOCK_SIZE_M, off_k])
+            b = b_desc.load([off_k, pid_n * (BLOCK_SIZE_N // 8)])
+        else:
+            masks_k = offsets_k < K
+            masks_a = masks_am[:, None] & masks_k[None, :]
+            a = tl.load(a_ptrs, mask=masks_a, other=0.0)
 
-        masks_b = masks_k[:, None] & masks_bn[None, :]
-        b = tl.load(b_ptrs, mask=masks_b, other=0.0)
+            masks_b = masks_k[:, None] & masks_bn[None, :]
+            b = tl.load(b_ptrs, mask=masks_b, other=0.0)
         b = tl.interleave(b, b)
         b = tl.interleave(b, b)
         b = tl.interleave(b, b)
@@ -293,6 +318,7 @@ def awq_gemm_triton(
     block_size_m: int = 32,
     block_size_n: int = 32,
     block_size_k: int = 32,
+    use_td: bool | None = None,
 ) -> torch.Tensor:
     M, K = input.shape
     N = qweight.shape[1] * 8
@@ -314,6 +340,27 @@ def awq_gemm_triton(
 
     result = torch.zeros((split_k_iters, M, N), dtype=scales.dtype, device=input.device)
 
+    # TD covers the two tl.dot operands; gated on the row-major layout the
+    # kernel already assumes plus 16-byte tile/row alignment. BLOCK_SIZE_N >= 32
+    # keeps the packed qweight tile (BLOCK_SIZE_N // 8 int32) at >= 16 bytes.
+    use_td = (
+        use_tensor_descriptor(use_td)
+        and input.stride(1) == 1
+        and input.stride(0) == K
+        and qweight.stride(1) == 1
+        and qweight.stride(0) == N // 8
+        and (K * input.element_size()) % 16 == 0
+        and ((N // 8) * qweight.element_size()) % 16 == 0
+        and (block_size_k * input.element_size()) % 16 == 0
+        and block_size_m & (block_size_m - 1) == 0
+        and block_size_n & (block_size_n - 1) == 0
+        and block_size_k & (block_size_k - 1) == 0
+        and block_size_n >= 32
+    )
+    if use_td and input.device not in _TD_ALLOCATOR_DEVICES:
+        set_triton_allocator(input.device)
+        _TD_ALLOCATOR_DEVICES.add(input.device)
+
     # A = input, B = qweight, C = result
     # A = M x K, B = K x N, C = M x N
     awq_gemm_kernel[grid](
@@ -330,6 +377,7 @@ def awq_gemm_triton(
         BLOCK_SIZE_N=block_size_n,
         BLOCK_SIZE_K=block_size_k,
         SPLIT_K=split_k_iters,
+        USE_TD=use_td,
     )
 
     result = result.sum(0)
