@@ -28,7 +28,8 @@ from vllm.model_executor.parameter import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 from vllm.utils.deep_gemm import (
     get_tma_aligned_size,
     is_deep_gemm_e8m0_used,
@@ -733,6 +734,9 @@ def per_token_group_quant_fp8_packed_for_deepgemm(
     return x_q, x_s_packed
 
 
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
+
+
 @triton.jit
 def _w8a8_triton_block_scaled_mm(
     # Pointers to inputs and output
@@ -764,6 +768,7 @@ def _w8a8_triton_block_scaled_mm(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     """Triton-accelerated function used to perform linear operations (dot
     product) on input tensors `A` and `B` with block-wise quantization, and
@@ -790,10 +795,30 @@ def _w8a8_triton_block_scaled_mm(
     offs_bsn = offs_bn // group_n
     Bs_ptrs = Bs + offs_bsn * stride_Bs_n
 
+    if USE_TD:
+        a_desc = tl.make_tensor_descriptor(
+            A,
+            shape=[M, K],
+            strides=[stride_am, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K],
+        )
+        # B is an [N, K] buffer consumed as a [K, N] view (stride_bk == 1), so
+        # describe the N-major buffer and transpose each tile.
+        b_desc = tl.make_tensor_descriptor(
+            B,
+            shape=[N, K],
+            strides=[stride_bn, 1],
+            block_shape=[BLOCK_SIZE_N, BLOCK_SIZE_K],
+        )
+
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+        if USE_TD:
+            a = a_desc.load([pid_m * BLOCK_SIZE_M, k * BLOCK_SIZE_K])
+            b = tl.trans(b_desc.load([pid_n * BLOCK_SIZE_N, k * BLOCK_SIZE_K]))
+        else:
+            a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
+            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
 
         k_start = k * BLOCK_SIZE_K
         offs_ks = k_start // group_k
@@ -864,6 +889,7 @@ def w8a8_triton_block_scaled_mm(
     Bs: torch.Tensor,
     block_size: list[int],
     output_dtype: torch.dtype = torch.float16,
+    use_td: bool | None = None,
 ) -> torch.Tensor:
     """This function performs matrix multiplication with block-wise
     quantization.
@@ -957,6 +983,32 @@ def w8a8_triton_block_scaled_mm(
             triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
         )
 
+    # TD operand loads. A is described as the flattened [M, K] activation and B
+    # as its native [N, K] buffer (the kernel transposes each tile), so both
+    # need an inner stride of 1, 16B-aligned bases/row strides and power-of-two
+    # tiles whose innermost extent is a 16B multiple.
+    def _pow2(v: int) -> bool:
+        return v > 0 and (v & (v - 1)) == 0
+
+    a_esize, b_esize = A.element_size(), B.element_size()
+    use_td = (
+        use_tensor_descriptor(use_td)
+        and A.stride(-1) == 1
+        and B.stride(1) == 1
+        and A.data_ptr() % 16 == 0
+        and B.data_ptr() % 16 == 0
+        and (A.stride(-2) * a_esize) % 16 == 0
+        and (B.stride(0) * b_esize) % 16 == 0
+        and _pow2(config["BLOCK_SIZE_M"])
+        and _pow2(config["BLOCK_SIZE_N"])
+        and _pow2(config["BLOCK_SIZE_K"])
+        and (config["BLOCK_SIZE_K"] * a_esize) % 16 == 0
+        and (config["BLOCK_SIZE_K"] * b_esize) % 16 == 0
+    )
+    if use_td and A.device not in _TD_ALLOCATOR_DEVICES:
+        set_triton_allocator(A.device)
+        _TD_ALLOCATOR_DEVICES.add(A.device)
+
     _w8a8_triton_block_scaled_mm[grid](
         A,
         B,
@@ -979,6 +1031,7 @@ def w8a8_triton_block_scaled_mm(
         Bs.stride(1),
         Bs.stride(0),
         **config,
+        USE_TD=use_td,
     )
 
     return C
