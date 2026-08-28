@@ -12,8 +12,25 @@ import torch.nn as nn
 
 from vllm.model_executor.custom_op import CustomOp
 from vllm.platforms import current_platform
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 from vllm.utils.math_utils import cdiv, next_power_of_2
+
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
+
+
+def _td_row_major(t: torch.Tensor | None, row_stride: int) -> bool:
+    # Descriptors need a unit innermost stride, a 16B-aligned base and a
+    # 16B-multiple row pitch.
+    if t is None:
+        return True
+    return (
+        t.stride(-1) == 1
+        and t.stride(0) == row_stride
+        and (row_stride * t.element_size()) % 16 == 0
+        and t.data_ptr() % 16 == 0
+    )
+
 
 @triton.heuristics(
     {
@@ -48,6 +65,7 @@ def layer_norm_gated_fwd_kernel(
     HAS_WEIGHT: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     launch_pdl: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     i_t = tl.program_id(0)
 
@@ -58,18 +76,40 @@ def layer_norm_gated_fwd_kernel(
         tl.extra.cuda.gdc_wait()
         tl.extra.cuda.gdc_launch_dependents()
 
-    p_x = tl.make_block_ptr(x, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    b_x = tl.load(p_x, boundary_check=(0, 1)).to(tl.float32)
+    if USE_TD:
+        x_desc = tl.make_tensor_descriptor(
+            x, shape=[T, D], strides=[D, 1], block_shape=[BT, BD]
+        )
+        b_x = x_desc.load([i_t * BT, 0]).to(tl.float32)
+    else:
+        p_x = tl.make_block_ptr(x, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
+        b_x = tl.load(p_x, boundary_check=(0, 1)).to(tl.float32)
     if HAS_RESIDUAL:
-        p_res = tl.make_block_ptr(
-            residual, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0)
-        )
-        b_x += tl.load(p_res, boundary_check=(0, 1)).to(tl.float32)
+        if USE_TD:
+            res_desc = tl.make_tensor_descriptor(
+                residual, shape=[T, D], strides=[D, 1], block_shape=[BT, BD]
+            )
+            b_x += res_desc.load([i_t * BT, 0]).to(tl.float32)
+        else:
+            p_res = tl.make_block_ptr(
+                residual, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0)
+            )
+            b_x += tl.load(p_res, boundary_check=(0, 1)).to(tl.float32)
     if STORE_RESIDUAL_OUT:
-        p_res_out = tl.make_block_ptr(
-            residual_out, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0)
-        )
-        tl.store(p_res_out, b_x.to(p_res_out.dtype.element_ty), boundary_check=(0, 1))
+        if USE_TD:
+            res_out_desc = tl.make_tensor_descriptor(
+                residual_out, shape=[T, D], strides=[D, 1], block_shape=[BT, BD]
+            )
+            res_out_desc.store([i_t * BT, 0], b_x.to(residual_out.dtype.element_ty))
+        else:
+            p_res_out = tl.make_block_ptr(
+                residual_out, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0)
+            )
+            tl.store(
+                p_res_out,
+                b_x.to(p_res_out.dtype.element_ty),
+                boundary_check=(0, 1),
+            )
     if not IS_RMS_NORM:
         b_mean = tl.sum(b_x, axis=1) / D
         p_mean = tl.make_block_ptr(mean, (T,), (1,), (i_t * BT,), (BT,), (0,))
@@ -98,21 +138,35 @@ def layer_norm_gated_fwd_kernel(
         b_y = b_y + b_b[None, :]
 
     # swish/sigmoid output gate
-    o_t = i_t * BT + tl.arange(0, BT)
-    o_g = (o_t // H) * g_stride_n + (o_t % H) * D
-    b_g = tl.load(
-        g + o_g[:, None] + o_d[None, :],
-        mask=(o_t[:, None] < T) & m_d[None, :],
-        other=0.0,
-    ).to(tl.float32)
+    if USE_TD:
+        # Host side only enables TD when g_stride_n == H * D, i.e. the gate is
+        # a plain row-major (T, D) buffer.
+        g_desc = tl.make_tensor_descriptor(
+            g, shape=[T, D], strides=[D, 1], block_shape=[BT, BD]
+        )
+        b_g = g_desc.load([i_t * BT, 0]).to(tl.float32)
+    else:
+        o_t = i_t * BT + tl.arange(0, BT)
+        o_g = (o_t // H) * g_stride_n + (o_t % H) * D
+        b_g = tl.load(
+            g + o_g[:, None] + o_d[None, :],
+            mask=(o_t[:, None] < T) & m_d[None, :],
+            other=0.0,
+        ).to(tl.float32)
     if ACTIVATION == "swish" or ACTIVATION == "silu":
         b_y = b_y * b_g * tl.sigmoid(b_g)
     elif ACTIVATION == "sigmoid":
         b_y = b_y * tl.sigmoid(b_g)
 
     # Write output
-    p_y = tl.make_block_ptr(y, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
+    if USE_TD:
+        y_desc = tl.make_tensor_descriptor(
+            y, shape=[T, D], strides=[D, 1], block_shape=[BT, BD]
+        )
+        y_desc.store([i_t * BT, 0], b_y.to(y.dtype.element_ty))
+    else:
+        p_y = tl.make_block_ptr(y, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
+        tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
 
 
 @triton.heuristics(
@@ -209,6 +263,7 @@ def layer_norm_gated_fwd(
     is_rms_norm: bool = False,
     H: int = 1,
     g_stride_n: int | None = None,
+    use_td: bool | None = None,
 ):
     if residual is not None:
         residual_dtype = residual.dtype
@@ -243,6 +298,25 @@ def layer_norm_gated_fwd(
         raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
     if D <= 512:
         BT = 16
+        # TD requires row-major (T, D) tiles: BD == D keeps the descriptor box
+        # equal to the innermost extent, and the gate must be unstrided so the
+        # (n, h) -> row mapping collapses to o_t * D.
+        use_td = (
+            use_tensor_descriptor(use_td)
+            and BD == D
+            and _td_row_major(x, D)
+            and _td_row_major(y, D)
+            and _td_row_major(residual, D)
+            and _td_row_major(residual_out, D)
+            and g_stride_n == H * D
+            and g.is_contiguous()
+            and g.numel() == T * D
+            and (D * g.element_size()) % 16 == 0
+            and g.data_ptr() % 16 == 0
+        )
+        if use_td and x.device not in _TD_ALLOCATOR_DEVICES:
+            set_triton_allocator(x.device)
+            _TD_ALLOCATOR_DEVICES.add(x.device)
         layer_norm_gated_fwd_kernel[(cdiv(T, BT),)](
             x=x,
             g=g,
@@ -264,6 +338,7 @@ def layer_norm_gated_fwd(
             IS_RMS_NORM=is_rms_norm,
             num_warps=8,
             launch_pdl=current_platform.is_arch_support_pdl(),
+            USE_TD=use_td,
         )
     else:
         layer_norm_gated_fwd_kernel1[(T,)](
