@@ -6,12 +6,25 @@
 
 # ruff: noqa: E501,SIM102
 
+import torch
 from packaging import version
 
 from vllm.model_executor.layers.mamba.ops.triton_helpers import fast_exp
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 
 TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
+
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
+
+
+def _td_compatible(t: torch.Tensor) -> bool:
+    # Descriptors need a unit inner stride plus 16-byte aligned inner extent
+    # and leading strides, since every tile base is a multiple of those.
+    esz = t.element_size()
+    if t.stride(-1) != 1 or (t.shape[-1] * esz) % 16 != 0:
+        return False
+    return all((s * esz) % 16 == 0 for s in t.stride()[:-1])
 
 
 @triton.autotune(
@@ -208,6 +221,9 @@ def _chunk_scan_fwd_kernel(
     BLOCK_SIZE_DSTATE: tl.constexpr,
     IS_TRITON_22: tl.constexpr,
     HAS_INITSTATES: tl.constexpr,
+    # Tensor-descriptor path for the four tl.dot operands (C, prev_states,
+    # cb, x). Pointer path is unchanged when False.
+    USE_TD: tl.constexpr = False,
 ):
     pid_c = tl.program_id(axis=1).to(tl.int64)
     pid_h = tl.program_id(axis=2)
@@ -270,14 +286,36 @@ def _chunk_scan_fwd_kernel(
         offs_m[:, None] * stride_C_seqlen + offs_k_dstate[None, :] * stride_C_dstate
     )
 
+    BLOCK_K_DSTATE: tl.constexpr = (
+        BLOCK_SIZE_DSTATE if BLOCK_SIZE_DSTATE <= 128 else BLOCK_SIZE_K
+    )
+    if USE_TD:
+        C_desc = tl.make_tensor_descriptor(
+            C_ptr,
+            shape=[chunk_size_limit, dstate],
+            strides=[stride_C_seqlen, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_K_DSTATE],
+        )
+        # prev_states lives as [hdim, dstate] but is consumed as
+        # [dstate, hdim], so describe the buffer and transpose each tile.
+        prev_states_desc = tl.make_tensor_descriptor(
+            prev_states_ptr,
+            shape=[hdim, dstate],
+            strides=[prev_states_hdim, 1],
+            block_shape=[BLOCK_SIZE_N, BLOCK_K_DSTATE],
+        )
+
     scale_m = fast_exp(dA_cs_m)
     if BLOCK_SIZE_DSTATE <= 128:
-        C = tl.load(
-            C_ptrs,
-            mask=(offs_m[:, None] < chunk_size_limit)
-            & (offs_k_dstate[None, :] < dstate),
-            other=0.0,
-        )
+        if USE_TD:
+            C = C_desc.load([pid_m * BLOCK_SIZE_M, 0])
+        else:
+            C = tl.load(
+                C_ptrs,
+                mask=(offs_m[:, None] < chunk_size_limit)
+                & (offs_k_dstate[None, :] < dstate),
+                other=0.0,
+            )
 
         if not HAS_INITSTATES and (seq_idx != seq_idx_prev):
             # if no init states AND starting a new sequence, we need zeros
@@ -286,16 +324,19 @@ def _chunk_scan_fwd_kernel(
             )
         else:
             # otherwise read the previous state
-            prev_states_ptrs = (
-                prev_states_ptr
-                + offs_n[None, :] * prev_states_hdim
-                + offs_k_dstate[:, None] * prev_states_dstate
-            )
-            prev_states = tl.load(
-                prev_states_ptrs,
-                mask=(offs_k_dstate[:, None] < dstate) & (offs_n[None, :] < hdim),
-                other=0.0,
-            )
+            if USE_TD:
+                prev_states = tl.trans(prev_states_desc.load([pid_n * BLOCK_SIZE_N, 0]))
+            else:
+                prev_states_ptrs = (
+                    prev_states_ptr
+                    + offs_n[None, :] * prev_states_hdim
+                    + offs_k_dstate[:, None] * prev_states_dstate
+                )
+                prev_states = tl.load(
+                    prev_states_ptrs,
+                    mask=(offs_k_dstate[:, None] < dstate) & (offs_n[None, :] < hdim),
+                    other=0.0,
+                )
             prev_states = prev_states.to(C_ptr.dtype.element_ty)
 
         acc = tl.dot(C, prev_states) * scale_m[:, None]
@@ -307,23 +348,31 @@ def _chunk_scan_fwd_kernel(
             + offs_k_dstate[:, None] * prev_states_dstate
         )
         for k in range(0, dstate, BLOCK_SIZE_K):
-            C = tl.load(
-                C_ptrs,
-                mask=(offs_m[:, None] < chunk_size_limit)
-                & (offs_k_dstate[None, :] < dstate - k),
-                other=0.0,
-            )
+            if USE_TD:
+                C = C_desc.load([pid_m * BLOCK_SIZE_M, k])
+            else:
+                C = tl.load(
+                    C_ptrs,
+                    mask=(offs_m[:, None] < chunk_size_limit)
+                    & (offs_k_dstate[None, :] < dstate - k),
+                    other=0.0,
+                )
             if not HAS_INITSTATES and (seq_idx != seq_idx_prev):
                 prev_states = tl.zeros(
                     (BLOCK_SIZE_K, BLOCK_SIZE_N), dtype=C_ptr.dtype.element_ty
                 )
             else:
-                prev_states = tl.load(
-                    prev_states_ptrs,
-                    mask=(offs_k_dstate[:, None] < dstate - k)
-                    & (offs_n[None, :] < hdim),
-                    other=0.0,
-                )
+                if USE_TD:
+                    prev_states = tl.trans(
+                        prev_states_desc.load([pid_n * BLOCK_SIZE_N, k])
+                    )
+                else:
+                    prev_states = tl.load(
+                        prev_states_ptrs,
+                        mask=(offs_k_dstate[:, None] < dstate - k)
+                        & (offs_n[None, :] < hdim),
+                        other=0.0,
+                    )
                 prev_states = prev_states.to(C_ptr.dtype.element_ty)
             acc += tl.dot(C, prev_states)
             C_ptrs += BLOCK_SIZE_K
@@ -344,12 +393,29 @@ def _chunk_scan_fwd_kernel(
         if not IS_CAUSAL
         else min((pid_m + 1) * BLOCK_SIZE_M, chunk_size_limit)
     )
+    if USE_TD:
+        cb_desc = tl.make_tensor_descriptor(
+            cb_ptr,
+            shape=[chunk_size, chunk_size],
+            strides=[stride_cb_csize_m, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K],
+        )
+        x_desc = tl.make_tensor_descriptor(
+            x_ptr,
+            shape=[chunk_size_limit, hdim],
+            strides=[stride_x_seqlen, 1],
+            block_shape=[BLOCK_SIZE_K, BLOCK_SIZE_N],
+        )
     for k in range(0, K_MAX, BLOCK_SIZE_K):
-        cb = tl.load(
-            cb_ptrs,
-            mask=(offs_m[:, None] < chunk_size) & (offs_k[None, :] < chunk_size - k),
-            other=0.0,
-        ).to(tl.float32)
+        if USE_TD:
+            cb = cb_desc.load([pid_m * BLOCK_SIZE_M, k]).to(tl.float32)
+        else:
+            cb = tl.load(
+                cb_ptrs,
+                mask=(offs_m[:, None] < chunk_size)
+                & (offs_k[None, :] < chunk_size - k),
+                other=0.0,
+            ).to(tl.float32)
         dA_cs_k = tl.load(dA_cumsum_ptrs, mask=offs_k < chunk_size - k, other=0.0).to(
             tl.float32
         )
@@ -362,11 +428,15 @@ def _chunk_scan_fwd_kernel(
             mask = offs_m[:, None] >= k + offs_k[None, :]
             cb = tl.where(mask, cb, 0.0)
         cb = cb.to(x_ptr.dtype.element_ty)
-        x = tl.load(
-            x_ptrs,
-            mask=(offs_k[:, None] < chunk_size_limit - k) & (offs_n[None, :] < hdim),
-            other=0.0,
-        )
+        if USE_TD:
+            x = x_desc.load([k, pid_n * BLOCK_SIZE_N])
+        else:
+            x = tl.load(
+                x_ptrs,
+                mask=(offs_k[:, None] < chunk_size_limit - k)
+                & (offs_n[None, :] < hdim),
+                other=0.0,
+            )
         acc += tl.dot(cb, x)
         cb_ptrs += BLOCK_SIZE_K * stride_cb_csize_k
         x_ptrs += BLOCK_SIZE_K * stride_x_seqlen
@@ -428,6 +498,7 @@ def _chunk_scan_fwd(
     D=None,
     z=None,
     initial_states=None,
+    use_td=None,
 ):
     assert seq_idx is not None, "this implementation requires seq_idx"
 
@@ -464,6 +535,21 @@ def _chunk_scan_fwd(
         if initial_states is not None
         else (0, 0, 0, 0)
     )
+
+    # TD covers the four tl.dot operands; all of them need a unit inner stride
+    # and 16-byte aligned leading strides.
+    use_td = (
+        use_tensor_descriptor(use_td)
+        and _td_compatible(cb)
+        and _td_compatible(x)
+        and _td_compatible(C)
+        and _td_compatible(states)
+        and (initial_states is None or _td_compatible(initial_states))
+    )
+    if use_td and x.device not in _TD_ALLOCATOR_DEVICES:
+        # Device-side descriptors need a PyTorch-backed scratch allocator.
+        set_triton_allocator(x.device)
+        _TD_ALLOCATOR_DEVICES.add(x.device)
 
     _chunk_scan_fwd_kernel[grid](
         cb_ptr=cb,
@@ -521,5 +607,6 @@ def _chunk_scan_fwd(
         BLOCK_SIZE_DSTATE=max(triton.next_power_of_2(dstate), 16),
         IS_TRITON_22=TRITON_22,
         HAS_INITSTATES=initial_states is not None,
+        USE_TD=use_td,
     )
     return
