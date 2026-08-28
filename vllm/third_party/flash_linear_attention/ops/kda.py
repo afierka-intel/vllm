@@ -13,7 +13,8 @@ import torch
 import torch.nn as nn
 
 from vllm.model_executor.custom_op import CustomOp
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 from vllm.utils.math_utils import RCP_LN2, cdiv, next_power_of_2
 
 from .chunk_delta_h import chunk_gated_delta_rule_fwd_h
@@ -644,7 +645,7 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @triton.autotune(
     configs=[triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8]],
-    key=["BK", "BT"],
+    key=["BK", "BT", "USE_TD"],
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
@@ -664,6 +665,7 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
     BC: tl.constexpr,
     BK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     i_t, i_i, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
@@ -689,33 +691,59 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
     m_A = (i_t * BT + i_i * BC + o_i) < T
     o_A = (bos + i_t * BT + i_i * BC + o_i) * H * BT + i_h * BT + i_i * BC
 
-    p_q = tl.make_block_ptr(
-        q + (bos * H + i_h) * K,
-        (T, K),
-        (H * K, 1),
-        (i_t * BT + i_i * BC, 0),
-        (BC, BK),
-        (1, 0),
-    )
-    p_k = tl.make_block_ptr(
-        k + (bos * H + i_h) * K,
-        (T, K),
-        (H * K, 1),
-        (i_t * BT + i_i * BC, 0),
-        (BC, BK),
-        (1, 0),
-    )
-    p_g = tl.make_block_ptr(
-        g + (bos * H + i_h) * K,
-        (T, K),
-        (H * K, 1),
-        (i_t * BT + i_i * BC, 0),
-        (BC, BK),
-        (1, 0),
-    )
-    b_q = tl.load(p_q, boundary_check=(0, 1))
-    b_k = tl.load(p_k, boundary_check=(0, 1))
-    b_g = tl.load(p_g, boundary_check=(0, 1))
+    if USE_TD:
+        # Host gates TD on BK == K and an inner stride of 1, so the tile is
+        # in-bounds on the last dim and rows past T are zero-filled, matching
+        # boundary_check on the block-pointer path.
+        q_desc = tl.make_tensor_descriptor(
+            q + (bos * H + i_h) * K,
+            shape=[T, K],
+            strides=[H * K, 1],
+            block_shape=[BC, BK],
+        )
+        k_desc = tl.make_tensor_descriptor(
+            k + (bos * H + i_h) * K,
+            shape=[T, K],
+            strides=[H * K, 1],
+            block_shape=[BC, BK],
+        )
+        g_desc = tl.make_tensor_descriptor(
+            g + (bos * H + i_h) * K,
+            shape=[T, K],
+            strides=[H * K, 1],
+            block_shape=[BC, BK],
+        )
+        b_q = q_desc.load([i_t * BT + i_i * BC, 0])
+        b_k = k_desc.load([i_t * BT + i_i * BC, 0])
+        b_g = g_desc.load([i_t * BT + i_i * BC, 0])
+    else:
+        p_q = tl.make_block_ptr(
+            q + (bos * H + i_h) * K,
+            (T, K),
+            (H * K, 1),
+            (i_t * BT + i_i * BC, 0),
+            (BC, BK),
+            (1, 0),
+        )
+        p_k = tl.make_block_ptr(
+            k + (bos * H + i_h) * K,
+            (T, K),
+            (H * K, 1),
+            (i_t * BT + i_i * BC, 0),
+            (BC, BK),
+            (1, 0),
+        )
+        p_g = tl.make_block_ptr(
+            g + (bos * H + i_h) * K,
+            (T, K),
+            (H * K, 1),
+            (i_t * BT + i_i * BC, 0),
+            (BC, BK),
+            (1, 0),
+        )
+        b_q = tl.load(p_q, boundary_check=(0, 1))
+        b_k = tl.load(p_k, boundary_check=(0, 1))
+        b_g = tl.load(p_g, boundary_check=(0, 1))
 
     p_b = beta + (bos + i_t * BT + i_i * BC + o_i) * H + i_h
     b_k = b_k * tl.load(p_b, mask=m_A, other=0)[:, None]
@@ -747,6 +775,7 @@ def chunk_kda_scaled_dot_kkt_fwd(
     chunk_indices: torch.Tensor | None = None,
     chunk_size: int = FLA_CHUNK_SIZE,
     output_dtype: torch.dtype = torch.float32,
+    use_td: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     r"""
     Compute beta * K * K^T.
@@ -800,6 +829,23 @@ def chunk_kda_scaled_dot_kkt_fwd(
         NC=NC,
     )
 
+    # TD tile loads for q/k/g; require inner stride 1, BK == K so the
+    # [BC, BK] tile fits the last dim, and 16B-aligned tile rows.
+    use_td = (
+        use_tensor_descriptor(use_td)
+        and BK == K
+        and (BC & (BC - 1)) == 0
+        and gk is not None
+        and q.stride(-1) == 1
+        and k.stride(-1) == 1
+        and gk.stride(-1) == 1
+        and (K * q.element_size()) % 16 == 0
+        and (K * k.element_size()) % 16 == 0
+        and (K * gk.element_size()) % 16 == 0
+    )
+    if use_td:
+        set_triton_allocator(k.device)
+
     grid = (NT, NC, B * H)
     chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra[grid](
         q=q,
@@ -817,6 +863,7 @@ def chunk_kda_scaled_dot_kkt_fwd(
         BT=BT,
         BC=BC,
         BK=BK,
+        USE_TD=use_td,
     )
     return A, Aqk
 
