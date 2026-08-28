@@ -24,7 +24,8 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8Static128BlockSym,
 )
 from vllm.platforms import current_platform
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 from vllm.utils.deep_gemm import (
     DeepGemmQuantScaleFMT,
     fp8_m_grouped_gemm_nt_masked,
@@ -35,6 +36,8 @@ from vllm.utils.deep_gemm import (
 from vllm.utils.math_utils import cdiv, round_up
 
 logger = init_logger(__name__)
+
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
 
 
 def scales_shape_stride_dtype(
@@ -86,6 +89,9 @@ def _silu_mul_fp8_quant_deep_gemm(
     # Meta ---------------------------------------------------------------
     BLOCK: tl.constexpr,
     NUM_STAGES: tl.constexpr,
+    # TD: padded token dim of input/y_q, only read when USE_TD
+    T=0,
+    USE_TD: tl.constexpr = False,
 ):
     G = H // GROUP_SIZE
 
@@ -109,11 +115,39 @@ def _silu_mul_fp8_quant_deep_gemm(
     base_yq_offset = e * stride_yq_e + g * GROUP_SIZE * stride_yq_h + cols * stride_yq_h
     base_ys_offset = e * stride_ys_e + g * stride_ys_g
 
+    if USE_TD:
+        # make_tensor_descriptor needs an innermost stride of 1; the launcher
+        # only enables USE_TD for H-contiguous input/y_q. The expert index is
+        # folded into the base pointers, so a tile is one [1, BLOCK] row of
+        # the (T, 2*H) / (T, H) slice owned by this expert. Descriptor
+        # offsets must be i32.
+        td_col = (g * GROUP_SIZE).to(tl.int32)
+        td_col_up = td_col + H
+        i_desc = tl.make_tensor_descriptor(
+            input_ptr + e * stride_i_e,
+            shape=[T, 2 * H],
+            strides=[stride_i_t, 1],
+            block_shape=[1, BLOCK],
+        )
+        yq_desc = tl.make_tensor_descriptor(
+            y_q_ptr + e * stride_yq_e,
+            shape=[T, H],
+            strides=[stride_yq_t, 1],
+            block_shape=[1, BLOCK],
+        )
+
     for t in tl.range(0, n_tokens, num_stages=NUM_STAGES):
-        gate = tl.load(
-            input_ptr + base_gate_offset + t * stride_i_t, mask=mask, other=0.0
-        ).to(tl.float32)
-        up = tl.load(input_ptr + base_up_offset + t * stride_i_t, mask=mask, other=0.0)
+        if USE_TD:
+            td_row = t.to(tl.int32)
+            gate = i_desc.load([td_row, td_col]).to(tl.float32)
+            up = i_desc.load([td_row, td_col_up])
+        else:
+            gate = tl.load(
+                input_ptr + base_gate_offset + t * stride_i_t, mask=mask, other=0.0
+            ).to(tl.float32)
+            up = tl.load(
+                input_ptr + base_up_offset + t * stride_i_t, mask=mask, other=0.0
+            )
 
         gate = gate * (1.0 / (1.0 + tl.exp(-gate)))
         y = gate * up
@@ -127,7 +161,10 @@ def _silu_mul_fp8_quant_deep_gemm(
 
         y_q = tl.clamp(y / y_s, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
 
-        tl.store(y_q_ptr + base_yq_offset + t * stride_yq_t, y_q, mask=mask)
+        if USE_TD:
+            yq_desc.store([td_row, td_col], y_q)
+        else:
+            tl.store(y_q_ptr + base_yq_offset + t * stride_yq_t, y_q, mask=mask)
         tl.store(y_s_ptr + base_ys_offset + t * stride_ys_t, y_s)
 
 
@@ -137,6 +174,7 @@ def persistent_masked_m_silu_mul_quant(
     num_parallel_tokens=16,
     group_size: int = 128,
     quant_scale_fmt: DeepGemmQuantScaleFMT = DeepGemmQuantScaleFMT.FLOAT32,
+    use_td: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize silu(y[..., :H]) * y[..., H:] to FP8 with group per-token scales
     y has shape (E, T, 2*H). The first half of the last dimension is
@@ -235,6 +273,28 @@ def persistent_masked_m_silu_mul_quant(
             "_silu_mul_fp8_quant_deep_gemm Triton fallback does not "
             f"support {y_s.dtype} scales. Only torch.float32 supported."
         )
+
+        # TD tiles are [1, group_size] rows of input/y_q; gated on H-inner
+        # contiguity plus 16-byte tile/row/expert-slice alignment.
+        elem_i = y.element_size()
+        elem_q = y_q.element_size()
+        use_td = (
+            use_tensor_descriptor(use_td)
+            and stride_i_h == 1
+            and stride_yq_h == 1
+            and H % group_size == 0
+            and (group_size & (group_size - 1)) == 0
+            and (group_size * elem_i) % 16 == 0
+            and (group_size * elem_q) % 16 == 0
+            and (stride_i_t * elem_i) % 16 == 0
+            and (stride_i_e * elem_i) % 16 == 0
+            and (stride_yq_t * elem_q) % 16 == 0
+            and (stride_yq_e * elem_q) % 16 == 0
+        )
+        if use_td and y.device not in _TD_ALLOCATOR_DEVICES:
+            set_triton_allocator(y.device)
+            _TD_ALLOCATOR_DEVICES.add(y.device)
+
         _silu_mul_fp8_quant_deep_gemm[grid](
             y,
             y_q,
@@ -258,6 +318,8 @@ def persistent_masked_m_silu_mul_quant(
             ceil_ue8m0,
             BLOCK=group_size,
             NUM_STAGES=4,
+            T=T,
+            USE_TD=use_td,
             num_warps=1,
         )
 
