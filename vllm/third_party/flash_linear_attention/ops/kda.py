@@ -13,7 +13,8 @@ import torch
 import torch.nn as nn
 
 from vllm.model_executor.custom_op import CustomOp
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 from vllm.utils.math_utils import RCP_LN2, cdiv, next_power_of_2
 
 from .chunk_delta_h import chunk_gated_delta_rule_fwd_h
@@ -27,6 +28,8 @@ from .utils import FLA_CHUNK_SIZE, is_amd
 
 BT_LIST_AUTOTUNE = [32, 64, 128]
 NUM_WARPS_AUTOTUNE = [2, 4, 8, 16] if is_amd else [4, 8, 16, 32]
+
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
 
 
 def fused_recurrent_kda_fwd(
@@ -260,6 +263,7 @@ def layer_norm_gated_fwd_kernel1(
     mean,  # pointer to the mean
     rstd,  # pointer to the 1/std
     eps,  # epsilon to avoid division by zero
+    T,  # number of rows in x
     D: tl.constexpr,  # number of columns in x
     BD: tl.constexpr,
     ACTIVATION: tl.constexpr,
@@ -268,8 +272,29 @@ def layer_norm_gated_fwd_kernel1(
     HAS_RESIDUAL: tl.constexpr,
     HAS_WEIGHT: tl.constexpr,
     HAS_BIAS: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     i_t = tl.program_id(0)
+    if USE_TD:
+        # Row-major [T, D] buffers, one [1, BD] tile per program. The
+        # descriptor bound on D zero-fills the tail, matching `mask=m_d`.
+        p_x_desc = tl.make_tensor_descriptor(
+            x, shape=[T, D], strides=[D, 1], block_shape=[1, BD]
+        )
+        p_g_desc = tl.make_tensor_descriptor(
+            g, shape=[T, D], strides=[D, 1], block_shape=[1, BD]
+        )
+        p_y_desc = tl.make_tensor_descriptor(
+            y, shape=[T, D], strides=[D, 1], block_shape=[1, BD]
+        )
+        if HAS_RESIDUAL:
+            p_res_desc = tl.make_tensor_descriptor(
+                residual, shape=[T, D], strides=[D, 1], block_shape=[1, BD]
+            )
+        if STORE_RESIDUAL_OUT:
+            p_res_out_desc = tl.make_tensor_descriptor(
+                residual_out, shape=[T, D], strides=[D, 1], block_shape=[1, BD]
+            )
     x += i_t * D
     y += i_t * D
     g += i_t * D
@@ -280,11 +305,20 @@ def layer_norm_gated_fwd_kernel1(
 
     o_d = tl.arange(0, BD)
     m_d = o_d < D
-    b_x = tl.load(x + o_d, mask=m_d, other=0.0).to(tl.float32)
+    if USE_TD:
+        b_x = tl.reshape(p_x_desc.load([i_t, 0]), (BD,)).to(tl.float32)
+    else:
+        b_x = tl.load(x + o_d, mask=m_d, other=0.0).to(tl.float32)
     if HAS_RESIDUAL:
-        b_x += tl.load(residual + o_d, mask=m_d, other=0.0).to(tl.float32)
+        if USE_TD:
+            b_x += tl.reshape(p_res_desc.load([i_t, 0]), (BD,)).to(tl.float32)
+        else:
+            b_x += tl.load(residual + o_d, mask=m_d, other=0.0).to(tl.float32)
     if STORE_RESIDUAL_OUT:
-        tl.store(residual_out + o_d, b_x, mask=m_d)
+        if USE_TD:
+            p_res_out_desc.store([i_t, 0], b_x[None, :])
+        else:
+            tl.store(residual_out + o_d, b_x, mask=m_d)
     if not IS_RMS_NORM:
         b_mean = tl.sum(b_x, axis=0) / D
         tl.store(mean + i_t, b_mean)
@@ -306,14 +340,20 @@ def layer_norm_gated_fwd_kernel1(
         b_y = b_y + b_b
 
     # swish/sigmoid output gate
-    b_g = tl.load(g + o_d, mask=m_d, other=0.0).to(tl.float32)
+    if USE_TD:
+        b_g = tl.reshape(p_g_desc.load([i_t, 0]), (BD,)).to(tl.float32)
+    else:
+        b_g = tl.load(g + o_d, mask=m_d, other=0.0).to(tl.float32)
     if ACTIVATION == "swish" or ACTIVATION == "silu":
         b_y = b_y * b_g * tl.sigmoid(b_g)
     elif ACTIVATION == "sigmoid":
         b_y = b_y * tl.sigmoid(b_g)
 
     # Write output
-    tl.store(y + o_d, b_y, mask=m_d)
+    if USE_TD:
+        p_y_desc.store([i_t, 0], b_y[None, :])
+    else:
+        tl.store(y + o_d, b_y, mask=m_d)
 
 
 def layer_norm_gated_fwd(
@@ -385,6 +425,20 @@ def layer_norm_gated_fwd(
             num_warps=8,
         )
     else:
+        # TD tiles are [1, BD] over row-major [T, D] buffers; require unit
+        # inner stride and a 16-byte aligned row pitch for every described
+        # tensor.
+        td_tensors = [x, g, y]
+        if residual is not None:
+            td_tensors.append(residual)
+        if residual_out is not None:
+            td_tensors.append(residual_out)
+        use_td = use_tensor_descriptor() and all(
+            t.is_contiguous() and (D * t.element_size()) % 16 == 0 for t in td_tensors
+        )
+        if use_td and x.device not in _TD_ALLOCATOR_DEVICES:
+            set_triton_allocator(x.device)
+            _TD_ALLOCATOR_DEVICES.add(x.device)
         layer_norm_gated_fwd_kernel1[(T,)](
             x=x,
             g=g,
@@ -396,10 +450,12 @@ def layer_norm_gated_fwd(
             mean=mean,
             rstd=rstd,
             eps=eps,
+            T=T,
             D=D,
             BD=BD,
             ACTIVATION=activation,
             IS_RMS_NORM=is_rms_norm,
+            USE_TD=use_td,
             num_warps=4,
         )
     # residual_out is None if residual is None and residual_dtype == input_dtype
