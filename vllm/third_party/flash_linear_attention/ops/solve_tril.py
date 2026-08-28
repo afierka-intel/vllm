@@ -12,7 +12,8 @@ import os
 
 import torch
 
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 
 from .index import prepare_chunk_indices
 from .op import make_tensor_descriptor
@@ -23,6 +24,13 @@ ALLOWED_TRIL_PRECISIONS = ["ieee", "tf32"] if is_amd else ["ieee", "tf32", "tf32
 assert FLA_TRIL_PRECISION in ALLOWED_TRIL_PRECISIONS, (
     f"FLA_TRIL_PRECISION must be one of {ALLOWED_TRIL_PRECISIONS}, but got {FLA_TRIL_PRECISION}"
 )
+
+# `.op.make_tensor_descriptor` degrades to a stub returning None when the
+# installed Triton exposes no descriptor API; only opt into TD if it is real.
+_TD_SUPPORTED = hasattr(tl, "make_tensor_descriptor") or hasattr(
+    tl, "_experimental_make_tensor_descriptor"
+)
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
@@ -232,7 +240,7 @@ def merge_16x16_to_32x32_inverse_kernel(
         for num_warps in [2, 4, 8]
         for num_stages in [2, 3, 4, 5]
     ],
-    key=["H", "BT", "IS_VARLEN"],
+    key=["H", "BT", "IS_VARLEN", "USE_TD"],
 )
 @triton.jit(do_not_specialize=["T"])
 def merge_16x16_to_64x64_inverse_kernel(
@@ -246,6 +254,7 @@ def merge_16x16_to_64x64_inverse_kernel(
     USE_TMA: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
@@ -268,7 +277,7 @@ def merge_16x16_to_64x64_inverse_kernel(
     A += (bos * H + i_h) * BT
     Ai += (bos * H + i_h) * BT
 
-    if not USE_TMA:
+    if not (USE_TMA or USE_TD):
         p_A_11 = tl.make_block_ptr(
             A, (T, BT), (H * BT, 1), (i_t * BT, 0), (16, 16), (1, 0)
         )
@@ -320,7 +329,7 @@ def merge_16x16_to_64x64_inverse_kernel(
     b_Ai_33 += m_I
     b_Ai_44 += m_I
 
-    if not USE_TMA:
+    if not (USE_TMA or USE_TD):
         p_A_21 = tl.make_block_ptr(
             A, (T, BT), (H * BT, 1), (i_t * BT + 16, 0), (16, 16), (1, 0)
         )
@@ -389,7 +398,7 @@ def merge_16x16_to_64x64_inverse_kernel(
         input_precision=DOT_PRECISION,
     )
 
-    if not USE_TMA:
+    if not (USE_TMA or USE_TD):
         p_Ai_11 = tl.make_block_ptr(
             Ai, (T, BT), (H * BT, 1), (i_t * BT, 0), (16, 16), (1, 0)
         )
@@ -503,6 +512,21 @@ def merge_16x16_to_64x64_inverse_kernel(
         )
 
 
+def _use_td_merge_64x64(A: torch.Tensor, Ai: torch.Tensor, H: int, BT: int) -> bool:
+    # The descriptors mirror the block-ptr view (T, BT) with strides
+    # (H * BT, 1), so require a unit inner stride, that exact row stride and a
+    # 16B-multiple row pitch on both buffers. USE_TMA already takes the same
+    # descriptor branch, so leave that pre-existing path alone.
+    if is_tma_supported or not _TD_SUPPORTED or not use_tensor_descriptor():
+        return False
+    for t in (A, Ai):
+        if t.stride(-1) != 1 or t.stride(1) != H * BT:
+            return False
+        if (H * BT * t.element_size()) % 16 != 0:
+            return False
+    return True
+
+
 @input_guard
 def solve_tril(
     A: torch.Tensor,
@@ -537,12 +561,20 @@ def solve_tril(
     NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, BT)
 
     Ai = torch.zeros_like(A, dtype=output_dtype)
+    td_kwargs: dict[str, bool] = {}
     if BT == 16:
         merge_fn = solve_tril_16x16_kernel
     elif BT == 32:
         merge_fn = merge_16x16_to_32x32_inverse_kernel
     elif BT == 64:
         merge_fn = merge_16x16_to_64x64_inverse_kernel
+        use_td = _use_td_merge_64x64(A, Ai, H, BT)
+        if use_td and A.device not in _TD_ALLOCATOR_DEVICES:
+            # Descriptors are built inside the kernel, which needs a
+            # PyTorch-backed scratch allocator registered with Triton.
+            set_triton_allocator(A.device)
+            _TD_ALLOCATOR_DEVICES.add(A.device)
+        td_kwargs["USE_TD"] = use_td
 
     merge_fn[NT, B * H](
         A=A,
@@ -554,5 +586,6 @@ def solve_tril(
         BT=BT,
         USE_TMA=is_tma_supported,
         DOT_PRECISION=FLA_TRIL_PRECISION,
+        **td_kwargs,
     )
     return Ai
