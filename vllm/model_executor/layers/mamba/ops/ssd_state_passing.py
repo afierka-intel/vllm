@@ -9,7 +9,10 @@
 import torch
 
 from vllm.model_executor.layers.mamba.ops.triton_helpers import fast_exp
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
+
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
 
 
 @triton.autotune(
@@ -50,6 +53,7 @@ def _state_passing_fwd_kernel(
     # Meta-parameters
     HAS_INITSTATES: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     pid_m = tl.program_id(axis=0)
     pid_b = tl.program_id(axis=1)
@@ -60,6 +64,17 @@ def _state_passing_fwd_kernel(
     chunk_start = (
         tl.load(last_chunk_indices_ptr + pid_b - 1, mask=pid_b > 0, other=-1) + 1
     )
+
+    if USE_TD:
+        # This head's [chunk, dim] slice. Rows chunk_start..chunk_end-1 are
+        # exactly the rows this program writes, so the row axis never clamps;
+        # the dim axis clamps like `mask=offs_m < dim`.
+        out_desc = tl.make_tensor_descriptor(
+            out_ptr + pid_h * stride_out_head,
+            shape=[chunk_end, dim],
+            strides=[stride_out_chunk, 1],
+            block_shape=[1, BLOCK_SIZE],
+        )
 
     # Offset pointers to this sequence's first chunk
     states_ptr += chunk_start * stride_states_chunk + pid_h * stride_states_head
@@ -88,11 +103,17 @@ def _state_passing_fwd_kernel(
 
     # Loop over only this sequence's chunks — branchless
     nchunks_this_seq = chunk_end - chunk_start
-    for _ in range(nchunks_this_seq):
+    for c in range(nchunks_this_seq):
         new_states = tl.load(states_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
         dA_cs = tl.load(dA_cs_ptr).to(tl.float32)
         states = fast_exp(dA_cs) * states + new_states
-        tl.store(out_ptrs, states, mask=offs_m < dim)
+        if USE_TD:
+            out_desc.store(
+                [chunk_start + c, pid_m * BLOCK_SIZE],
+                states.to(out_ptr.dtype.element_ty)[None, :],
+            )
+        else:
+            tl.store(out_ptrs, states, mask=offs_m < dim)
 
         states_ptrs += stride_states_chunk
         dA_cs_ptr += stride_dA_cs_chunk
@@ -105,6 +126,7 @@ def _state_passing_fwd(
     last_chunk_indices,
     initial_states=None,
     out_dtype=None,
+    use_td=None,
 ):
     nchunks, nheads, dim = states.shape
     chunk_size = dA_cumsum.shape[-1]
@@ -118,6 +140,22 @@ def _state_passing_fwd(
         if initial_states is not None
         else (0, 0, 0)
     )
+
+    # TD covers the `out` store only; see notes.md. `out` is the only
+    # descriptorised tensor, and its descriptor base is offset by
+    # `pid_h * stride_out_head`, so the chunk and head strides must be
+    # 16B-aligned on top of the descriptor inner-stride-1 rule.
+    out_esize = out.element_size()
+    use_td = (
+        use_tensor_descriptor(use_td)
+        and out.stride(2) == 1
+        and (out.stride(0) * out_esize) % 16 == 0
+        and (out.stride(1) * out_esize) % 16 == 0
+        and out.data_ptr() % 16 == 0
+    )
+    if use_td and states.device not in _TD_ALLOCATOR_DEVICES:
+        set_triton_allocator(states.device)
+        _TD_ALLOCATOR_DEVICES.add(states.device)
 
     grid = lambda META: (triton.cdiv(dim, META["BLOCK_SIZE"]), batch, nheads)
     with torch.accelerator.device_index(states.device.index):
@@ -142,5 +180,6 @@ def _state_passing_fwd(
             stride_initstates_head=initial_states_strides[1],
             stride_initstates_dim=initial_states_strides[2],
             HAS_INITSTATES=initial_states is not None,
+            USE_TD=use_td,
         )
     return out
