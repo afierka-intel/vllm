@@ -35,11 +35,14 @@ import torch
 from packaging import version
 
 from vllm.platforms import current_platform
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 
 is_hip_ = current_platform.is_rocm()
 
 logger = logging.getLogger(__name__)
+
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
 
 # Only print the following warnings when triton version < 3.2.0.
 # The issue won't affect performance or accuracy.
@@ -65,6 +68,61 @@ def _page_stride(buf, page_size):
     return buf.stride(-4)
 
 
+def _flat_kv_rows(buf, page_size):
+    # Row count of the flattened (page, token) view used by the TD gather.
+    return buf.shape[-3] if buf.ndim == 3 else buf.shape[-4] * page_size
+
+
+def _td_pages_packed(buf, page_size, page_stride):
+    # The flat row view is only equivalent to (page, token) addressing when
+    # pages sit exactly page_size token rows apart. A cross-layer view has
+    # gaps, so it must keep the pointer path.
+    return page_stride == page_size * buf.stride(-3)
+
+
+def _td_buf_ok(buf, inner):
+    # Descriptors need a unit innermost stride plus 16B-aligned base, row
+    # stride and per-head/per-batch offsets.
+    es = buf.element_size()
+    return (
+        buf.stride(-1) == 1
+        and buf.data_ptr() % 16 == 0
+        and (inner * es) % 16 == 0
+        and (buf.stride(-2) * es) % 16 == 0
+        and (buf.stride(-3) * es) % 16 == 0
+    )
+
+
+def _td_gather_supported():
+    # The K/V tiles are row gathers out of the paged cache, so the TD path
+    # needs tensor_descriptor.gather. On CUDA that lowers to tile::gather4
+    # (sm100+ only); XPU maps it to HW 2D block reads.
+    if current_platform.is_xpu():
+        return True
+    if current_platform.is_cuda():
+        return current_platform.has_device_capability(100)
+    return False
+
+
+def _stage1_use_td(
+    q, k_buffer, v_buffer, page_size, k_page_stride, v_page_stride, Lk, Lv, override
+):
+    if not use_tensor_descriptor(override) or not _td_gather_supported():
+        return False
+    # A padded innermost block (Lk < BLOCK_DMODEL) miscompiles with
+    # descriptor gather, so require power-of-2 head dims. The innermost box
+    # dim is also capped at 256 elements.
+    if Lk != triton.next_power_of_2(Lk) or Lv != triton.next_power_of_2(Lv):
+        return False
+    if Lk > 256 or Lv > 256:
+        return False
+    if not _td_pages_packed(k_buffer, page_size, k_page_stride):
+        return False
+    if not _td_pages_packed(v_buffer, page_size, v_page_stride):
+        return False
+    return _td_buf_ok(q, Lk) and _td_buf_ok(k_buffer, Lk) and _td_buf_ok(v_buffer, Lv)
+
+
 @triton.jit
 def _fwd_kernel_stage1(
     Q,
@@ -88,6 +146,8 @@ def _fwd_kernel_stage1(
     stride_mid_os,
     k_scale,
     v_scale,
+    kv_rows_k,
+    kv_rows_v,
     kv_group_num: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DV: tl.constexpr,
@@ -97,6 +157,7 @@ def _fwd_kernel_stage1(
     logit_cap: tl.constexpr,
     Lk: tl.constexpr,
     Lv: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -111,8 +172,17 @@ def _fwd_kernel_stage1(
     cur_batch_seq_len = tl.load(B_Seqlen + cur_batch)
     cur_batch_req_idx = cur_batch
 
-    off_q = cur_batch * stride_qbs + cur_head * stride_qh + offs_d
-    q = tl.load(Q + off_q, mask=mask_d, other=0.0)
+    if USE_TD:
+        q_desc = tl.make_tensor_descriptor(
+            Q + cur_batch * stride_qbs + cur_head * stride_qh,
+            shape=[1, Lk],
+            strides=[stride_qh, 1],
+            block_shape=[1, BLOCK_DMODEL],
+        )
+        q = q_desc.load([0, 0]).reshape([BLOCK_DMODEL])
+    else:
+        off_q = cur_batch * stride_qbs + cur_head * stride_qh + offs_d
+        q = tl.load(Q + off_q, mask=mask_d, other=0.0)
 
     kv_len_per_split = tl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
     split_kv_start = kv_len_per_split * split_kv_id
@@ -125,6 +195,21 @@ def _fwd_kernel_stage1(
     if split_kv_end > split_kv_start:
         ks = tl.load(k_scale)
         vs = tl.load(v_scale)
+        if USE_TD:
+            # (page, token) collapses to one row axis, so the paged tiles are
+            # descriptor row gathers. block_shape[0] must be 1 for gather.
+            k_desc = tl.make_tensor_descriptor(
+                K_Buffer + cur_kv_head * stride_buf_kh,
+                shape=[kv_rows_k, Lk],
+                strides=[stride_buf_kbs, 1],
+                block_shape=[1, BLOCK_DMODEL],
+            )
+            v_desc = tl.make_tensor_descriptor(
+                V_Buffer + cur_kv_head * stride_buf_vh,
+                shape=[kv_rows_v, Lv],
+                strides=[stride_buf_vbs, 1],
+                block_shape=[1, BLOCK_DV],
+            )
         for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
             offs_n = start_n + tl.arange(0, BLOCK_N)
             kv_page_number = tl.load(
@@ -135,18 +220,24 @@ def _fwd_kernel_stage1(
                 other=0,
             ).to(tl.int64)  # page_number * page stride overflows int32
             kv_in_page = offs_n % PAGE_SIZE
-            offs_buf_k = (
-                (kv_page_number * stride_buf_kpbs + kv_in_page * stride_buf_kbs)[
-                    :, None
-                ]
-                + cur_kv_head * stride_buf_kh
-                + offs_d[None, :]
-            )
-            k = tl.load(
-                K_Buffer + offs_buf_k,
-                mask=(offs_n[:, None] < split_kv_end) & (mask_d[None, :]),
-                other=0.0,
-            )
+            if USE_TD:
+                # Out-of-range lanes land on page 0; qk is -inf-masked below
+                # and p is exactly 0, so their contribution stays 0.
+                kv_row = (kv_page_number * PAGE_SIZE + kv_in_page).to(tl.int32)
+                k = k_desc.gather(kv_row, 0)
+            else:
+                offs_buf_k = (
+                    (kv_page_number * stride_buf_kpbs + kv_in_page * stride_buf_kbs)[
+                        :, None
+                    ]
+                    + cur_kv_head * stride_buf_kh
+                    + offs_d[None, :]
+                )
+                k = tl.load(
+                    K_Buffer + offs_buf_k,
+                    mask=(offs_n[:, None] < split_kv_end) & (mask_d[None, :]),
+                    other=0.0,
+                )
             if k.dtype.is_fp8():
                 k = (k.to(tl.float32) * ks).to(q.dtype)
             qk = tl.sum(q[None, :] * k, 1)
@@ -157,18 +248,21 @@ def _fwd_kernel_stage1(
 
             qk = tl.where(offs_n < split_kv_end, qk, float("-inf"))
 
-            offs_buf_v = (
-                (kv_page_number * stride_buf_vpbs + kv_in_page * stride_buf_vbs)[
-                    :, None
-                ]
-                + cur_kv_head * stride_buf_vh
-                + offs_dv[None, :]
-            )
-            v = tl.load(
-                V_Buffer + offs_buf_v,
-                mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
-                other=0.0,
-            )
+            if USE_TD:
+                v = v_desc.gather(kv_row, 0)
+            else:
+                offs_buf_v = (
+                    (kv_page_number * stride_buf_vpbs + kv_in_page * stride_buf_vbs)[
+                        :, None
+                    ]
+                    + cur_kv_head * stride_buf_vh
+                    + offs_dv[None, :]
+                )
+                v = tl.load(
+                    V_Buffer + offs_buf_v,
+                    mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
+                    other=0.0,
+                )
             if v.dtype.is_fp8():
                 v = (v.to(tl.float32) * vs).to(q.dtype)
 
@@ -220,6 +314,7 @@ def _decode_att_m_fwd(
     logit_cap,
     k_scale,
     v_scale,
+    use_td=None,
 ):
     BLOCK = 64 if not is_hip_ else 8
 
@@ -239,6 +334,17 @@ def _decode_att_m_fwd(
     BLOCK_DMODEL = triton.next_power_of_2(Lk)
     BLOCK_DV = triton.next_power_of_2(Lv)
 
+    k_page_stride = _page_stride(k_buffer, page_size)
+    v_page_stride = _page_stride(v_buffer, page_size)
+
+    use_td = _stage1_use_td(
+        q, k_buffer, v_buffer, page_size, k_page_stride, v_page_stride, Lk, Lv, use_td
+    )
+    if use_td and q.device not in _TD_ALLOCATOR_DEVICES:
+        # In-kernel descriptors need a PyTorch-backed scratch allocator.
+        set_triton_allocator(q.device)
+        _TD_ALLOCATOR_DEVICES.add(q.device)
+
     _fwd_kernel_stage1[grid](
         q,
         k_buffer,
@@ -250,10 +356,10 @@ def _decode_att_m_fwd(
         Req_to_tokens.stride(0),
         q.stride(0),
         q.stride(1),
-        _page_stride(k_buffer, page_size),
+        k_page_stride,
         k_buffer.stride(-3),  # Assume (..., PAGE_SIZE, NUM_HEADS, HEAD_DIM)
         k_buffer.stride(-2),  # Assume (..., PAGE_SIZE, NUM_HEADS, HEAD_DIM)
-        _page_stride(v_buffer, page_size),
+        v_page_stride,
         v_buffer.stride(-3),  # Assume (..., PAGE_SIZE, NUM_HEADS, HEAD_DIM)
         v_buffer.stride(-2),  # Assume (..., PAGE_SIZE, NUM_HEADS, HEAD_DIM)
         att_out.stride(0),
@@ -261,6 +367,8 @@ def _decode_att_m_fwd(
         att_out.stride(2),
         k_scale,
         v_scale,
+        _flat_kv_rows(k_buffer, page_size),
+        _flat_kv_rows(v_buffer, page_size),
         kv_group_num=kv_group_num,
         BLOCK_DMODEL=BLOCK_DMODEL,
         BLOCK_DV=BLOCK_DV,
@@ -272,6 +380,7 @@ def _decode_att_m_fwd(
         num_stages=2,
         Lk=Lk,
         Lv=Lv,
+        USE_TD=use_td,
     )
 
 
