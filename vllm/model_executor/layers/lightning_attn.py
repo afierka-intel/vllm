@@ -5,8 +5,11 @@ import torch
 from einops import rearrange
 
 from vllm.platforms import current_platform
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
 
 
 @triton.jit
@@ -261,6 +264,7 @@ def _fwd_kv_reduce(
     NUM_BLOCK,
     D_FBLOCK: tl.constexpr,
     E_FBLOCK: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     # This kernel reduces the key-value outer products
     # across blocks and updates the KV history
@@ -290,8 +294,30 @@ def _fwd_kv_reduce(
         + tl.arange(0, E_FBLOCK)[None, :]
     )
 
+    if USE_TD:
+        # KV is a contiguous [b, h, NUM_BLOCK, d, e] buffer and KV_HISTORY a
+        # contiguous [b, h, d, e] one, so both flatten to row-major 2D views
+        # with e contiguous columns; the tiles cover full [d, e] slices.
+        kv_desc = tl.make_tensor_descriptor(
+            KV,
+            shape=[b * h * NUM_BLOCK * d, e],
+            strides=[e, 1],
+            block_shape=[D_FBLOCK, E_FBLOCK],
+        )
+        kv_history_desc = tl.make_tensor_descriptor(
+            KV_HISTORY,
+            shape=[b * h * d, e],
+            strides=[e, 1],
+            block_shape=[D_FBLOCK, E_FBLOCK],
+        )
+        kv_row = off_bh * NUM_BLOCK * d
+        kv_history_row = off_bh * d
+
     # Load the previous key-value history
-    kv_pre = tl.load(KV_HISTORY_block_ptr).to(tl.float32)
+    if USE_TD:
+        kv_pre = kv_history_desc.load([kv_history_row, 0]).to(tl.float32)
+    else:
+        kv_pre = tl.load(KV_HISTORY_block_ptr).to(tl.float32)
 
     # Process all blocks in reverse order to compute the prefix sum
     for i in range(NUM_BLOCK):
@@ -299,17 +325,28 @@ def _fwd_kv_reduce(
         # Compute decay factor for the current block
         block_decay = tl.exp(-s.to(tl.float32) * block_size)
 
-        # Load the current key-value outer product
-        kv_cur = tl.load(KV_block_ptr).to(tl.float32)
-        # Store the previous key-value history to the current block
-        tl.store(KV_block_ptr, kv_pre.to(KV_block_ptr.dtype.element_ty))
+        if USE_TD:
+            # Load the current key-value outer product, then overwrite the
+            # block with the previous history (same order as the pointer path).
+            kv_cur = kv_desc.load([kv_row + i * d, 0]).to(tl.float32)
+            kv_desc.store([kv_row + i * d, 0], kv_pre.to(KV.dtype.element_ty))
+        else:
+            # Load the current key-value outer product
+            kv_cur = tl.load(KV_block_ptr).to(tl.float32)
+            # Store the previous key-value history to the current block
+            tl.store(KV_block_ptr, kv_pre.to(KV_block_ptr.dtype.element_ty))
 
         # Update the key-value history with the current block
         kv_pre = block_decay * kv_pre + kv_cur
         KV_block_ptr += d * e
 
     # Store the updated key-value history
-    tl.store(KV_HISTORY_block_ptr, kv_pre)
+    if USE_TD:
+        kv_history_desc.store(
+            [kv_history_row, 0], kv_pre.to(KV_HISTORY.dtype.element_ty)
+        )
+    else:
+        tl.store(KV_HISTORY_block_ptr, kv_pre)
 
 
 @triton.jit
@@ -487,6 +524,25 @@ class _attention(torch.autograd.Function):
 
         # Step 3: Reduce key-value outer products
         # across blocks and update KV history
+        # TD path needs the [d, e] tiles to be exact contiguous slices of both
+        # buffers, so gate on contiguity, matching kv_history layout, power-of-2
+        # tiles and 16-byte aligned rows.
+        use_td = (
+            use_tensor_descriptor()
+            and kv.is_contiguous()
+            and kv_history.is_contiguous()
+            and tuple(kv_history.shape) == (b, h, d, e)
+            and d == D_FBLOCK
+            and e == E_FBLOCK
+            and (d & (d - 1)) == 0
+            and (e & (e - 1)) == 0
+            and (e * kv.element_size()) % 16 == 0
+            and (e * kv_history.element_size()) % 16 == 0
+        )
+        if use_td and q.device not in _TD_ALLOCATOR_DEVICES:
+            set_triton_allocator(q.device)
+            _TD_ALLOCATOR_DEVICES.add(q.device)
+
         grid = (b * h, NUM_FBLOCK)
         _fwd_kv_reduce[grid](
             s,
@@ -501,6 +557,7 @@ class _attention(torch.autograd.Function):
             NUM_BLOCK=NUM_BLOCK,
             D_FBLOCK=D_FBLOCK,
             E_FBLOCK=E_FBLOCK,
+            USE_TD=use_td,
         )
 
         # Step 4: Compute non-diagonal blocks of attention
