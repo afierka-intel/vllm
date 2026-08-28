@@ -11,11 +11,14 @@ import os
 
 import torch
 
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 
 BT_LIST = [8, 16, 32, 64, 128]
 
 USE_DEFAULT_FLA_NORM = int(os.getenv("USE_DEFAULT_FLA_NORM", "0"))
+
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
 
 
 @triton.autotune(
@@ -31,6 +34,7 @@ def l2norm_fwd_kernel1(
     D,
     BD: tl.constexpr,
     eps,
+    USE_TD: tl.constexpr = False,
 ):
     i_t = tl.program_id(0)
     x += i_t * D
@@ -38,13 +42,34 @@ def l2norm_fwd_kernel1(
     # Compute mean and variance
     cols = tl.arange(0, BD)
     mask = cols < D
-    b_x = tl.load(x + cols, mask=mask, other=0.0).to(tl.float32)
+    if USE_TD:
+        # One program owns one row, so describe just that row: the base is
+        # already advanced and the D..BD-1 tail is zero-filled by the
+        # descriptor, matching the masked load below.
+        x_desc = tl.make_tensor_descriptor(
+            base=x,
+            shape=[1, D],
+            strides=[D, 1],
+            block_shape=[1, BD],
+        )
+        b_x = x_desc.load([0, 0]).reshape(BD).to(tl.float32)
+    else:
+        b_x = tl.load(x + cols, mask=mask, other=0.0).to(tl.float32)
     b_var = tl.sum(b_x * b_x, axis=0)
     b_rstd = 1 / tl.sqrt(b_var + eps)
     # tl.store(Rstd + i_t, rstd)
     # Normalize and apply linear transformation
     b_y = b_x * b_rstd
-    tl.store(y + cols, b_y, mask=mask)
+    if USE_TD:
+        y_desc = tl.make_tensor_descriptor(
+            base=y,
+            shape=[1, D],
+            strides=[D, 1],
+            block_shape=[1, BD],
+        )
+        y_desc.store([0, 0], b_y.reshape(1, BD).to(y.dtype.element_ty))
+    else:
+        tl.store(y + cols, b_y, mask=mask)
 
 
 @triton.autotune(
@@ -140,12 +165,26 @@ def l2norm_fwd(
                 BD=BD,
             )
         else:
+            # Descriptors need a unit inner stride and a 16B-aligned base and
+            # row pitch; every row base is x + i_t * D elements.
+            use_td = (
+                use_tensor_descriptor()
+                and x.stride(-1) == 1
+                and (D * x.element_size()) % 16 == 0
+                and (D * y.element_size()) % 16 == 0
+                and x.data_ptr() % 16 == 0
+                and y.data_ptr() % 16 == 0
+            )
+            if use_td and x.device not in _TD_ALLOCATOR_DEVICES:
+                set_triton_allocator(x.device)
+                _TD_ALLOCATOR_DEVICES.add(x.device)
             l2norm_fwd_kernel1[(T,)](
                 x,
                 y,
                 eps=eps,
                 D=D,
                 BD=BD,
+                USE_TD=use_td,
             )
 
     return y.view(x_shape_og)
