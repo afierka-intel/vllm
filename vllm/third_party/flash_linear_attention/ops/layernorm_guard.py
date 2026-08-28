@@ -18,11 +18,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.utils.platform_utils import num_compute_units
 
 from .utils import input_guard
+
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
 
 
 def rms_norm_ref(
@@ -76,6 +79,7 @@ def layer_norm_fwd_kernel(
     stride_y_row,
     stride_z_row,
     M,  # number of rows in X
+    N_COLS,  # total number of columns in X/Y/Z (ngroups * N)
     N: tl.constexpr,  # number of columns in X
     eps,  # epsilon to avoid division by zero
     BLOCK_N: tl.constexpr,
@@ -85,6 +89,7 @@ def layer_norm_fwd_kernel(
     NORM_BEFORE_GATE: tl.constexpr,
     IS_RMS_NORM: tl.constexpr,
     ACTIVATION: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     # Map the program id to the starting row of X and Y it should compute.
     row_start = tl.program_id(0) * ROWS_PER_BLOCK
@@ -108,11 +113,29 @@ def layer_norm_fwd_kernel(
     mask = row_mask & col_mask
 
     # Load input data with 2D tile
-    x = tl.load(X_base, mask=mask, other=0.0).to(tl.float32)
+    if USE_TD:
+        x_desc = tl.make_tensor_descriptor(
+            X,
+            shape=[M, N_COLS],
+            strides=[stride_x_row, 1],
+            block_shape=[ROWS_PER_BLOCK, BLOCK_N],
+        )
+        x = x_desc.load([row_start, group * N]).to(tl.float32)
+    else:
+        x = tl.load(X_base, mask=mask, other=0.0).to(tl.float32)
 
     if HAS_Z and not NORM_BEFORE_GATE:
-        Z_base = Z + rows[:, None] * stride_z_row + col_offsets
-        z = tl.load(Z_base, mask=mask, other=0.0).to(tl.float32)
+        if USE_TD:
+            z_desc = tl.make_tensor_descriptor(
+                Z,
+                shape=[M, N_COLS],
+                strides=[stride_z_row, 1],
+                block_shape=[ROWS_PER_BLOCK, BLOCK_N],
+            )
+            z = z_desc.load([row_start, group * N]).to(tl.float32)
+        else:
+            Z_base = Z + rows[:, None] * stride_z_row + col_offsets
+            z = tl.load(Z_base, mask=mask, other=0.0).to(tl.float32)
         if ACTIVATION == "swish" or ACTIVATION == "silu":
             x *= z * tl.sigmoid(z)
         elif ACTIVATION == "sigmoid":
@@ -157,15 +180,44 @@ def layer_norm_fwd_kernel(
     y = x_hat * w[None, :] + b[None, :] if HAS_BIAS else x_hat * w[None, :]
 
     if HAS_Z and NORM_BEFORE_GATE:
-        Z_base = Z + rows[:, None] * stride_z_row + col_offsets
-        z = tl.load(Z_base, mask=mask, other=0.0).to(tl.float32)
+        if USE_TD:
+            z_desc = tl.make_tensor_descriptor(
+                Z,
+                shape=[M, N_COLS],
+                strides=[stride_z_row, 1],
+                block_shape=[ROWS_PER_BLOCK, BLOCK_N],
+            )
+            z = z_desc.load([row_start, group * N]).to(tl.float32)
+        else:
+            Z_base = Z + rows[:, None] * stride_z_row + col_offsets
+            z = tl.load(Z_base, mask=mask, other=0.0).to(tl.float32)
         if ACTIVATION == "swish" or ACTIVATION == "silu":
             y *= z * tl.sigmoid(z)
         elif ACTIVATION == "sigmoid":
             y *= tl.sigmoid(z)
 
     # Write output
-    tl.store(Y_base, y, mask=mask)
+    if USE_TD:
+        y_desc = tl.make_tensor_descriptor(
+            Y,
+            shape=[M, N_COLS],
+            strides=[stride_y_row, 1],
+            block_shape=[ROWS_PER_BLOCK, BLOCK_N],
+        )
+        y_desc.store([row_start, group * N], y.to(Y.dtype.element_ty))
+    else:
+        tl.store(Y_base, y, mask=mask)
+
+
+def _td_layout_ok(t: torch.Tensor, block_n: int) -> bool:
+    # Descriptors need a unit inner stride, a 16B row pitch, a 16B-aligned
+    # base and a tile whose inner extent is a 16B multiple.
+    return (
+        t.stride(-1) == 1
+        and (t.stride(0) * t.element_size()) % 16 == 0
+        and (block_n * t.element_size()) % 16 == 0
+        and t.data_ptr() % 16 == 0
+    )
 
 
 def calc_rows_per_block(M: int, device: torch.device) -> int:
@@ -186,6 +238,7 @@ def layer_norm_fwd(
     norm_before_gate: bool = True,
     is_rms_norm: bool = False,
     activation: str = "swish",
+    use_td: bool | None = None,
 ):
     M, N = x.shape
     if group_size is None:
@@ -224,6 +277,18 @@ def layer_norm_fwd(
     rows_per_block = calc_rows_per_block(M, x.device)
     # Update grid to use rows_per_block
     grid = (cdiv(M, rows_per_block), ngroups)
+    # TD tiles must be exactly the [ROWS_PER_BLOCK, BLOCK_N] window the kernel
+    # already loads, so require group_size == BLOCK_N (no column masking).
+    use_td = (
+        use_tensor_descriptor(use_td)
+        and group_size == BLOCK_N
+        and _td_layout_ok(x, BLOCK_N)
+        and _td_layout_ok(out, BLOCK_N)
+        and (z is None or _td_layout_ok(z, BLOCK_N))
+    )
+    if use_td and x.device not in _TD_ALLOCATOR_DEVICES:
+        set_triton_allocator(x.device)
+        _TD_ALLOCATOR_DEVICES.add(x.device)
     layer_norm_fwd_kernel[grid](
         x,
         out,
@@ -236,6 +301,7 @@ def layer_norm_fwd(
         out.stride(0),
         z.stride(0) if z is not None else 0,
         M,
+        N,
         group_size,
         eps,
         BLOCK_N=BLOCK_N,
@@ -246,6 +312,7 @@ def layer_norm_fwd(
         IS_RMS_NORM=is_rms_norm,
         num_warps=num_warps,
         ACTIVATION=activation,
+        USE_TD=use_td,
     )
     return out, mean, rstd
 
