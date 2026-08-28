@@ -12,7 +12,8 @@ import os
 
 import torch
 
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 
 from .index import prepare_chunk_indices
 from .op import make_tensor_descriptor
@@ -23,6 +24,8 @@ ALLOWED_TRIL_PRECISIONS = ["ieee", "tf32"] if is_amd else ["ieee", "tf32", "tf32
 assert FLA_TRIL_PRECISION in ALLOWED_TRIL_PRECISIONS, (
     f"FLA_TRIL_PRECISION must be one of {ALLOWED_TRIL_PRECISIONS}, but got {FLA_TRIL_PRECISION}"
 )
+
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
@@ -46,6 +49,7 @@ def solve_tril_16x16_kernel(
     USE_TMA: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
@@ -69,7 +73,18 @@ def solve_tril_16x16_kernel(
     Ai = Ai + (bos * H + i_h) * 16
 
     offset = (i_t * 16) % BT
-    if not USE_TMA:
+    if USE_TD:
+        # A / Ai are row-major [T, H, BT] slices, so the last stride is 1 and
+        # the [16, 16] tile matches the block_ptr tile exactly.
+        td_A = tl.make_tensor_descriptor(
+            A, shape=[T, BT], strides=[H * BT, 1], block_shape=[16, 16]
+        )
+        td_Ai = tl.make_tensor_descriptor(
+            Ai, shape=[T, 16], strides=[H * 16, 1], block_shape=[16, 16]
+        )
+        # [16, 16]
+        b_A = td_A.load([i_t * 16, offset]).to(tl.float32)
+    elif not USE_TMA:
         p_A = tl.make_block_ptr(
             A, (T, BT), (H * BT, 1), (i_t * 16, offset), (16, 16), (1, 0)
         )
@@ -87,7 +102,12 @@ def solve_tril_16x16_kernel(
         b_a = b_a + tl.sum(b_a[:, None] * b_A, 0)
         b_A = tl.where((o_i == i)[:, None], b_a, b_A)
     b_A += m_I
-    if not USE_TMA:
+    if USE_TD:
+        td_Ai.store(
+            [i_t * 16, 0],
+            b_A.to(Ai.dtype.element_ty, fp_downcast_rounding="rtne"),
+        )
+    elif not USE_TMA:
         p_Ai = tl.make_block_ptr(
             Ai, (T, 16), (H * 16, 1), (i_t * 16, 0), (16, 16), (1, 0)
         )
@@ -537,8 +557,21 @@ def solve_tril(
     NT = len(chunk_indices) if cu_seqlens is not None else triton.cdiv(T, BT)
 
     Ai = torch.zeros_like(A, dtype=output_dtype)
+    td_kwargs: dict[str, bool] = {}
     if BT == 16:
         merge_fn = solve_tril_16x16_kernel
+        # Descriptors need unit inner stride and 16-byte aligned tile rows.
+        use_td = (
+            use_tensor_descriptor()
+            and A.stride(-1) == 1
+            and Ai.stride(-1) == 1
+            and (BT * A.element_size()) % 16 == 0
+            and (16 * Ai.element_size()) % 16 == 0
+        )
+        if use_td and A.device not in _TD_ALLOCATOR_DEVICES:
+            set_triton_allocator(A.device)
+            _TD_ALLOCATOR_DEVICES.add(A.device)
+        td_kwargs["USE_TD"] = use_td
     elif BT == 32:
         merge_fn = merge_16x16_to_32x32_inverse_kernel
     elif BT == 64:
@@ -554,5 +587,6 @@ def solve_tril(
         BT=BT,
         USE_TMA=is_tma_supported,
         DOT_PRECISION=FLA_TRIL_PRECISION,
+        **td_kwargs,
     )
     return Ai
