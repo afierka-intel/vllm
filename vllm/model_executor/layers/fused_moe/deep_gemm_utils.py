@@ -11,9 +11,12 @@ import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.utils import count_expert_num_tokens
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 from vllm.utils.deep_gemm import get_mk_alignment_for_contiguous_layout
 from vllm.utils.math_utils import round_up
+
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
 
 
 def expert_num_tokens_round_up_and_sum(
@@ -374,10 +377,31 @@ def _fwd_kernel_ep_gather(
     expert_map,
     HAS_EXPERT_MAP: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    # TD: global extents of input_tensor / output_tensor.
+    input_num_rows=0,
+    hidden_size=0,
+    USE_TD: tl.constexpr = False,
 ):
     cur_block = tl.program_id(0)
     start_cur_token = tl.program_id(1)
     grid_num = tl.num_programs(1)
+
+    if USE_TD:
+        # make_tensor_descriptor requires the last (hidden) stride to be a
+        # compile-time 1; the launcher only enables USE_TD for row-contiguous
+        # input/output. Each topk slot gathers a single [1, BLOCK_D] row tile.
+        in_desc = tl.make_tensor_descriptor(
+            input_tensor,
+            shape=[input_num_rows, hidden_size],
+            strides=[input_tensor_stride0, 1],
+            block_shape=[1, BLOCK_D],
+        )
+        out_desc = tl.make_tensor_descriptor(
+            output_tensor,
+            shape=[total_token_num, hidden_size],
+            strides=[output_tensor_stride0, 1],
+            block_shape=[1, BLOCK_D],
+        )
 
     for cur_token in range(start_cur_token, total_token_num, grid_num):
         off_d = tl.arange(0, BLOCK_D)
@@ -397,21 +421,36 @@ def _fwd_kernel_ep_gather(
                 acc_weight = tl.load(
                     recv_topk_weight + cur_token * recv_topk_weight_stride0 + topk_index
                 )
-                tmp = tl.load(
-                    input_tensor
-                    + source_token_index * input_tensor_stride0
-                    + cur_block * BLOCK_D
-                    + off_d
-                )
+                if USE_TD:
+                    tmp = tl.reshape(
+                        in_desc.load([source_token_index, cur_block * BLOCK_D]),
+                        [BLOCK_D],
+                    )
+                else:
+                    tmp = tl.load(
+                        input_tensor
+                        + source_token_index * input_tensor_stride0
+                        + cur_block * BLOCK_D
+                        + off_d
+                    )
                 accumulator += tmp.to(tl.float32) * acc_weight
 
-        tl.store(
-            output_tensor
-            + cur_token * output_tensor_stride0
-            + cur_block * BLOCK_D
-            + off_d,
-            accumulator.to(output_tensor.dtype.element_ty),
-        )
+        if USE_TD:
+            out_desc.store(
+                [cur_token, cur_block * BLOCK_D],
+                tl.reshape(
+                    accumulator.to(output_tensor.dtype.element_ty),
+                    [1, BLOCK_D],
+                ),
+            )
+        else:
+            tl.store(
+                output_tensor
+                + cur_token * output_tensor_stride0
+                + cur_block * BLOCK_D
+                + off_d,
+                accumulator.to(output_tensor.dtype.element_ty),
+            )
 
 
 @torch.no_grad()
@@ -422,6 +461,7 @@ def ep_gather(
     input_index: torch.Tensor,
     expert_map: torch.Tensor | None,
     output_tensor: torch.Tensor,
+    use_td: bool | None = None,
 ):
     num_warps = 2
     num_tokens = output_tensor.shape[0]
@@ -429,6 +469,27 @@ def ep_gather(
     BLOCK_D = math.gcd(hidden_size, 1024)
     assert hidden_size % BLOCK_D == 0
     grid = (triton.cdiv(hidden_size, BLOCK_D), min(num_tokens, 1024))
+
+    # TD row tiles need unit inner stride plus 16-byte aligned base pointer,
+    # row stride and tile width on both the gathered and the reduced tensor.
+    in_esz = input_tensor.element_size()
+    out_esz = output_tensor.element_size()
+    use_td = (
+        use_tensor_descriptor(use_td)
+        and input_tensor.stride(1) == 1
+        and output_tensor.stride(1) == 1
+        and output_tensor.shape[1] == hidden_size
+        and (BLOCK_D & (BLOCK_D - 1)) == 0
+        and (BLOCK_D * in_esz) % 16 == 0
+        and (BLOCK_D * out_esz) % 16 == 0
+        and (input_tensor.stride(0) * in_esz) % 16 == 0
+        and (output_tensor.stride(0) * out_esz) % 16 == 0
+        and input_tensor.data_ptr() % 16 == 0
+        and output_tensor.data_ptr() % 16 == 0
+    )
+    if use_td and input_tensor.device not in _TD_ALLOCATOR_DEVICES:
+        set_triton_allocator(input_tensor.device)
+        _TD_ALLOCATOR_DEVICES.add(input_tensor.device)
 
     _fwd_kernel_ep_gather[grid](
         num_tokens,
@@ -452,6 +513,9 @@ def ep_gather(
         HAS_EXPERT_MAP=expert_map is not None,
         num_warps=num_warps,
         BLOCK_D=BLOCK_D,
+        input_num_rows=input_tensor.shape[0],
+        hidden_size=hidden_size,
+        USE_TD=use_td,
     )
     return
 
