@@ -13,7 +13,8 @@ import torch
 import torch.nn as nn
 
 from vllm.model_executor.custom_op import CustomOp
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 from vllm.utils.math_utils import RCP_LN2, cdiv, next_power_of_2
 
 from .chunk_delta_h import chunk_gated_delta_rule_fwd_h
@@ -27,6 +28,23 @@ from .utils import FLA_CHUNK_SIZE, is_amd
 
 BT_LIST_AUTOTUNE = [32, 64, 128]
 NUM_WARPS_AUTOTUNE = [2, 4, 8, 16] if is_amd else [4, 8, 16, 32]
+
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
+
+
+def _kkt_td_supported(x: torch.Tensor | None, H: int, K: int) -> bool:
+    # Descriptors over the [T, K] view of a [B, T, H, K] tensor: unit last-dim
+    # stride, 16-byte aligned head offset (K) and row pitch (H * K).
+    if x is None:
+        return False
+    esz = x.element_size()
+    return (
+        x.stride(-1) == 1
+        and x.stride(-2) == K
+        and x.stride(-3) == H * K
+        and (K * esz) % 16 == 0
+        and (H * K * esz) % 16 == 0
+    )
 
 
 def fused_recurrent_kda_fwd(
@@ -559,6 +577,7 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
     BK: tl.constexpr,
     NC: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     i_t, i_c, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
@@ -592,40 +611,65 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
     )
     b_b = tl.load(p_b, boundary_check=(0,))
 
+    if USE_TD:
+        # The transposed k/g tiles are the same [BC, BK] tiles at row i_j, so a
+        # single row-major descriptor per tensor serves both orientations.
+        desc_q = tl.make_tensor_descriptor(
+            q, shape=[T, K], strides=[H * K, 1], block_shape=[BC, BK]
+        )
+        desc_k = tl.make_tensor_descriptor(
+            k, shape=[T, K], strides=[H * K, 1], block_shape=[BC, BK]
+        )
+        desc_g = tl.make_tensor_descriptor(
+            g, shape=[T, K], strides=[H * K, 1], block_shape=[BC, BK]
+        )
+
     b_A = tl.zeros([BC, BC], dtype=tl.float32)
     b_Aqk = tl.zeros([BC, BC], dtype=tl.float32)
     for i_k in range(tl.cdiv(K, BK)):
-        p_q = tl.make_block_ptr(
-            q, (T, K), (H * K, 1), (i_t * BT + i_i * BC, i_k * BK), (BC, BK), (1, 0)
-        )
-        p_k = tl.make_block_ptr(
-            k, (T, K), (H * K, 1), (i_t * BT + i_i * BC, i_k * BK), (BC, BK), (1, 0)
-        )
-        p_g = tl.make_block_ptr(
-            g, (T, K), (H * K, 1), (i_t * BT + i_i * BC, i_k * BK), (BC, BK), (1, 0)
-        )
-        b_kt = tl.make_block_ptr(
-            k, (K, T), (1, H * K), (i_k * BK, i_t * BT + i_j * BC), (BK, BC), (0, 1)
-        )
-        p_gk = tl.make_block_ptr(
-            g, (K, T), (1, H * K), (i_k * BK, i_t * BT + i_j * BC), (BK, BC), (0, 1)
-        )
-
         o_k = i_k * BK + tl.arange(0, BK)
         m_k = o_k < K
         # [BK,]
         b_gn = tl.load(g + (i_t * BT + i_i * BC) * H * K + o_k, mask=m_k, other=0)
-        # [BC, BK]
-        b_g = tl.load(p_g, boundary_check=(0, 1))
-        b_k = tl.load(p_k, boundary_check=(0, 1)) * exp2(b_g - b_gn[None, :])
-        # [BK, BC]
-        b_gk = tl.load(p_gk, boundary_check=(0, 1))
-        b_kt = tl.load(b_kt, boundary_check=(0, 1))
+        if USE_TD:
+            # [BC, BK]
+            b_g = desc_g.load([i_t * BT + i_i * BC, i_k * BK])
+            b_k = desc_k.load([i_t * BT + i_i * BC, i_k * BK]) * exp2(
+                b_g - b_gn[None, :]
+            )
+            # [BK, BC]
+            b_gk = tl.trans(desc_g.load([i_t * BT + i_j * BC, i_k * BK]))
+            b_kt = tl.trans(desc_k.load([i_t * BT + i_j * BC, i_k * BK]))
+        else:
+            p_k = tl.make_block_ptr(
+                k, (T, K), (H * K, 1), (i_t * BT + i_i * BC, i_k * BK), (BC, BK), (1, 0)
+            )
+            p_g = tl.make_block_ptr(
+                g, (T, K), (H * K, 1), (i_t * BT + i_i * BC, i_k * BK), (BC, BK), (1, 0)
+            )
+            p_kt = tl.make_block_ptr(
+                k, (K, T), (1, H * K), (i_k * BK, i_t * BT + i_j * BC), (BK, BC), (0, 1)
+            )
+            p_gk = tl.make_block_ptr(
+                g, (K, T), (1, H * K), (i_k * BK, i_t * BT + i_j * BC), (BK, BC), (0, 1)
+            )
+            # [BC, BK]
+            b_g = tl.load(p_g, boundary_check=(0, 1))
+            b_k = tl.load(p_k, boundary_check=(0, 1)) * exp2(b_g - b_gn[None, :])
+            # [BK, BC]
+            b_gk = tl.load(p_gk, boundary_check=(0, 1))
+            b_kt = tl.load(p_kt, boundary_check=(0, 1))
         # [BC, BC]
         b_ktg = b_kt * exp2(b_gn[:, None] - b_gk)
         b_A += tl.dot(b_k, b_ktg)
 
-        b_q = tl.load(p_q, boundary_check=(0, 1))
+        if USE_TD:
+            b_q = desc_q.load([i_t * BT + i_i * BC, i_k * BK])
+        else:
+            p_q = tl.make_block_ptr(
+                q, (T, K), (H * K, 1), (i_t * BT + i_i * BC, i_k * BK), (BC, BK), (1, 0)
+            )
+            b_q = tl.load(p_q, boundary_check=(0, 1))
         b_qg = b_q * exp2(b_g - b_gn[None, :]) * scale
         b_Aqk += tl.dot(b_qg, b_ktg)
 
@@ -781,6 +825,18 @@ def chunk_kda_scaled_dot_kkt_fwd(
     BK = max(next_power_of_2(K), 16)
     A = torch.zeros(B, T, H, BT, device=k.device, dtype=output_dtype)
     Aqk = torch.zeros(B, T, H, BT, device=k.device, dtype=output_dtype)
+    # TD path covers the q/k/g tiles of the intra_sub_inter kernel; BK comes
+    # from autotune ([32, 64], both powers of two).
+    use_td = (
+        use_tensor_descriptor()
+        and (BC & (BC - 1)) == 0
+        and _kkt_td_supported(q, H, K)
+        and _kkt_td_supported(k, H, K)
+        and _kkt_td_supported(gk, H, K)
+    )
+    if use_td and k.device not in _TD_ALLOCATOR_DEVICES:
+        set_triton_allocator(k.device)
+        _TD_ALLOCATOR_DEVICES.add(k.device)
     grid = (NT, NC * NC, B * H)
     chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter[grid](
         q=q,
@@ -798,6 +854,7 @@ def chunk_kda_scaled_dot_kkt_fwd(
         BT=BT,
         BC=BC,
         NC=NC,
+        USE_TD=use_td,
     )
 
     grid = (NT, NC, B * H)
