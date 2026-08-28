@@ -9,8 +9,11 @@ import numpy as np
 import torch
 
 from vllm.platforms import current_platform
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
+
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
 
 
 @triton.jit(do_not_specialize_on_alignment=["num_cache_lines"])
@@ -804,6 +807,7 @@ def _causal_conv1d_update_kernel(
     HAS_NULL_BLOCK: tl.constexpr,
     BLOCK_N: tl.constexpr,
     launch_pdl: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     if launch_pdl:
         tl.extra.cuda.gdc_wait()
@@ -908,21 +912,45 @@ def _causal_conv1d_update_kernel(
     # With speculative decoding, the conv_state updates works in a sliding
     # window manner, at each forward pass, the tokens are shift by 1, so we
     # load since idx_tokens + 1.
-    conv_state_ptrs_source = (
-        conv_state_ptr
-        + (conv_states_input_coord * stride_conv_state_seq)
-        + conv_state_token_offset * stride_conv_state_tok
-        + (idx_feats * stride_conv_state_dim)[None, :]
-        + ((idx_tokens + (1 if IS_SPEC_DECODING else seqlen)) * stride_conv_state_tok)[
-            :, None
-        ]
-    )  # [BLOCK_M, BLOCK_N]
     mask = (
         (conv_states_input_coord < num_cache_lines)
         & ((idx_tokens + seqlen) < state_len)[:, None]
         & (idx_feats < dim)[None, :]
     )
-    conv_state = tl.load(conv_state_ptrs_source, mask, other=0.0)
+    if USE_TD:
+        # One descriptor per cache line over the [state_len, dim] slab; the
+        # launcher only enables USE_TD when the feature dim is the contiguous
+        # one. Rows/columns past the shape are zero-filled, which reproduces
+        # the row/feature terms of `mask`; lines past num_cache_lines are
+        # already dropped by `mask`, so clamp the base to stay in bounds.
+        td_state_len = state_len.to(tl.int32) if IS_VARLEN else state_len
+        td_feats = tl.program_id(1) * BLOCK_N
+        td_line = tl.minimum(conv_states_input_coord, num_cache_lines - 1)
+        source_desc = tl.make_tensor_descriptor(
+            base=conv_state_ptr + td_line * stride_conv_state_seq,
+            shape=(td_state_len, dim),
+            strides=(stride_conv_state_tok, 1),
+            block_shape=(NP2_STATELEN, BLOCK_N),
+        )
+        if IS_SPEC_DECODING:
+            td_source_row = (conv_state_token_offset + 1).to(tl.int32)
+        elif IS_VARLEN:
+            td_source_row = seqlen.to(tl.int32)
+        else:
+            td_source_row = seqlen
+        conv_state = source_desc.load([td_source_row, td_feats])
+    else:
+        conv_state_ptrs_source = (
+            conv_state_ptr
+            + (conv_states_input_coord * stride_conv_state_seq)
+            + conv_state_token_offset * stride_conv_state_tok
+            + (idx_feats * stride_conv_state_dim)[None, :]
+            + (
+                (idx_tokens + (1 if IS_SPEC_DECODING else seqlen))
+                * stride_conv_state_tok
+            )[:, None]
+        )  # [BLOCK_M, BLOCK_N]
+        conv_state = tl.load(conv_state_ptrs_source, mask, other=0.0)
 
     VAL = state_len - seqlen
     x_base = x_ptr + x_offset + (idx_feats * stride_x_dim)  # [BLOCK_N]
@@ -946,15 +974,25 @@ def _causal_conv1d_update_kernel(
     conv_states_offset = tl.load(
         conv_state_indices_ptr + idx_seq * stride_state_indices + current_last_index
     ).to(tl.int64)
-    conv_state_ptrs_target = (
-        conv_state_ptr
-        + (conv_states_offset * stride_conv_state_seq)  # Offset from seq
-        + (idx_feats * stride_conv_state_dim)
-    )[None, :] + (  # [BLOCK_N,]
-        idx_tokens * stride_conv_state_tok
-    )[:, None]
-    mask = (idx_tokens < state_len)[:, None] & (idx_feats < dim)[None, :]
-    tl.store(conv_state_ptrs_target, new_conv_state, mask)
+    if USE_TD:
+        # Descriptor clipping at [state_len, dim] is exactly the store mask.
+        target_desc = tl.make_tensor_descriptor(
+            base=conv_state_ptr + conv_states_offset * stride_conv_state_seq,
+            shape=(td_state_len, dim),
+            strides=(stride_conv_state_tok, 1),
+            block_shape=(NP2_STATELEN, BLOCK_N),
+        )
+        target_desc.store([0, td_feats], new_conv_state)
+    else:
+        conv_state_ptrs_target = (
+            conv_state_ptr
+            + (conv_states_offset * stride_conv_state_seq)  # Offset from seq
+            + (idx_feats * stride_conv_state_dim)
+        )[None, :] + (  # [BLOCK_N,]
+            idx_tokens * stride_conv_state_tok
+        )[:, None]
+        mask = (idx_tokens < state_len)[:, None] & (idx_feats < dim)[None, :]
+        tl.store(conv_state_ptrs_target, new_conv_state, mask)
 
     # STEP 3: init accumulator
     if HAS_BIAS:
@@ -1223,6 +1261,22 @@ def causal_conv1d_update(
         state_len = width - 1
     np2_statelen = triton.next_power_of_2(state_len)
 
+    # TD path covers the 2D conv_state tiles; descriptors need a unit
+    # innermost (feature) stride, a 16B-aligned base plus token/line pitches,
+    # and a shape that stays inside the cache line.
+    elem_size = conv_state.element_size()
+    use_td = (
+        use_tensor_descriptor()
+        and stride_istate_dim == 1
+        and state_len <= conv_state.size(2)
+        and (stride_istate_token * elem_size) % 16 == 0
+        and (stride_istate_seq * elem_size) % 16 == 0
+        and conv_state.data_ptr() % 16 == 0
+    )
+    if use_td and conv_state.device not in _TD_ALLOCATOR_DEVICES:
+        set_triton_allocator(conv_state.device)
+        _TD_ALLOCATOR_DEVICES.add(conv_state.device)
+
     def grid(META):
         return (
             batch,
@@ -1273,6 +1327,7 @@ def causal_conv1d_update(
         HAS_NULL_BLOCK=null_block_id is not None,
         BLOCK_N=256,
         launch_pdl=current_platform.is_arch_support_pdl(),
+        USE_TD=use_td,
     )
     if unsqueeze:
         out = out.squeeze(-1)
