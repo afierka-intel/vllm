@@ -28,7 +28,8 @@ from vllm.model_executor.parameter import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 from vllm.utils.deep_gemm import (
     get_tma_aligned_size,
     is_deep_gemm_e8m0_used,
@@ -37,6 +38,8 @@ from vllm.utils.deep_gemm import (
 from vllm.utils.platform_utils import get_device_name_as_file_name
 
 logger = init_logger(__name__)
+
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
 
 
 def is_fp8(x: torch.dtype | torch.Tensor) -> bool:
@@ -487,6 +490,7 @@ def _per_token_group_quant_fp8_colmajor(
     use_ue8m0: tl.constexpr,
     # Meta-parameters
     BLOCK: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     """A Triton-accelerated function to perform per-token-group
     quantization on a tensor.
@@ -498,6 +502,17 @@ def _per_token_group_quant_fp8_colmajor(
     g_id = tl.program_id(0)
     row = g_id // groups_per_row
     row_g_id = g_id % groups_per_row
+
+    if USE_TD:
+        # Built from the un-advanced base pointer. The grid is
+        # (num_rows * groups_per_row,), so the row extent of y is recoverable
+        # from the grid size.
+        y_desc = tl.make_tensor_descriptor(
+            y_ptr,
+            shape=[tl.num_programs(0) // groups_per_row, y_num_columns],
+            strides=[y_row_stride, 1],
+            block_shape=[1, BLOCK],
+        )
 
     # Ensure offset calculations use int64 to prevent overflow
     y_ptr_offset = (row.to(tl.int64) * y_row_stride) + (
@@ -520,7 +535,13 @@ def _per_token_group_quant_fp8_colmajor(
     cols = tl.arange(0, BLOCK)  # group_size <= BLOCK
     mask = cols < group_size
 
-    y = tl.load(y_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    if USE_TD:
+        # The host only enables TD when BLOCK == group_size, so the tile is
+        # exactly one group and is fully in bounds; mask is all-true there.
+        tile = y_desc.load([row, row_g_id * group_size])
+        y = tl.reshape(tile, (BLOCK,)).to(tl.float32)
+    else:
+        y = tl.load(y_ptr + cols, mask=mask, other=0.0).to(tl.float32)
     # Quant
     _absmax = tl.maximum(tl.max(tl.abs(y)), eps)
     scale_raw = _absmax * (1.0 / fp8_max)
@@ -624,6 +645,22 @@ def per_token_group_quant_fp8(
     num_warps = min(max(BLOCK // 256, 1), 8)
     num_stages = 1
     if column_major_scales:
+        # TD load of the [1, BLOCK] activation tile. Requires BLOCK ==
+        # group_size so the tile is exactly one group (the masked tail of a
+        # padded BLOCK would otherwise read the neighbouring group), a 2D
+        # input, and 16-byte aligned base pointer / row stride / tile row.
+        use_td = (
+            use_tensor_descriptor()
+            and x.dim() == 2
+            and group_size == BLOCK
+            and BLOCK <= 256
+            and x.data_ptr() % 16 == 0
+            and (BLOCK * x.element_size()) % 16 == 0
+            and (x.stride(0) * x.element_size()) % 16 == 0
+        )
+        if use_td and x.device not in _TD_ALLOCATOR_DEVICES:
+            set_triton_allocator(x.device)
+            _TD_ALLOCATOR_DEVICES.add(x.device)
         _per_token_group_quant_fp8_colmajor[(M,)](
             x,
             x_q,
@@ -637,6 +674,7 @@ def per_token_group_quant_fp8(
             fp8_max=fp8_max,
             use_ue8m0=use_ue8m0,
             BLOCK=BLOCK,
+            USE_TD=use_td,
             num_warps=num_warps,
             num_stages=num_stages,
         )
