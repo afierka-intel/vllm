@@ -35,13 +35,16 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     per_tensor_dequantize,
 )
 from vllm.platforms import current_platform
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 from vllm.utils.math_utils import cdiv
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 
 logger = init_logger(__name__)
+
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
 
 
 @triton.jit
@@ -53,16 +56,32 @@ def _count_expert_num_tokens(
     expert_map,
     HAS_EXPERT_MAP: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     curr_expert = tl.program_id(0)
 
     offsets = tl.arange(0, BLOCK_SIZE)
     topk_ids_ptrs = topk_ids_ptr + offsets
 
+    if USE_TD:
+        # 1D descriptor over the flat topk_ids buffer; the caller gates on
+        # contiguity, base alignment and inner block size.
+        topk_ids_desc = tl.make_tensor_descriptor(
+            topk_ids_ptr,
+            shape=[topk_numel],
+            strides=[1],
+            block_shape=[BLOCK_SIZE],
+        )
+
     acc = tl.zeros((BLOCK_SIZE,), dtype=tl.int32)
     for x in range(tl.cdiv(topk_numel, BLOCK_SIZE)):
         mask = offsets < (topk_numel - x * BLOCK_SIZE)
-        expert_ids = tl.load(topk_ids_ptrs, mask=mask, other=-1)
+        if USE_TD:
+            # Descriptors zero-pad the tail, so restore `other=-1` here;
+            # expert 0 would otherwise absorb every padding lane.
+            expert_ids = tl.where(mask, topk_ids_desc.load([x * BLOCK_SIZE]), -1)
+        else:
+            expert_ids = tl.load(topk_ids_ptrs, mask=mask, other=-1)
         if HAS_EXPERT_MAP:
             expert_map_ptrs = expert_map + expert_ids
             expert_map_mask = expert_ids >= 0
@@ -103,6 +122,18 @@ def count_expert_num_tokens(
     BLOCK_SIZE = min(topk_ids.numel(), 1024)
     BLOCK_SIZE = triton.next_power_of_2(BLOCK_SIZE)
 
+    # The descriptor needs a contiguous flat buffer, a 16B-aligned base and
+    # at least 32B in the contiguous block dim.
+    use_td = (
+        use_tensor_descriptor()
+        and topk_ids.is_contiguous()
+        and topk_ids.data_ptr() % 16 == 0
+        and BLOCK_SIZE * topk_ids.element_size() >= 32
+    )
+    if use_td and topk_ids.device not in _TD_ALLOCATOR_DEVICES:
+        set_triton_allocator(topk_ids.device)
+        _TD_ALLOCATOR_DEVICES.add(topk_ids.device)
+
     _count_expert_num_tokens[(grid,)](
         topk_ids,
         expert_num_tokens,
@@ -111,6 +142,7 @@ def count_expert_num_tokens(
         expert_map,
         HAS_EXPERT_MAP=expert_map is not None,
         BLOCK_SIZE=BLOCK_SIZE,
+        USE_TD=use_td,
     )
 
     return expert_num_tokens
