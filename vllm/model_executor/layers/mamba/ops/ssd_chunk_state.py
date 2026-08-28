@@ -9,9 +9,12 @@
 import torch
 
 from vllm.model_executor.layers.mamba.ops.triton_helpers import fast_exp
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 
 from .mamba_ssm import softplus
+
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
 
 
 @triton.autotune(
@@ -227,6 +230,7 @@ def _chunk_state_fwd_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     pid_c = tl.program_id(axis=1).to(tl.int64)
     pid_h = tl.program_id(axis=2)
@@ -260,18 +264,42 @@ def _chunk_state_fwd_kernel(
 
     chunk_size_limit = chunk_seqlen_end - chunk_seqlen_start
 
+    if USE_TD:
+        # x is hdim-contiguous, so the (hdim, seqlen) tile the kernel wants has
+        # a non-unit innermost stride: describe the (seqlen, hdim) buffer and
+        # transpose each tile. Descriptor shapes are the exact chunk extents, so
+        # the zero-fill past the boundary reproduces the pointer-path masks.
+        x_desc = tl.make_tensor_descriptor(
+            x_ptr,
+            shape=[chunk_size_limit, hdim],
+            strides=[stride_x_seqlen, 1],
+            block_shape=[BLOCK_SIZE_K, BLOCK_SIZE_M],
+        )
+        b_desc = tl.make_tensor_descriptor(
+            b_ptr,
+            shape=[chunk_size_limit, dstate],
+            strides=[stride_b_seqlen, 1],
+            block_shape=[BLOCK_SIZE_K, BLOCK_SIZE_N],
+        )
+
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, chunk_size_limit, BLOCK_SIZE_K):
-        x = tl.load(
-            x_ptrs,
-            mask=(offs_m[:, None] < hdim) & (offs_k[None, :] < chunk_size_limit - k),
-            other=0.0,
-        )
-        b = tl.load(
-            b_ptrs,
-            mask=(offs_k[:, None] < chunk_size_limit - k) & (offs_n[None, :] < dstate),
-            other=0.0,
-        ).to(tl.float32)
+        if USE_TD:
+            x = tl.trans(x_desc.load([k, pid_m * BLOCK_SIZE_M]))
+            b = b_desc.load([k, pid_n * BLOCK_SIZE_N]).to(tl.float32)
+        else:
+            x = tl.load(
+                x_ptrs,
+                mask=(offs_m[:, None] < hdim)
+                & (offs_k[None, :] < chunk_size_limit - k),
+                other=0.0,
+            )
+            b = tl.load(
+                b_ptrs,
+                mask=(offs_k[:, None] < chunk_size_limit - k)
+                & (offs_n[None, :] < dstate),
+                other=0.0,
+            ).to(tl.float32)
         dA_cs_k = tl.load(
             dA_cumsum_ptrs, mask=offs_k < chunk_size_limit - k, other=0.0
         ).to(tl.float32)
@@ -375,6 +403,27 @@ def _chunk_state_fwd(
         nchunks,
         nheads,
     )
+
+    # TD operand loads; gated on innermost contiguity plus 16-byte alignment of
+    # the per-program base pointers (advanced by the head/group strides) and of
+    # the described row pitches. All autotune tiles are powers of two.
+    x_esz = x.element_size()
+    b_esz = B.element_size()
+    use_td = (
+        use_tensor_descriptor()
+        and x.stride(2) == 1
+        and B.stride(2) == 1
+        and (x.stride(0) * x_esz) % 16 == 0
+        and (x.stride(1) * x_esz) % 16 == 0
+        and (B.stride(0) * b_esz) % 16 == 0
+        and (B.stride(1) * b_esz) % 16 == 0
+        and x.data_ptr() % 16 == 0
+        and B.data_ptr() % 16 == 0
+    )
+    if use_td and x.device not in _TD_ALLOCATOR_DEVICES:
+        set_triton_allocator(x.device)
+        _TD_ALLOCATOR_DEVICES.add(x.device)
+
     with torch.accelerator.device_index(x.device.index):
         _chunk_state_fwd_kernel[grid](
             x_ptr=x,
@@ -403,5 +452,6 @@ def _chunk_state_fwd(
             stride_dA_cs_head=dA_cumsum.stride(0),
             stride_dA_cs_chunk=dA_cumsum.stride(1),
             stride_dA_cs_csize=dA_cumsum.stride(2),
+            USE_TD=use_td,
         )
     return states
