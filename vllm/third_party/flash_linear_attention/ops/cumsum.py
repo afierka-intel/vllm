@@ -10,12 +10,15 @@
 
 import torch
 
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 
 from .index import prepare_chunk_indices
 from .utils import check_shared_mem, input_guard
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
+
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
@@ -95,6 +98,7 @@ def chunk_local_cumsum_vector_kernel(
     REVERSE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     HEAD_FIRST: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     i_s, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
@@ -117,44 +121,70 @@ def chunk_local_cumsum_vector_kernel(
     else:
         m_s = tl.where(o_i[:, None] >= o_i[None, :], 1.0, 0.0)
 
-    if HEAD_FIRST:
-        p_s = tl.make_block_ptr(
-            s + (bos * H + i_h * T) * S,
-            (T, S),
-            (S, 1),
-            (i_t * BT, i_s * BS),
-            (BT, BS),
-            (1, 0),
+    if USE_TD:
+        # Both layouts are contiguous in S, so the [T, S] tile the block
+        # pointers walk maps 1:1 onto a descriptor; no transpose needed.
+        if HEAD_FIRST:
+            bh_off = (bos * H + i_h * T) * S
+            stride_t = S
+        else:
+            bh_off = (bos * H + i_h) * S
+            stride_t = H * S
+        d_s = tl.make_tensor_descriptor(
+            s + bh_off,
+            shape=[T, S],
+            strides=[stride_t, 1],
+            block_shape=[BT, BS],
         )
-        p_o = tl.make_block_ptr(
-            o + (bos * H + i_h * T) * S,
-            (T, S),
-            (S, 1),
-            (i_t * BT, i_s * BS),
-            (BT, BS),
-            (1, 0),
+        d_o = tl.make_tensor_descriptor(
+            o + bh_off,
+            shape=[T, S],
+            strides=[stride_t, 1],
+            block_shape=[BT, BS],
         )
+        # [BT, BS]
+        b_s = d_s.load([i_t * BT, i_s * BS]).to(tl.float32)
+        b_o = tl.dot(m_s, b_s, allow_tf32=False)
+        d_o.store([i_t * BT, i_s * BS], b_o.to(o.type.element_ty))
     else:
-        p_s = tl.make_block_ptr(
-            s + (bos * H + i_h) * S,
-            (T, S),
-            (H * S, 1),
-            (i_t * BT, i_s * BS),
-            (BT, BS),
-            (1, 0),
-        )
-        p_o = tl.make_block_ptr(
-            o + (bos * H + i_h) * S,
-            (T, S),
-            (H * S, 1),
-            (i_t * BT, i_s * BS),
-            (BT, BS),
-            (1, 0),
-        )
-    # [BT, BS]
-    b_s = tl.load(p_s, boundary_check=(0, 1)).to(tl.float32)
-    b_o = tl.dot(m_s, b_s, allow_tf32=False)
-    tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+        if HEAD_FIRST:
+            p_s = tl.make_block_ptr(
+                s + (bos * H + i_h * T) * S,
+                (T, S),
+                (S, 1),
+                (i_t * BT, i_s * BS),
+                (BT, BS),
+                (1, 0),
+            )
+            p_o = tl.make_block_ptr(
+                o + (bos * H + i_h * T) * S,
+                (T, S),
+                (S, 1),
+                (i_t * BT, i_s * BS),
+                (BT, BS),
+                (1, 0),
+            )
+        else:
+            p_s = tl.make_block_ptr(
+                s + (bos * H + i_h) * S,
+                (T, S),
+                (H * S, 1),
+                (i_t * BT, i_s * BS),
+                (BT, BS),
+                (1, 0),
+            )
+            p_o = tl.make_block_ptr(
+                o + (bos * H + i_h) * S,
+                (T, S),
+                (H * S, 1),
+                (i_t * BT, i_s * BS),
+                (BT, BS),
+                (1, 0),
+            )
+        # [BT, BS]
+        b_s = tl.load(p_s, boundary_check=(0, 1)).to(tl.float32)
+        b_o = tl.dot(m_s, b_s, allow_tf32=False)
+        tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
 def chunk_local_cumsum_scalar(
@@ -220,6 +250,21 @@ def chunk_local_cumsum_vector(
     def grid(meta):
         return (triton.cdiv(meta["S"], meta["BS"]), NT, B * H)
 
+    # TD tiles are [BT, BS] over a [T, S] view whose row pitch is S (head-first)
+    # or H * S; both must be 16B-aligned, as must every per-(batch, head) base
+    # offset, which is always a multiple of S elements.
+    use_td = (
+        use_tensor_descriptor()
+        and g_org.stride(-1) == 1
+        and g.stride(-1) == 1
+        and (S * g_org.element_size()) % 16 == 0
+        and (S * g.element_size()) % 16 == 0
+        and (BT & (BT - 1)) == 0
+    )
+    if use_td and g.device not in _TD_ALLOCATOR_DEVICES:
+        set_triton_allocator(g.device)
+        _TD_ALLOCATOR_DEVICES.add(g.device)
+
     # keep cumulative normalizer in fp32
     # this kernel is equivalent to
     # g = g.view(B, H, NT, BT, -1).cumsum(-2).view(B, H, T, -1)
@@ -235,6 +280,7 @@ def chunk_local_cumsum_vector(
         BT=BT,
         HEAD_FIRST=head_first,
         REVERSE=reverse,
+        USE_TD=use_td,
     )
     return g
 
