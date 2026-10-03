@@ -20,6 +20,16 @@ from vllm.triton_utils.allocation import set_triton_allocator
 TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
 
 
+def _prune_td_configs(configs, named_args, **kwargs):
+    # Autotuning runs on the first (warmup) call, which is a single chunk.
+    # There the BLOCK_SIZE_M=128 TD configs tie with the M=32 ones, but on
+    # multi-chunk prefill they are ~2x slower on XPU, so a server could lock
+    # in the slow tile. The pointer path keeps the full config list.
+    if not kwargs.get("USE_TD", False):
+        return configs
+    return [c for c in configs if c.kwargs["BLOCK_SIZE_M"] < 128] or configs
+
+
 @triton.autotune(
     configs=[
         # =================================================================
@@ -149,6 +159,7 @@ TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
         ),
     ],
     key=["chunk_size", "hdim", "dstate", "IS_CAUSAL", "USE_TD"],
+    prune_configs_by={"early_config_prune": _prune_td_configs},
 )
 @triton.jit
 def _chunk_scan_fwd_kernel(
