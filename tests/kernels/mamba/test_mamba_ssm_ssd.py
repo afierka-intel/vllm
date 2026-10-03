@@ -6,10 +6,17 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
+from vllm.model_executor.layers.mamba.ops import (
+    ssd_bmm,
+    ssd_chunk_scan,
+    ssd_chunk_state,
+    ssd_state_passing,
+)
 from vllm.model_executor.layers.mamba.ops.ssd_combined import (
     mamba_chunk_scan_combined_varlen,
 )
 from vllm.platforms import current_platform
+from vllm.triton_utils import tl
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.attention.backends.mamba2_attn import compute_varlen_chunk_metadata
 
@@ -578,3 +585,359 @@ def test_mamba_chunk_scan_cont_batch_prefill_chunking(chunk_size, seqlens):
             rtol=rtol,
             msg=lambda x, i=i: f"seq{i} state " + x,
         )
+
+
+# Tensor-descriptor (TD) path of _chunk_scan_fwd_kernel / _chunk_state_fwd_kernel.
+# TD is on by default on XPU and opt-in (VLLM_TRITON_USE_TD=1) elsewhere. These
+# tests force each path, run both at one pinned config per kernel (same tiles,
+# no autotuning), and compare TD against the pointer path, which is tight enough
+# to catch a wrong tile offset or transpose; one test repeats that at other
+# tiles, one also checks both paths against the torch reference. A launch spy
+# proves which path ran.
+
+requires_td = pytest.mark.skipif(
+    not hasattr(tl, "make_tensor_descriptor")
+    or not (
+        current_platform.is_xpu()
+        or (current_platform.is_cuda() and current_platform.has_device_capability(90))
+    ),
+    reason="SSD TD path is tested on XPU and on CUDA sm90+ (TMA) only; it needs "
+    "tl.make_tensor_descriptor",
+)
+
+
+def _pin_ssd_configs(
+    monkeypatch, scan_cfg=(64, 64, 32, 2, 4), state_cfg=(64, 64, 32, 4, 2)
+):
+    """Restrict every autotuned SSD kernel to one of its own configs. The scan
+    and state configs are (BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, num_stages,
+    num_warps)."""
+
+    def tile(m, n, k):
+        return {"BLOCK_SIZE_M": m, "BLOCK_SIZE_N": n, "BLOCK_SIZE_K": k}
+
+    pins = [
+        (ssd_chunk_scan._chunk_scan_fwd_kernel, tile(*scan_cfg[:3]), scan_cfg[3:]),
+        (ssd_chunk_state._chunk_state_fwd_kernel, tile(*state_cfg[:3]), state_cfg[3:]),
+        (ssd_bmm._bmm_chunk_fwd_kernel, tile(64, 64, 32), (4, 2)),
+        (ssd_chunk_state._chunk_cumsum_fwd_kernel, {"BLOCK_SIZE_H": 8}, None),
+        (ssd_state_passing._state_passing_fwd_kernel, {"BLOCK_SIZE": 256}, None),
+    ]
+    for kernel, kwargs, stages_warps in pins:
+        (config,) = [
+            c
+            for c in kernel.configs
+            if c.kwargs == kwargs
+            and stages_warps in (None, (c.num_stages, c.num_warps))
+        ]
+        monkeypatch.setattr(kernel, "configs", [config])
+
+
+@pytest.fixture
+def pin_ssd_configs(monkeypatch):
+    _pin_ssd_configs(monkeypatch)
+
+
+def _spy_use_td(monkeypatch) -> dict[str, list[bool]]:
+    """Record the USE_TD constexpr of every launch of both kernels."""
+    calls: dict[str, list[bool]] = {"scan": [], "state": []}
+    for name, kernel in (
+        ("scan", ssd_chunk_scan._chunk_scan_fwd_kernel),
+        ("state", ssd_chunk_state._chunk_state_fwd_kernel),
+    ):
+
+        def spy(*args, _run=kernel.run, _calls=calls[name], **kwargs):
+            _calls.append(kwargs["USE_TD"])
+            return _run(*args, **kwargs)
+
+        monkeypatch.setattr(kernel, "run", spy)
+    return calls
+
+
+def _misaligned(t: torch.Tensor) -> torch.Tensor:
+    """Contiguous copy of ``t`` whose data_ptr is one element off 16 bytes."""
+    out = torch.empty(t.numel() + 1, dtype=t.dtype, device=t.device)[1:]
+    return out.view(t.shape).copy_(t)
+
+
+def _make_td_inputs(
+    nheads, headdim, dstate, ngroups, seqlens, dtype, *, z, hdim_D, state_dtype
+):
+    """Inputs laid out like the mamba_mixer2 prefill call: x, B and C are views
+    into one xBC buffer, so their row stride is wider than the tile."""
+    set_random_seed(0)
+    T = sum(seqlens)
+    xBC = torch.randn(
+        T, nheads * headdim + 2 * ngroups * dstate, device=DEVICE, dtype=dtype
+    )
+    x, B, C = torch.split(
+        xBC, [nheads * headdim, ngroups * dstate, ngroups * dstate], dim=-1
+    )
+    D_shape = (nheads, headdim) if hdim_D else (nheads,)
+    return dict(
+        x=x.view(T, nheads, headdim),
+        B=B.view(T, ngroups, dstate),
+        C=C.view(T, ngroups, dstate),
+        dt=torch.randn(T, nheads, device=DEVICE, dtype=dtype) * 0.5,
+        A=-torch.exp(torch.rand(nheads, device=DEVICE, dtype=torch.float32)),
+        D=torch.rand(D_shape, device=DEVICE, dtype=torch.float32),
+        z=torch.randn(T, nheads, headdim, device=DEVICE, dtype=dtype) if z else None,
+        dt_bias=torch.rand(nheads, device=DEVICE, dtype=torch.float32),
+        state_dtype=state_dtype,
+    )
+
+
+def _run_ssd(inputs, seqlens, chunk_size, initial_states, misaligned_out=False):
+    cu_seqlens = torch.tensor((0, *seqlens), device=DEVICE).cumsum(0).to(torch.int32)
+    cu_chunk_seqlens, last_chunk_indices, seq_idx = compute_varlen_chunk_metadata(
+        cu_seqlens, chunk_size
+    )
+    out = torch.empty_like(inputs["x"])
+    if misaligned_out:
+        out = _misaligned(out)
+    final_states = mamba_chunk_scan_combined_varlen(
+        **inputs,
+        chunk_size=chunk_size,
+        cu_seqlens=cu_seqlens,
+        cu_chunk_seqlens=cu_chunk_seqlens,
+        last_chunk_indices=last_chunk_indices,
+        seq_idx=seq_idx,
+        out=out,
+        initial_states=initial_states,
+        dt_softplus=True,
+    )
+    return out, final_states
+
+
+def _run_both_paths(monkeypatch, *run_args, **run_kwargs):
+    results, calls = {}, {}
+    for use_td in (False, True):
+        monkeypatch.setenv("VLLM_TRITON_USE_TD", "1" if use_td else "0")
+        with monkeypatch.context() as m:
+            calls[use_td] = _spy_use_td(m)
+            results[use_td] = _run_ssd(*run_args, **run_kwargs)
+    assert calls[False]["scan"] and not any(calls[False]["scan"])
+    assert calls[False]["state"] and not any(calls[False]["state"])
+    return results, calls
+
+
+def _assert_same_result(results):
+    # Same tiles and arithmetic on both paths, but the loads compile to
+    # different instruction schedules, so allow rounding-level differences
+    # (torch's per-dtype defaults); a wrong tile offset or transpose is far
+    # outside them.
+    for got, want in zip(results[True], results[False]):
+        torch.testing.assert_close(got, want)
+
+
+# Ragged lengths: a 1-token sequence, partial chunks and exact chunk multiples.
+TD_SEQLENS = (300, 1, 127, 256, 17)
+
+
+@requires_td
+@pytest.mark.parametrize(
+    "nheads, headdim, dstate, ngroups, chunk_size",
+    [
+        # headdim not a multiple of BLOCK_SIZE_N: zero-filled partial tiles
+        (8, 80, 128, 8, 256),
+        # 8 heads per B/C group
+        (8, 64, 128, 1, 128),
+        # dstate > 128 takes the K-looped prev_states branch of the scan
+        (4, 64, 256, 2, 128),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    "variant",
+    [
+        # fresh prefill: no initial states, per-head D, no gate
+        "fresh",
+        # chunked prefill / prefix-cache hit with fp32 states (NemotronH)
+        "cont_fp32_state",
+        # same with states in the input dtype (default for the other Mamba2
+        # models), plus a gate z and a per-headdim D
+        "cont_state_in_dtype_z_hdim_D",
+    ],
+)
+def test_ssd_td_matches_pointer(
+    nheads,
+    headdim,
+    dstate,
+    ngroups,
+    chunk_size,
+    dtype,
+    variant,
+    pin_ssd_configs,
+    monkeypatch,
+):
+    """With TD forced on, both kernels take the descriptor path and match the
+    pointer path at the same config to rounding."""
+    full = variant == "cont_state_in_dtype_z_hdim_D"
+    state_dtype = dtype if full else torch.float32
+    inputs = _make_td_inputs(
+        nheads,
+        headdim,
+        dstate,
+        ngroups,
+        TD_SEQLENS,
+        dtype,
+        z=full,
+        hdim_D=full,
+        state_dtype=state_dtype,
+    )
+    initial_states = None
+    if variant != "fresh":
+        initial_states = 0.1 * torch.randn(
+            len(TD_SEQLENS), nheads, headdim, dstate, device=DEVICE
+        ).to(state_dtype)
+
+    results, calls = _run_both_paths(
+        monkeypatch, inputs, TD_SEQLENS, chunk_size, initial_states
+    )
+
+    assert all(calls[True]["scan"]) and all(calls[True]["state"]), calls[True]
+    _assert_same_result(results)
+
+
+@requires_td
+@pytest.mark.parametrize(
+    "dstate, scan_cfg, state_cfg",
+    [
+        # (BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, num_stages, num_warps)
+        # What the B60 autotuner picked in E2E prefill runs
+        (128, (32, 64, 32, 1, 4), (32, 64, 32, 5, 2)),
+        # M = 128: scan tile taller than the ragged chunks, state tile taller
+        # than headdim
+        (128, (128, 32, 32, 4, 4), (128, 32, 32, 4, 4)),
+        # N = 256: scan tile wider than headdim, state tile spans all of dstate
+        (256, (64, 256, 32, 4, 4), (64, 256, 32, 4, 4)),
+        # K = 64: the K-looped prev_states branch steps 64 wide over dstate
+        (256, (128, 64, 64, 4, 4), (64, 128, 64, 2, 4)),
+    ],
+)
+def test_ssd_td_matches_pointer_across_tiles(dstate, scan_cfg, state_cfg, monkeypatch):
+    """Same check as test_ssd_td_matches_pointer, at other tile shapes the
+    autotuner can pick (the descriptor block shapes follow the tile)."""
+    _pin_ssd_configs(monkeypatch, scan_cfg, state_cfg)
+    nheads, headdim, chunk_size = 4, 80, 128
+    inputs = _make_td_inputs(
+        nheads,
+        headdim,
+        dstate,
+        2,
+        TD_SEQLENS,
+        torch.bfloat16,
+        z=True,
+        hdim_D=True,
+        state_dtype=torch.bfloat16,
+    )
+    initial_states = 0.1 * torch.randn(
+        len(TD_SEQLENS),
+        nheads,
+        headdim,
+        dstate,
+        device=DEVICE,
+        dtype=torch.bfloat16,
+    )
+
+    results, calls = _run_both_paths(
+        monkeypatch, inputs, TD_SEQLENS, chunk_size, initial_states
+    )
+
+    assert all(calls[True]["scan"]) and all(calls[True]["state"]), calls[True]
+    _assert_same_result(results)
+
+
+@requires_td
+@pytest.mark.parametrize(
+    "case, scan_td, state_td",
+    [
+        # 16-byte aligned but narrower than 64 B (Intel 2D block IO minimum):
+        # 16 bf16 = 32 B x/out/z rows; chunk_size 8 = 32 B fp32 cb rows.
+        ("headdim_16", False, False),
+        ("chunk_size_8", False, True),
+        # One operand at a time off 16-byte alignment.
+        ("x", False, False),
+        ("B", True, False),
+        ("C", False, True),
+        ("z", False, True),
+        ("initial_states", False, True),
+        ("out", False, True),
+    ],
+)
+def test_ssd_td_falls_back_per_operand(
+    case, scan_td, state_td, pin_ssd_configs, monkeypatch
+):
+    """With TD forced on, a kernel whose operand a descriptor cannot cover
+    launches on the pointer path (the other kernel is unaffected), and the
+    result still matches the pointer path."""
+    seqlens = (300, 17, 500)
+    headdim = 16 if case == "headdim_16" else 64
+    chunk_size = 8 if case == "chunk_size_8" else 128
+    inputs = _make_td_inputs(
+        4,
+        headdim,
+        128,
+        1,
+        seqlens,
+        torch.bfloat16,
+        z=True,
+        hdim_D=False,
+        state_dtype=torch.bfloat16,
+    )
+    initial_states = 0.1 * torch.randn(
+        len(seqlens), 4, headdim, 128, device=DEVICE, dtype=torch.bfloat16
+    )
+    if case == "initial_states":
+        initial_states = _misaligned(initial_states)
+    elif case in inputs:
+        inputs[case] = _misaligned(inputs[case])
+
+    results, calls = _run_both_paths(
+        monkeypatch,
+        inputs,
+        seqlens,
+        chunk_size,
+        initial_states,
+        misaligned_out=case == "out",
+    )
+
+    assert calls[True]["scan"] and all(v is scan_td for v in calls[True]["scan"])
+    assert calls[True]["state"] and all(v is state_td for v in calls[True]["state"])
+    _assert_same_result(results)
+
+
+@requires_td
+@pytest.mark.parametrize(
+    "d_head, uses_td",
+    [
+        (128, True),
+        # 8 elements = 16 B bf16 / 32 B fp32 rows: under the 64 B minimum
+        (8, False),
+    ],
+)
+@pytest.mark.parametrize("itype", [torch.float32, torch.bfloat16])
+def test_ssd_td_single_example_vs_reference(
+    d_head, uses_td, itype, pin_ssd_configs, monkeypatch
+):
+    """With TD forced on (the XPU default), both the descriptor path and the
+    pointer fallback match the torch reference, not only each other."""
+    monkeypatch.setenv("VLLM_TRITON_USE_TD", "1")
+    calls = _spy_use_td(monkeypatch)
+
+    test_mamba_chunk_scan_single_example(d_head, 16, (128, 32), itype)
+
+    assert calls["scan"] and all(v is uses_td for v in calls["scan"])
+    assert calls["state"] and all(v is uses_td for v in calls["state"])
+
+
+def test_ssd_td_scan_autotune_drops_block_m_128():
+    """TD launches of the scan kernel autotune without the BLOCK_SIZE_M=128
+    configs (slow on multi-chunk prefill, indistinguishable at the one-chunk
+    warmup); pointer launches keep the full list."""
+    kernel = ssd_chunk_scan._chunk_scan_fwd_kernel
+    prune = kernel.early_config_prune
+    td = prune(kernel.configs, {}, USE_TD=True)
+    assert td and all(c.kwargs["BLOCK_SIZE_M"] < 128 for c in td)
+    assert len(td) < len(kernel.configs)
+    assert prune(kernel.configs, {}, USE_TD=False) == kernel.configs
