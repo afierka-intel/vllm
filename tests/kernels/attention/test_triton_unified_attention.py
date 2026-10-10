@@ -13,7 +13,10 @@ from vllm.v1.attention.ops.triton_attention_helpers import (
     apply_softcap,
     compute_tile_loop_bounds,
 )
-from vllm.v1.attention.ops.triton_unified_attention import unified_attention
+from vllm.v1.attention.ops.triton_unified_attention import (
+    _reduce_segments_launch_kwargs,
+    unified_attention,
+)
 from vllm.v1.kv_cache_interface import KVQuantMode
 
 pytestmark = pytest.mark.skip_global_cleanup
@@ -917,6 +920,19 @@ def _softcap_probe_kernel(
 
 
 @torch.inference_mode()
+@pytest.mark.parametrize("head_size", [64, 96, 128, 256])
+def test_reduce_segments_launch_kwargs(head_size: int) -> None:
+    """XPU launches one 16-lane sub-group lane per 4 fp32 columns of the
+    padded head; every other platform keeps the default launch."""
+    head_size_padded = next_power_of_2(head_size)
+    kwargs = _reduce_segments_launch_kwargs(head_size_padded)
+    if not current_platform.is_xpu():
+        assert kwargs == {}
+        return
+    assert kwargs["warp_size"] == 16
+    assert kwargs["num_warps"] * kwargs["warp_size"] * 4 == head_size_padded
+
+
 def test_softcap_does_not_overflow_on_large_scores() -> None:
     """Scores above ~88 * soft_cap must not overflow to inf/NaN.
 

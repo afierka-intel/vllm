@@ -776,6 +776,21 @@ def reduce_segments(
     tl.store(output_ptr + output_offset, acc, mask=dim_mask)
 
 
+def _reduce_segments_launch_kwargs(head_size_padded: int) -> dict[str, int]:
+    """Launch options for ``reduce_segments`` on Intel XPU.
+
+    The default launch (4 warps x 32 lanes) spreads the
+    ``[NUM_SEGMENTS_PER_SEQ, HEAD_SIZE_PADDED]`` tile over more lanes than
+    there are 4-wide fp32 column chunks, so the max/sum over segments goes
+    through shared local memory and barriers.  16-lane sub-groups with one
+    lane per 4 columns keep each column's segments in one lane and reduce
+    them in registers.  Other platforms keep their default launch.
+    """
+    if not current_platform.is_xpu():
+        return {}
+    return {"num_warps": max(1, head_size_padded // 64), "warp_size": 16}
+
+
 def _is_gemma3_attention(head_size: int, sliding_window: int) -> bool:
     """Detect Gemma3 models via unique (head_size, sliding_window) signature.
 
@@ -1191,4 +1206,5 @@ def unified_attention(
             BLOCK_Q=BLOCK_Q,
             NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
             USE_FP8=output_scale is not None,
+            **_reduce_segments_launch_kwargs(head_size_padded),
         )
