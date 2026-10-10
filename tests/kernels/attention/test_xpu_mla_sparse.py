@@ -168,3 +168,77 @@ def test_bf16_triton_sparse_mla_masked_chunks(device_str, dtype):
     # lse/max_logits are large-negative finite rather than the reference's
     # +inf/-inf placeholders, so only the output is compared here.
     assert torch.allclose(out[2], torch.zeros_like(out[2]))
+
+
+@pytest.mark.parametrize("device_str", ["xpu"])
+@pytest.mark.parametrize("num_valid", [1, 4, 16, 128, 512])
+@pytest.mark.skipif(
+    not torch.xpu.is_available(),
+    reason="XPU is required",
+)
+def test_bf16_triton_sparse_mla_attn_sink(device_str, num_valid):
+    """DSv4 attn_sink (a per-head extra logit in the softmax denominator).
+
+    Uses the DSv4 prefill/decode shape (head 512, no rope split,
+    ``block_dpe=0``) and sinks drawn from the range of the released
+    checkpoints. Rows with few valid keys are where ignoring the sink hurts
+    most (start of a sequence / SWA window), so they are covered explicitly.
+    """
+    device = torch.device(device_str)
+    s_q, s_kv, h_q, h_kv, d_qk, d_v, topk = 8, 1024, 64, 1, 512, 512, 512
+    dtype = torch.bfloat16
+    torch.random.manual_seed(1234)
+
+    q = torch.randn((s_q, h_q, d_qk), dtype=dtype, device=device)
+    kv = torch.randn((s_kv, h_kv, d_qk), dtype=dtype, device=device)
+    indices = torch.full((s_q, h_kv, topk), -1, dtype=torch.int32, device=device)
+    for t in range(s_q):
+        indices[t, 0, :num_valid] = torch.randperm(s_kv, device=device)[:num_valid].to(
+            torch.int32
+        )
+    # attn_sink values of the released DSv4-Flash checkpoints span ~[-2.2, 2.5].
+    attn_sink = torch.rand(h_q, device=device) * 4.7 - 2.2
+    sm_scale = d_qk**-0.5
+
+    out, _, lse = triton_bf16_mla_sparse_interface(
+        q, kv, indices, sm_scale, d_v, block_dpe=0, attn_sink=attn_sink
+    )
+    ref_out, _, _, ref_lse = reference_mla_sparse_prefill(
+        q, kv, indices, sm_scale, d_v, attn_sink=attn_sink
+    )
+    assert out.isfinite().all()
+    assert torch.allclose(out, ref_out, atol=1e-2, rtol=1e-2)
+    # lse is reported over the selected keys only (sink excluded).
+    assert torch.allclose(lse, ref_lse, atol=1e-3, rtol=1e-3)
+
+    # Without a sink the result must differ markedly for short rows -- this
+    # guards against the sink silently becoming a no-op again.
+    out_nosink, _, _ = triton_bf16_mla_sparse_interface(
+        q, kv, indices, sm_scale, d_v, block_dpe=0
+    )
+    if num_valid <= 16:
+        assert not torch.allclose(out_nosink, ref_out, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(
+    not torch.xpu.is_available(),
+    reason="XPU is required",
+)
+def test_bf16_triton_sparse_mla_attn_sink_neg_inf_is_noop():
+    """The default sink value (-inf) must not change the output."""
+    device = torch.device("xpu")
+    s_q, s_kv, h_q, d_qk, d_v, topk = 4, 256, 16, 512, 512, 128
+    torch.random.manual_seed(7)
+    q = torch.randn((s_q, h_q, d_qk), dtype=torch.bfloat16, device=device)
+    kv = torch.randn((s_kv, 1, d_qk), dtype=torch.bfloat16, device=device)
+    indices = torch.stack(
+        [torch.randperm(s_kv, device=device)[:topk] for _ in range(s_q)]
+    ).to(torch.int32)[:, None, :]
+    sink = torch.full((h_q,), float("-inf"), device=device)
+    a, _, _ = triton_bf16_mla_sparse_interface(
+        q, kv, indices, d_qk**-0.5, d_v, block_dpe=0
+    )
+    b, _, _ = triton_bf16_mla_sparse_interface(
+        q, kv, indices, d_qk**-0.5, d_v, block_dpe=0, attn_sink=sink
+    )
+    assert torch.equal(a, b)
