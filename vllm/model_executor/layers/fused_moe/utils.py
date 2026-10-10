@@ -640,15 +640,13 @@ def moe_use_td_hw_supported() -> bool:
     ``fused_moe_kernel`` (ignores the ``VLLM_TRITON_USE_TD`` override).
 
     The A-load uses ``tensor_descriptor.gather``, which lowers to the PTX
-    ``tile::gather4`` instruction. That instruction is part of the
-    ``tcgen05``/Tensor Memory (TMEM) family introduced with Blackwell and has
-    no Hopper (sm90) equivalent -- ptxas rejects it there ("Feature
+    ``tile::gather4`` instruction. That TMA mode was introduced with Blackwell
+    and has no Hopper (sm90) equivalent -- ptxas rejects it there ("Feature
     '.tile::gather4 ...' requires .target sm_100 or higher"). Unlike
     ``scatter4``, ``gather4`` is supported across the whole sm100+ range
     including consumer Blackwell (sm120/sm121): see triton-lang/triton#8498,
     which enables ``gather4`` on sm120/sm121 while leaving ``scatter4``
-    unsupported there. So this gates on a blanket ``has_device_capability(100)``
-    rather than the sm100 *family* check used for the scatter store path.
+    unsupported there. So this gates on a blanket ``has_device_capability(100)``.
     """
     if current_platform.is_xpu():
         return True

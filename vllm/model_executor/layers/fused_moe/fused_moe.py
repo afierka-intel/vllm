@@ -53,12 +53,26 @@ def write_zeros_to_output(
     BLOCK_SIZE_M,
     BLOCK_SIZE_N,
     compute_type,
+    num_valid_tokens,
+    USE_TD_SCATTER: tl.constexpr,
 ):
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=compute_type)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, accumulator, mask=c_mask)
+    if USE_TD_SCATTER:
+        # Scatter takes no mask; padded slots (offs_token >= num_valid_tokens)
+        # are dropped by the descriptor's row bound.
+        c_desc = tl.make_tensor_descriptor(
+            base=c_ptr,
+            shape=(num_valid_tokens, N),
+            strides=(stride_cm, stride_cn),
+            block_shape=(1, BLOCK_SIZE_N),
+        )
+        zeros = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=c_ptr.dtype.element_ty)
+        c_desc.scatter(zeros, offs_token.to(tl.int32), pid_n * BLOCK_SIZE_N)
+    else:
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=compute_type)
+        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+        c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+        tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
 @triton.jit
@@ -178,6 +192,8 @@ def fused_moe_kernel_gptq_awq(
             BLOCK_SIZE_M,
             BLOCK_SIZE_N,
             compute_type,
+            num_valid_tokens,
+            USE_TD_SCATTER=False,
         )
         return
 
@@ -351,6 +367,8 @@ def fused_moe_kernel(
     SWAP_AB: tl.constexpr,
     # Tensor-descriptor path for the A gather and B load in the K-loop.
     USE_TD: tl.constexpr = False,
+    # Tensor-descriptor scatter for the zero store of EP-pruned blocks.
+    USE_TD_SCATTER: tl.constexpr = False,
 ):
     """Implements the fused computation for a Mixture of Experts (MOE) using
     token and expert matrices.
@@ -434,6 +452,8 @@ def fused_moe_kernel(
             BLOCK_SIZE_M,
             BLOCK_SIZE_N,
             compute_type,
+            num_valid_tokens,
+            USE_TD_SCATTER=USE_TD_SCATTER,
         )
         return
 
@@ -855,6 +875,16 @@ def invoke_fused_moe_triton_kernel(
             BLOCK_SIZE_K,
         )
         use_td = False
+    # XPU only: on CUDA sm90+ the scatter lowers to tile::scatter4, which
+    # sm90/sm12x reject and sm100 runs slower than the pointer store. C rows
+    # must be 16-byte aligned and BLOCK_SIZE_N at least 32 bytes wide.
+    use_td_scatter = (
+        use_td
+        and current_platform.is_xpu()
+        and C.stride(2) == 1
+        and C.stride(1) * C.element_size() % 16 == 0
+        and config["BLOCK_SIZE_N"] * C.element_size() >= 32
+    )
 
     # Triton treats 0-D tensor arguments as scalar values, but the kernel
     # loads tensor-wise activation scales through a pointer.
@@ -904,6 +934,7 @@ def invoke_fused_moe_triton_kernel(
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         SWAP_AB=SWAP_AB,
         USE_TD=use_td,
+        USE_TD_SCATTER=use_td_scatter,
         **config,
     )
 

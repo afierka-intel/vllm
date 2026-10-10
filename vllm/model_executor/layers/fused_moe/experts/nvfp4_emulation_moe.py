@@ -137,6 +137,8 @@ def fused_moe_nvfp4_emulation_kernel(
             BLOCK_SIZE_M,
             BLOCK_SIZE_N,
             compute_type,
+            num_valid_tokens,
+            USE_TD_SCATTER=False,
         )
         return
 
