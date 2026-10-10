@@ -788,12 +788,14 @@ def _run_use_td_case(
     seq_threshold_3D: int,
     dtype: torch.dtype = torch.bfloat16,
     num_blocks: int = 2048,
+    fp8_output: bool = False,
 ) -> None:
     """Shared driver for the USE_TD test cases.
 
     Runs ``unified_attention(..., use_td=True)`` and compares against the
     reference paged-attention implementation that the sibling non-TD
-    tests use.
+    tests use.  With ``fp8_output`` the result is written as fp8 through
+    ``output_scale`` and dequantized before the comparison.
     """
     torch.set_default_device(DEVICE_TYPE)
     set_random_seed(0)
@@ -823,7 +825,12 @@ def _run_use_td_case(
         0, num_blocks, (num_seqs, max_num_blocks_per_seq), dtype=torch.int32
     )
 
-    output = torch.empty_like(query)
+    if fp8_output:
+        output = torch.empty(query.shape, dtype=FP8_DTYPE)
+        output_scale = torch.tensor(0.5, dtype=torch.float32)
+    else:
+        output = torch.empty_like(query)
+        output_scale = None
 
     num_par_softmax_segments = 16
     head_size_padded = next_power_of_2(head_size)
@@ -857,6 +864,7 @@ def _run_use_td_case(
         q_descale=None,
         k_descale=None,
         v_descale=None,
+        output_scale=output_scale,
         seq_threshold_3D=seq_threshold_3D,
         num_par_softmax_segments=num_par_softmax_segments,
         softmax_segm_output=softmax_segm_output,
@@ -876,7 +884,11 @@ def _run_use_td_case(
         sliding_window=sliding_window,
         soft_cap=soft_cap,
     )
-    torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
+    if fp8_output:
+        output = (output.to(torch.float32) * output_scale.item()).to(dtype)
+        torch.testing.assert_close(output, ref_output, atol=2e-1, rtol=2e-1)
+    else:
+        torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize(
@@ -918,6 +930,45 @@ def test_triton_unified_attn_use_td(
         soft_cap=soft_cap,
         seq_threshold_3D=seq_threshold_3D,
         num_blocks=num_blocks,
+    )
+
+
+# Decode-only batches with ``seq_threshold_3D=8`` force the 3D path, so
+# ``reduce_segments`` runs with ``USE_TD``.  The short sequences leave
+# ``act_num_segments < NUM_SEGMENTS_PER_SEQ`` (masked tail segments, which
+# the descriptor must zero-pad), the long ones fill all 16 segments.
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [(1, 1), (1, 3), (1, 17), (1, 100)],
+        [(1, 523), (1, 37), (1, 2011)],
+        [(1, 4096), (1, 9000)],
+    ],
+)
+@pytest.mark.parametrize("num_heads", [(4, 4), (8, 2)])
+@pytest.mark.parametrize("head_size", [64, 96, 128, 256])
+@pytest.mark.parametrize("fp8_output", [False, True])
+@torch.inference_mode()
+def test_triton_unified_attn_use_td_reduce_segments(
+    seq_lens: list[tuple[int, int]],
+    num_heads: tuple[int, int],
+    head_size: int,
+    fp8_output: bool,
+) -> None:
+    """``reduce_segments`` loads ``segm_output`` through a tensor descriptor.
+
+    ``head_size=96`` covers ``HEAD_SIZE < HEAD_SIZE_PADDED``: the buffer
+    has a padded inner axis the descriptor shape must exclude.
+    """
+    _run_use_td_case(
+        seq_lens=seq_lens,
+        num_heads=num_heads,
+        head_size=head_size,
+        block_size=16,
+        sliding_window=None,
+        soft_cap=None,
+        seq_threshold_3D=8,
+        fp8_output=fp8_output,
     )
 
 

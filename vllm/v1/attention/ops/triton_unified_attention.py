@@ -176,6 +176,41 @@ def _store_output_td(
 
 
 @triton.jit
+def _load_segm_output_td(
+    segm_output_ptr,
+    query_token_idx,
+    query_head_idx,
+    act_num_segments,
+    num_query_heads: tl.constexpr,
+    NUM_SEGMENTS_PER_SEQ: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+    HEAD_SIZE_PADDED: tl.constexpr,
+):
+    """Load the per-segment partial outputs of one (token, head) via TD.
+
+    The ``[NUM_SEGMENTS_PER_SEQ, HEAD_SIZE_PADDED]`` fp32 slice is one
+    contiguous block with row stride ``HEAD_SIZE_PADDED``.  The descriptor
+    ``shape`` is ``(act_num_segments, HEAD_SIZE)``, so rows past the
+    active segments and columns past ``HEAD_SIZE`` read back as zeros,
+    which is what the pointer path's ``mask`` / ``other=0.0`` produces.
+    Returns (NUM_SEGMENTS_PER_SEQ, HEAD_SIZE_PADDED).
+    """
+    base = (
+        segm_output_ptr
+        + query_token_idx.to(tl.int64)
+        * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
+        + query_head_idx * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
+    )
+    desc = tl.make_tensor_descriptor(
+        base=base,
+        shape=(act_num_segments, HEAD_SIZE),
+        strides=(HEAD_SIZE_PADDED, 1),
+        block_shape=(NUM_SEGMENTS_PER_SEQ, HEAD_SIZE_PADDED),
+    )
+    return desc.load([0, 0])
+
+
+@triton.jit
 def kernel_unified_attention(
     # Output destination for the 2D path.  In 3D mode per-segment partials
     # go to the ``segm_*`` tensors (see bottom of signature) and
@@ -715,6 +750,7 @@ def reduce_segments(
     BLOCK_Q: tl.constexpr,  # int
     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
     USE_FP8: tl.constexpr,  # bool
+    USE_TD: tl.constexpr = False,  # bool, load segm_output via a 2D TD
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
@@ -754,18 +790,30 @@ def reduce_segments(
     overall_expsum = tl.sum(segm_expsum)
 
     # load, rescale, and add segment attention outputs
-    segm_output_offset = (
-        query_token_idx.to(tl.int64)
-        * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
-        + query_head_idx * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
-        + tl.arange(0, NUM_SEGMENTS_PER_SEQ)[:, None] * HEAD_SIZE_PADDED
-        + tl.arange(0, HEAD_SIZE_PADDED)[None, :]
-    )
-    segm_output = tl.load(
-        segm_output_ptr + segm_output_offset,
-        mask=segm_mask[:, None] & dim_mask[None, :],
-        other=0.0,
-    )
+    if USE_TD:
+        segm_output = _load_segm_output_td(
+            segm_output_ptr,
+            query_token_idx,
+            query_head_idx,
+            act_num_segments,
+            num_query_heads,
+            NUM_SEGMENTS_PER_SEQ,
+            HEAD_SIZE,
+            HEAD_SIZE_PADDED,
+        )
+    else:
+        segm_output_offset = (
+            query_token_idx.to(tl.int64)
+            * (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
+            + query_head_idx * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED)
+            + tl.arange(0, NUM_SEGMENTS_PER_SEQ)[:, None] * HEAD_SIZE_PADDED
+            + tl.arange(0, HEAD_SIZE_PADDED)[None, :]
+        )
+        segm_output = tl.load(
+            segm_output_ptr + segm_output_offset,
+            mask=segm_mask[:, None] & dim_mask[None, :],
+            other=0.0,
+        )
     segm_output *= tl.exp(segm_max - overall_max)[:, None]
     acc_sum = tl.sum(segm_output, axis=0)
     # safely divide by overall_expsum, returning 0.0 if overall_expsum is 0
@@ -1199,4 +1247,5 @@ def unified_attention(
             BLOCK_Q=BLOCK_Q,
             NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
             USE_FP8=output_scale is not None,
+            USE_TD=use_td,
         )
