@@ -42,6 +42,9 @@ from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
     batched_fused_marlin_moe,
     fused_marlin_moe,
 )
+from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+    moe_align_block_size,
+)
 from vllm.model_executor.layers.fused_moe.utils import (
     moe_use_td_hw_supported,
 )
@@ -648,6 +651,111 @@ def test_naive_block_assignment_moe(
             use_compile=use_compile,
             use_cudagraph=use_cudagraph,
         )
+
+
+@pytest.mark.parametrize(
+    "m,n,k", [(1, 48, 128), (33, 104, 256), (16, 100, 128), (222, 1024, 512)]
+)
+@pytest.mark.parametrize("naive_block_assignment", [False, True])
+@pytest.mark.parametrize("use_td", [False, True])
+def test_fused_moe_kernel_zeros_pruned_expert_rows(
+    m: int,
+    n: int,
+    k: int,
+    naive_block_assignment: bool,
+    use_td: bool,
+    monkeypatch,
+):
+    """Rows routed to experts outside the local EP rank are zeroed by
+    ``write_zeros_to_output`` (TD scatter or pointer store), and padded slots
+    never write past ``num_valid_tokens``."""
+    if use_td and not hasattr(tl, "make_tensor_descriptor"):
+        pytest.skip("Triton < 3.6 lacks tl.make_tensor_descriptor")
+    if use_td and not moe_use_td_hw_supported():
+        pytest.skip("tensor_descriptor.gather is unsupported on this device")
+    monkeypatch.setenv("VLLM_TRITON_USE_TD", "1" if use_td else "0")
+    set_random_seed(7)
+
+    e, topk, dtype, sentinel = 8, 2, torch.bfloat16, 7.0
+    a = torch.randn((m, k), device=DEVICE_TYPE, dtype=dtype) / 10
+    w = torch.randn((e, n, k), device=DEVICE_TYPE, dtype=dtype) / 10
+    # Even experts are local to this EP rank and odd ones are pruned; every
+    # token is routed to one of each.
+    local = torch.arange(0, e, 2, device=DEVICE_TYPE)
+    expert_map = torch.full((e,), -1, device=DEVICE_TYPE, dtype=torch.int32)
+    expert_map[local] = torch.arange(e // 2, device=DEVICE_TYPE, dtype=torch.int32)
+    picks = torch.randint(0, e // 2, (m, topk), device=DEVICE_TYPE)
+    topk_ids = (local[picks] + torch.arange(topk, device=DEVICE_TYPE)).to(torch.int32)
+    pruned = expert_map[topk_ids] == -1
+
+    config = {
+        "BLOCK_SIZE_M": 16,
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 64,
+        "GROUP_SIZE_M": 1,
+    }
+    if naive_block_assignment:
+        sorted_token_ids = None
+        expert_ids = expert_map[topk_ids].view(-1)
+        num_tokens_post_padded = torch.full(
+            (1,),
+            topk_ids.numel() * config["BLOCK_SIZE_M"],
+            device=DEVICE_TYPE,
+            dtype=torch.int32,
+        )
+    else:
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+            topk_ids, config["BLOCK_SIZE_M"], e, expert_map
+        )
+
+    # Guard rows past num_valid_tokens catch writes from padded slots.
+    out = torch.full((m * topk + 16, n), sentinel, device=DEVICE_TYPE, dtype=dtype)
+    c = out[: m * topk].view(m, topk, n)
+
+    launch_kwargs: dict[str, Any] = {}
+    kernel = fused_moe_module.fused_moe_kernel
+
+    class SpyKernel:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                launch_kwargs.update(kwargs)
+                return kernel[grid](*args, **kwargs)
+
+            return launch
+
+    monkeypatch.setattr(fused_moe_module, "fused_moe_kernel", SpyKernel())
+    fused_moe_module.invoke_fused_moe_triton_kernel(
+        A=a,
+        B=w[local],
+        C=c,
+        A_scale=None,
+        B_scale=None,
+        topk_weights=None,
+        sorted_token_ids=sorted_token_ids,
+        expert_ids=expert_ids,
+        num_tokens_post_padded=num_tokens_post_padded,
+        mul_routed_weight=False,
+        top_k=topk,
+        config=config,
+        compute_type=tl.bfloat16,
+        use_fp8_w8a8=False,
+        use_int8_w8a8=False,
+        use_int8_w8a16=False,
+        use_int4_w4a16=False,
+        per_channel_quant=False,
+    )
+    # C rows that are not 16-byte aligned (N=100) keep the pointer store.
+    assert launch_kwargs["USE_TD_SCATTER"] == (
+        use_td and current_platform.is_xpu() and n * c.element_size() % 16 == 0
+    )
+
+    ref = torch.zeros((m, topk, n), device=DEVICE_TYPE, dtype=torch.float32)
+    for expert in local.tolist():
+        rows, slots = torch.nonzero(topk_ids == expert, as_tuple=True)
+        ref[rows, slots] = a[rows].float() @ w[expert].float().T
+    assert torch.all(c[pruned] == 0)
+    torch.testing.assert_close(c[~pruned].float(), ref[~pruned], atol=2e-2, rtol=2e-2)
+    assert torch.all(out[m * topk :] == sentinel)
 
 
 @pytest.mark.parametrize("m,n,k", FUSED_MOE_WN16_MNK_FACTORS)
