@@ -179,6 +179,27 @@ def test_scaled_mm_td_matches_plain(M, N, K, in_dtype, use_scalar_scale_a, use_b
     torch.testing.assert_close(out_td, out_plain, rtol=0, atol=0)
 
 
+@pytest.fixture
+def td_launches(monkeypatch):
+    """Force the tensor-descriptor path and record USE_TD of every launch."""
+    monkeypatch.setenv("VLLM_TRITON_USE_TD", "1")
+    real_kernel = triton_scaled_mm_module.scaled_mm_kernel
+    used: list[bool] = []
+
+    class _Recorder:
+        def __getitem__(self, grid):
+            launch = real_kernel[grid]
+
+            def run(*args, **kwargs):
+                used.append(bool(kwargs["USE_TD"]))
+                return launch(*args, **kwargs)
+
+            return run
+
+    monkeypatch.setattr(triton_scaled_mm_module, "scaled_mm_kernel", _Recorder())
+    return used
+
+
 # The launch must stay opaque to torch.compile (inline tracing breaks split_graph).
 @pytest.mark.skipif(
     not (current_platform.is_cuda_alike() or current_platform.is_xpu()),
@@ -187,7 +208,7 @@ def test_scaled_mm_td_matches_plain(M, N, K, in_dtype, use_scalar_scale_a, use_b
 @pytest.mark.parametrize("M", [1, 64])
 @pytest.mark.parametrize("use_bias", [True, False])
 @pytest.mark.parametrize("scalar_scales", [True, False])
-def test_scaled_mm_custom_op_under_compile(M, use_bias, scalar_scales):
+def test_scaled_mm_custom_op_under_compile(M, use_bias, scalar_scales, td_launches):
     import vllm.model_executor.kernels.linear.scaled_mm.triton  # noqa: F401
 
     N, K = 2048, 4096
@@ -208,6 +229,8 @@ def test_scaled_mm_custom_op_under_compile(M, use_bias, scalar_scales):
     expected = triton_scaled_mm(a, b, scale_a, scale_b, out_dtype, bias)
     compiled = torch.compile(fn, fullgraph=True)(a, b, scale_a, scale_b, bias)
     torch.testing.assert_close(compiled, expected, rtol=0, atol=0)
+    # Both the eager and the compiled launch went through the TD kernel path.
+    assert td_launches == [True, True], td_launches
 
 
 # The fake impl must match the real output without touching a device.
@@ -226,6 +249,33 @@ def test_scaled_mm_fake_impl_meta(M, N, K, out_dtype):
     assert out.device.type == "meta"
 
 
+# The fake impl must agree with the real op (shape, dtype, device) on a real device.
+@pytest.mark.skipif(
+    not (current_platform.is_cuda_alike() or current_platform.is_xpu()),
+    reason="Triton scaled_mm runs on CUDA-alike or XPU.",
+)
+@pytest.mark.parametrize("M,N,K", [(1, 2048, 4096), (7, 128, 256)])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
+def test_scaled_mm_fake_impl_matches_real(M, N, K, out_dtype):
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    import vllm.model_executor.kernels.linear.scaled_mm.triton  # noqa: F401
+
+    set_random_seed(0)
+    a = torch.randint(-32, 32, (M, K), dtype=torch.int8, device=device)
+    b = torch.randint(-32, 32, (N, K), dtype=torch.int8, device=device).t()
+    scale_a = 0.25 * torch.rand((M, 1), device=device)
+    scale_b = 0.25 * torch.rand((N, 1), device=device)
+
+    real = torch.ops.vllm.triton_scaled_mm_func(a, b, scale_a, scale_b, out_dtype, None)
+    with FakeTensorMode() as mode:
+        fake_args = [mode.from_tensor(t) for t in (a, b, scale_a, scale_b)]
+        fake = torch.ops.vllm.triton_scaled_mm_func(*fake_args, out_dtype, None)
+    assert fake.shape == real.shape
+    assert fake.dtype == real.dtype
+    assert fake.device == real.device
+
+
 # The regression itself: apply_weights must reach the opaque op under compile.
 @pytest.mark.skipif(
     not (current_platform.is_cuda_alike() or current_platform.is_xpu()),
@@ -234,7 +284,9 @@ def test_scaled_mm_fake_impl_meta(M, N, K, out_dtype):
 @pytest.mark.parametrize("M", [1, 64])
 @pytest.mark.parametrize("use_bias", [True, False])
 @pytest.mark.parametrize("is_static", [True, False])
-def test_int8_kernel_apply_weights_opaque_under_compile(M, use_bias, is_static):
+def test_int8_kernel_apply_weights_opaque_under_compile(
+    M, use_bias, is_static, td_launches
+):
     from vllm.model_executor.kernels.linear.scaled_mm import (
         Int8ScaledMMLinearLayerConfig,
     )
@@ -287,6 +339,8 @@ def test_int8_kernel_apply_weights_opaque_under_compile(M, use_bias, is_static):
 
     targets = [str(n.target) for g in graphs for n in g.graph.nodes]
     assert any("triton_scaled_mm_func" in t for t in targets), targets
+    # The opaque op really launched the TD kernel, eagerly and compiled.
+    assert td_launches == [True, True], td_launches
     if is_static:
         torch.testing.assert_close(compiled, expected, rtol=0, atol=0)
     else:
