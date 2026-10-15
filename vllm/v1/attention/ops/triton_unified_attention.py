@@ -845,6 +845,29 @@ def reduce_segments(
     tl.store(output_ptr + output_offset, acc, mask=dim_mask)
 
 
+# On XPU the launch of reduce_segments is picked at runtime.  The first config
+# is the default launch, so VLLM_TRITON_FORCE_FIRST_CONFIG=1 reproduces the
+# untuned kernel.  The key leaves out the batch size so tuning happens once per
+# model at warmup and never during graph capture.  Other platforms keep the
+# plain kernel.
+if current_platform.is_xpu():
+    reduce_segments = triton.autotune(
+        configs=[triton.Config({}, num_warps=4)]
+        + [
+            triton.Config({"warp_size": 16, "grf_mode": grf}, num_warps=nw)
+            for nw in (1, 2, 4, 8)
+            for grf in ("default", "256")
+        ],
+        key=[
+            "num_query_heads",
+            "HEAD_SIZE_PADDED",
+            "NUM_SEGMENTS_PER_SEQ",
+            "USE_FP8",
+            "USE_TD",
+        ],
+    )(reduce_segments)
+
+
 def _is_gemma3_attention(head_size: int, sliding_window: int) -> bool:
     """Detect Gemma3 models via unique (head_size, sliding_window) signature.
 
