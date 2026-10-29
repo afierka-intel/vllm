@@ -6,6 +6,7 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
+from vllm.v1.attention.ops import triton_decode_attention as tda
 from vllm.v1.attention.ops.triton_decode_attention import decode_attention_fwd
 
 pytestmark = pytest.mark.skip_global_cleanup
@@ -395,3 +396,100 @@ def test_decode_attention_int64_logits_offset(B, H_Q, H_KV, D_QK, D_V, is_mla):
     # Same compute order; the last request only differs in its logits offset.
     assert torch.equal(o[-1:], o_last)
     assert torch.equal(lse[-1:], lse_last)
+
+
+def _spy_stage1_use_td(monkeypatch):
+    """Record the USE_TD value of every _fwd_kernel_stage1 launch."""
+    real = tda._fwd_kernel_stage1
+    seen: list[bool] = []
+
+    class _Spy:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                seen.append(kwargs["USE_TD"])
+                return real[grid](*args, **kwargs)
+
+            return launch
+
+    monkeypatch.setattr(tda, "_fwd_kernel_stage1", _Spy())
+    return seen
+
+
+@pytest.mark.skipif(not current_platform.is_xpu(), reason="TD path is XPU-only")
+@pytest.mark.parametrize("D_QK", [64, 128, 256])
+@pytest.mark.parametrize("D_V", [64, 128, 256])
+@pytest.mark.parametrize("H", [1, 8])
+@pytest.mark.parametrize("PAGE_SIZE", [1, 16])
+@pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_decode_attention_stage1_td(monkeypatch, D_QK, D_V, H, PAGE_SIZE, kv_dtype):
+    """Every head-dim combo the stage1 TD gate accepts must take the TD path
+    and match the pointer path. Page 0 holds NaN/Inf and is never referenced:
+    out-of-range gather lanes alias to it and must not leak into the output."""
+    torch.manual_seed(0)
+    B, seq_len, num_kv_splits = 3, 1025, 8
+    num_pages = 4096 // PAGE_SIZE
+    dtype = torch.bfloat16
+
+    req_to_page = torch.randint(
+        1, num_pages, (B, cdiv(seq_len, PAGE_SIZE)), device=DEVICE_TYPE
+    )
+    b_seq_len = torch.full((B,), seq_len, device=DEVICE_TYPE)
+    q = torch.randn(B, H, D_QK, dtype=dtype, device=DEVICE_TYPE)
+    k = torch.randn(num_pages, PAGE_SIZE, H, D_QK, dtype=dtype, device=DEVICE_TYPE)
+    v = torch.randn(num_pages, PAGE_SIZE, H, D_V, dtype=dtype, device=DEVICE_TYPE)
+    k[0] = float("inf")
+    v[0] = float("nan")
+    k, v = k.to(kv_dtype), v.to(kv_dtype)
+    if PAGE_SIZE == 1:
+        k, v = k.flatten(0, 1), v.flatten(0, 1)
+
+    seen = _spy_stage1_use_td(monkeypatch)
+
+    def run(td):
+        monkeypatch.setenv("VLLM_TRITON_USE_TD", td)
+        o = torch.zeros(B, H, D_V, dtype=dtype, device=DEVICE_TYPE)
+        lse = torch.zeros(B, H, dtype=dtype, device=DEVICE_TYPE)
+        attn_logits = torch.empty(
+            (B, H, num_kv_splits, D_V + 1), dtype=torch.float32, device=DEVICE_TYPE
+        )
+        decode_attention_fwd(
+            q,
+            k,
+            v,
+            o,
+            lse,
+            req_to_page,
+            b_seq_len,
+            attn_logits,
+            num_kv_splits,
+            1.0 / (D_QK**0.5),
+            PAGE_SIZE,
+        )
+        return o, lse
+
+    o_ref, lse_ref = run("0")
+    o_td, lse_td = run("1")
+
+    assert seen == [False, True]
+    assert torch.isfinite(o_ref).all()
+    torch.testing.assert_close(o_td, o_ref)
+    torch.testing.assert_close(lse_td, lse_ref)
+
+
+def test_stage1_td_gate_rejects_int32_row_overflow(monkeypatch):
+    """Gather row indices are int32, so a KV cache with more than 2**31 - 1
+    flattened (page, token) rows must keep the pointer path. Meta tensors stand
+    in for a cache that large (256 GiB at this shape)."""
+    monkeypatch.setattr(tda, "_td_gather_supported", lambda: True)
+    page_size, d = 16, 64
+
+    def gate(num_pages):
+        q = torch.empty(1, 1, d, dtype=torch.bfloat16, device="meta")
+        kv = torch.empty(
+            num_pages, page_size, 1, d, dtype=torch.bfloat16, device="meta"
+        )
+        stride = tda._page_stride(kv, page_size)
+        return tda._stage1_use_td(q, kv, kv, page_size, stride, stride, d, d, True)
+
+    assert gate(2**31 // page_size - 1)
+    assert not gate(2**31 // page_size)
