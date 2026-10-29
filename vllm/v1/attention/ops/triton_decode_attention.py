@@ -333,13 +333,11 @@ def _fwd_grouped_kernel_stage1(
     cur_batch_req_idx = cur_batch
 
     if USE_TD:
-        # Q head-dim axis is contiguous, so the [BLOCK_H, BLOCK_DMODEL] tile is
-        # one descriptor load on the per-batch slice. Rows past q_head_num and
-        # columns past Lk read as 0, which is what mask_h/mask_d do. Rows inside
-        # the tile but past VALID_BLOCK_H hold neighbouring heads instead of 0;
-        # every consumer of them is masked (qk -> -inf, store masked by mask_h),
-        # and rows are independent in the dot/softmax/acc, so the result is
-        # unchanged.
+        # Descriptor bounds zero rows past q_head_num and columns past Lk.
+        # Rows past VALID_BLOCK_H are in bounds (neighbour heads), so they are
+        # zeroed explicitly; the tile then equals the masked pointer load,
+        # NaN/Inf in neighbour heads included. desc.load takes no
+        # cache_modifier, so the pointer path's ".ca" hint is not applied.
         q_desc = tl.make_tensor_descriptor(
             Q + cur_batch * stride_qbs,
             shape=[q_head_num, Lk],
@@ -347,6 +345,7 @@ def _fwd_grouped_kernel_stage1(
             block_shape=[BLOCK_H, BLOCK_DMODEL],
         )
         q = q_desc.load([cur_head_id * VALID_BLOCK_H, 0])
+        q = tl.where(mask_h[:, None], q, 0.0)
     else:
         offs_q = (
             cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_d[None, :]
@@ -369,6 +368,7 @@ def _fwd_grouped_kernel_stage1(
                 block_shape=[BLOCK_H, BLOCK_DPE],
             )
             qpe = qpe_desc.load([cur_head_id * VALID_BLOCK_H, BLOCK_DMODEL])
+            qpe = tl.where(mask_h[:, None], qpe, 0.0)
         else:
             off_qpe = (
                 cur_batch * stride_qbs
@@ -563,13 +563,19 @@ def _decode_grouped_att_m_fwd(
         # exceeds 101376 bytes limit
         num_stages = 1
 
-    # Tensor descriptors cover the Q / Q-PE tile loads only: their inner axis
-    # (head dim) is contiguous and the tile is exactly [BLOCK_H, BLOCK_DMODEL].
-    # K/V tiles are gathered page-by-page through Req_to_tokens, so they are
-    # not expressible as a descriptor and stay on the pointer path.
+    # The descriptor covers only the Q / Q-PE tile, read once per program. The
+    # K/V loop, which moves most of the bytes, stays on the pointer path (a
+    # tensor_descriptor.gather over flattened (page, token) rows could express
+    # it; not done here), so no speedup is expected. Hence opt-in only
+    # (VLLM_TRITON_USE_TD=1; unset does not enable it on XPU) and XPU only:
+    # other platforms, incl. BLOCK_DMODEL=512 vs the 256-element TMA box
+    # limit, are not validated.
+    from vllm import envs
+
     q_elem = q.element_size()
     use_td = (
-        use_tensor_descriptor()
+        use_tensor_descriptor(envs.VLLM_TRITON_USE_TD or False)
+        and current_platform.is_xpu()
         and q.stride(-1) == 1
         and q.data_ptr() % 16 == 0
         and (Lk * q_elem) % 16 == 0
