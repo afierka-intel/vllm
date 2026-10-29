@@ -94,14 +94,9 @@ def _td_buf_ok(buf, inner):
 
 
 def _td_gather_supported():
-    # The K/V tiles are row gathers out of the paged cache, so the TD path
-    # needs tensor_descriptor.gather. On CUDA that lowers to tile::gather4
-    # (sm100+ only); XPU maps it to HW 2D block reads.
-    if current_platform.is_xpu():
-        return True
-    if current_platform.is_cuda():
-        return current_platform.has_device_capability(100)
-    return False
+    # The K/V tiles are row gathers (tensor_descriptor.gather). That path is
+    # only tested on XPU; every other platform keeps the pointer path.
+    return current_platform.is_xpu()
 
 
 def _stage1_use_td(
@@ -109,13 +104,16 @@ def _stage1_use_td(
 ):
     if not use_tensor_descriptor(override) or not _td_gather_supported():
         return False
-    # A padded innermost block (Lk < BLOCK_DMODEL) miscompiles with
-    # descriptor gather, so require power-of-2 head dims. The innermost box
-    # dim is also capped at 256 elements.
+    # Restricted to the tested shapes: unpadded power-of-2 head dims <= 256.
+    # MLA (Lk=576, Lv=512) therefore always keeps the pointer path.
     if Lk != triton.next_power_of_2(Lk) or Lv != triton.next_power_of_2(Lv):
         return False
     if Lk > 256 or Lv > 256:
         return False
+    # Gather row indices are int32.
+    for buf in (k_buffer, v_buffer):
+        if _flat_kv_rows(buf, page_size) > 2**31 - 1:
+            return False
     if not _td_pages_packed(k_buffer, page_size, k_page_stride):
         return False
     if not _td_pages_packed(v_buffer, page_size, v_page_stride):
@@ -221,8 +219,9 @@ def _fwd_kernel_stage1(
             ).to(tl.int64)  # page_number * page stride overflows int32
             kv_in_page = offs_n % PAGE_SIZE
             if USE_TD:
-                # Out-of-range lanes land on page 0; qk is -inf-masked below
-                # and p is exactly 0, so their contribution stays 0.
+                # Lanes past split_kv_end gather real rows of page 0. Their qk
+                # is replaced by -inf below; v is zeroed after the fp8
+                # dequant, as in the pointer path, since 0 * NaN/Inf = NaN.
                 kv_row = (kv_page_number * PAGE_SIZE + kv_in_page).to(tl.int32)
                 k = k_desc.gather(kv_row, 0)
             else:
@@ -265,6 +264,8 @@ def _fwd_kernel_stage1(
                 )
             if v.dtype.is_fp8():
                 v = (v.to(tl.float32) * vs).to(q.dtype)
+            if USE_TD:
+                v = tl.where((offs_n < split_kv_end)[:, None], v, 0.0).to(v.dtype)
 
             n_e_max = tl.maximum(tl.max(qk, 0), e_max)
             re_scale = tl.exp(e_max - n_e_max)
