@@ -35,11 +35,14 @@ import torch
 from packaging import version
 
 from vllm.platforms import current_platform
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 
 is_hip_ = current_platform.is_rocm()
 
 logger = logging.getLogger(__name__)
+
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
 
 # Only print the following warnings when triton version < 3.2.0.
 # The issue won't affect performance or accuracy.
@@ -588,6 +591,7 @@ def _fwd_kernel_stage2(
     BLOCK_DV: tl.constexpr,
     Lv: tl.constexpr,
     OUTPUT_FP16: tl.constexpr = 0,
+    USE_TD: tl.constexpr = False,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -604,16 +608,38 @@ def _fwd_kernel_stage2(
     offs_v = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + offs_d
     offs_logic = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + Lv
 
+    if USE_TD:
+        # One [1, BLOCK_DV] tile per split. The descriptor shape stops at Lv,
+        # so lanes past Lv read as 0, matching the masked pointer load. The
+        # trailing LSE column is outside the descriptor and stays scalar.
+        # The batch offset is int64 for both: B * H * NUM_KV_SPLITS * (Lv + 1)
+        # can exceed 2**31 elements.
+        mid_base = (
+            Mid_O + cur_batch.to(tl.int64) * stride_mid_ob + cur_head * stride_mid_oh
+        )
+        mid_desc = tl.make_tensor_descriptor(
+            base=mid_base,
+            shape=[NUM_KV_SPLITS, Lv],
+            strides=[stride_mid_os, 1],
+            block_shape=[1, BLOCK_DV],
+        )
+
     for split_kv_id in range(0, NUM_KV_SPLITS):
         kv_len_per_split = tl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
         split_kv_start = kv_len_per_split * split_kv_id
         split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
 
         if split_kv_end > split_kv_start:
-            tv = tl.load(
-                Mid_O + offs_v + split_kv_id * stride_mid_os, mask=mask_d, other=0.0
-            )
-            tlogic = tl.load(Mid_O + offs_logic + split_kv_id * stride_mid_os)
+            if USE_TD:
+                tv = mid_desc.load([split_kv_id, 0]).reshape(BLOCK_DV)
+                tlogic = tl.load(mid_base + Lv + split_kv_id * stride_mid_os)
+            else:
+                tv = tl.load(
+                    Mid_O + offs_v + split_kv_id * stride_mid_os,
+                    mask=mask_d,
+                    other=0.0,
+                )
+                tlogic = tl.load(Mid_O + offs_logic + split_kv_id * stride_mid_os)
             n_e_max = tl.maximum(tlogic, e_max)
 
             old_scale = tl.exp(e_max - n_e_max)
@@ -660,6 +686,25 @@ def _decode_softmax_reducev_fwd(
         # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
         extra_kargs = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16, "kpack": 2}
 
+    # The stage-2 descriptor covers the per-split partial-output tile only. It
+    # needs a unit innermost stride, a 16-byte-multiple tile, a 16-byte
+    # aligned row stride (stride_mid_os) and a 16-byte aligned base (data_ptr
+    # plus batch/head strides). The default (..., Lv + 1) fp32 logits layout
+    # fails the row-stride check, so it takes the pointer path.
+    elem = logits.element_size()
+    use_td = (
+        use_tensor_descriptor()
+        and logits.stride(-1) == 1
+        and (BLOCK_DV * elem) % 16 == 0
+        and (logits.stride(2) * elem) % 16 == 0
+        and (logits.stride(0) * elem) % 16 == 0
+        and (logits.stride(1) * elem) % 16 == 0
+        and logits.data_ptr() % 16 == 0
+    )
+    if use_td and logits.device not in _TD_ALLOCATOR_DEVICES:
+        set_triton_allocator(logits.device)
+        _TD_ALLOCATOR_DEVICES.add(logits.device)
+
     grid = (batch, head_num)
     _fwd_kernel_stage2[grid](
         logits,
@@ -675,6 +720,7 @@ def _decode_softmax_reducev_fwd(
         NUM_KV_SPLITS=NUM_KV_SPLITS,
         BLOCK_DV=BLOCK_DV,
         Lv=Lv,
+        USE_TD=use_td,
         num_warps=4,
         num_stages=2,
         **extra_kargs,
