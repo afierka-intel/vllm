@@ -3,8 +3,9 @@
 
 import torch
 
+import vllm.envs as envs
 from vllm.platforms import current_platform
-from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils import tl, triton
 from vllm.triton_utils.allocation import set_triton_allocator
 
 float8_info = torch.finfo(current_platform.fp8_dtype())
@@ -15,10 +16,12 @@ _TD_ALLOCATOR_DEVICES: set[torch.device] = set()
 def _td_layout_ok(
     t: torch.Tensor, head_size: int, head_stride: int, num_heads: int
 ) -> bool:
-    # Tensor descriptors need a unit innermost stride, a 16-byte aligned base
-    # and leading stride, and the [tokens, heads] axes must collapse into a
-    # single row axis of stride ``head_stride`` (the layout the pointer path
-    # already assumes).
+    # Tensor descriptors need a unit innermost stride, a 16-byte aligned base,
+    # leading stride and row width, and the [tokens, heads] axes must collapse
+    # into a single row axis of stride ``head_stride`` (the layout the pointer
+    # path already assumes). ``head_stride`` may exceed ``head_size`` (e.g. MLA
+    # slices ``[..., :v_head_dim]`` out of a wider buffer); the descriptor then
+    # covers only the first ``head_size`` columns of each row.
     return (
         t.dim() == 3
         and t.stride(2) == 1
@@ -66,12 +69,19 @@ def merge_attn_states(
     if prefill_tokens_with_context is None:
         prefill_tokens_with_context = num_tokens
 
-    # TD describes each output buffer as a 2D [tokens * heads, head_size] view
-    # and moves one row per program. Gated on a power-of-2 head_size because
-    # descriptor stores do not mask the padded tail, so block_shape must match
-    # the described extent exactly.
+    # The TD path is opt-in for this kernel: it is taken only for use_td=True
+    # or an explicit VLLM_TRITON_USE_TD=1. Unlike use_tensor_descriptor(), an
+    # unset variable does NOT enable it on XPU, because no measurement shows a
+    # gain here (one [1, head_size] row per program in a launch-bound kernel).
+    if use_td is None:
+        use_td = envs.VLLM_TRITON_USE_TD is True
+    # TD describes each buffer as a 2D [tokens * heads, head_size] view and
+    # moves one row per program. Restricted to a power-of-2 head_size so the
+    # [1, PADDED_HEAD_SIZE] block covers exactly the described extent; a
+    # non-power-of-2 head_size would rely on descriptor bounds clipping of the
+    # padded tail, which is not exercised by the tests.
     use_td = (
-        use_tensor_descriptor(use_td)
+        use_td
         and head_size == padded_head_size
         and _td_layout_ok(output, head_size, output_head_stride, num_query_heads)
         and _td_layout_ok(prefix_output, head_size, prefix_head_stride, num_query_heads)
@@ -145,8 +155,8 @@ def merge_attn_states_kernel(
     if USE_TD:
         tl.static_assert(
             HEAD_SIZE == PADDED_HEAD_SIZE,
-            "USE_TD requires a power-of-2 head_size: descriptor stores do "
-            "not mask the padded tail.",
+            "USE_TD requires a power-of-2 head_size (the host gate falls "
+            "back to the pointer path otherwise).",
         )
         row_idx = token_idx * num_heads + head_idx
         num_rows = tl.num_programs(0) * num_heads
