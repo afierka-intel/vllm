@@ -111,6 +111,161 @@ def test_merge_attn_states_both_empty(merge_fn, output_dtype) -> None:
     assert not output.isnan().any()
 
 
+class _LaunchSpy:
+    """Records the USE_TD value of every merge_attn_states_kernel launch."""
+
+    def __init__(self, kernel):
+        self.kernel = kernel
+        self.use_td: list[bool] = []
+
+    def __getitem__(self, grid):
+        launch = self.kernel[grid]
+
+        def run(*args, **kwargs):
+            self.use_td.append(kwargs["USE_TD"])
+            return launch(*args, **kwargs)
+
+        return run
+
+
+def _spy_kernel(monkeypatch) -> _LaunchSpy:
+    import vllm.v1.attention.ops.triton_merge_attn_states as mod
+
+    spy = _LaunchSpy(mod.merge_attn_states_kernel)
+    monkeypatch.setattr(mod, "merge_attn_states_kernel", spy)
+    return spy
+
+
+def _merge_ref(prefix_output, prefix_lse, suffix_output, suffix_lse, n_ctx, scale):
+    """fp32 reference with the kernel's inf / both-empty handling."""
+    p_lse = torch.where(prefix_lse == torch.inf, -torch.inf, prefix_lse)
+    s_lse = torch.where(suffix_lse == torch.inf, -torch.inf, suffix_lse)
+    max_lse = torch.maximum(p_lse, s_lse)
+    p_se = torch.exp(p_lse - max_lse)
+    s_se = torch.exp(s_lse - max_lse)
+    out_se = p_se + s_se
+    empty = max_lse == -torch.inf
+    out_lse = torch.where(empty, -torch.inf, torch.log(out_se) + max_lse)
+    p_scale = (p_se / out_se).T.unsqueeze(-1)
+    s_scale = (s_se / out_se).T.unsqueeze(-1)
+    out = prefix_output.float() * p_scale + suffix_output.float() * s_scale
+    out = torch.where(empty.T.unsqueeze(-1), 0.0, out)
+    out[n_ctx:] = suffix_output[n_ctx:].float()
+    out_lse[:, n_ctx:] = suffix_lse[:, n_ctx:]
+    if scale is not None:
+        fp8 = torch.finfo(current_platform.fp8_dtype())
+        out = (out * (1.0 / scale)).clamp(fp8.min, fp8.max)
+        out = out.to(current_platform.fp8_dtype()).float() * scale
+    return out, out_lse
+
+
+@pytest.mark.parametrize("use_fp8", [False, True])
+@pytest.mark.parametrize("prefill_tokens_with_context", [None, 37])
+@pytest.mark.parametrize("out_pad", [0, 32])
+@pytest.mark.parametrize("in_pad", [0, 64])
+@pytest.mark.parametrize("head_size", [64, 96, 128])
+@pytest.mark.parametrize("input_dtype", DTYPES)
+@torch.inference_mode()
+def test_merge_attn_states_triton_td(
+    monkeypatch,
+    input_dtype: torch.dtype,
+    head_size: int,
+    in_pad: int,
+    out_pad: int,
+    prefill_tokens_with_context: int | None,
+    use_fp8: bool,
+):
+    """The Triton tensor-descriptor path must match the pointer path exactly,
+    including head_stride > head_size (padded inputs/output), FP8 output, the
+    no-context copy path and inf/-inf LSEs, and must not write the padding
+    columns. Non-power-of-2 head sizes must fall back to the pointer path."""
+    spy = _spy_kernel(monkeypatch)
+    torch.manual_seed(0)
+    num_tokens, num_heads = 67, 8
+    n_ctx = prefill_tokens_with_context or num_tokens
+    out_dtype = current_platform.fp8_dtype() if use_fp8 else input_dtype
+    scale = 0.05
+    output_scale = (
+        torch.tensor([scale], dtype=torch.float32, device=DEVICE) if use_fp8 else None
+    )
+
+    def padded_randn(pad: int) -> torch.Tensor:
+        shape = (num_tokens, num_heads, head_size + pad)
+        return torch.randn(shape, device=DEVICE).to(input_dtype)[..., :head_size]
+
+    prefix_output = padded_randn(in_pad)
+    suffix_output = padded_randn(in_pad)
+    prefix_lse = torch.randn(num_heads, num_tokens, device=DEVICE)
+    suffix_lse = torch.randn(num_heads, num_tokens, device=DEVICE)
+    prefix_lse[:, 1] = float("inf")  # FA2-style empty prefix
+    suffix_lse[:, 2] = float("inf")  # FA2-style empty suffix
+    prefix_lse[:, 3] = suffix_lse[:, 3] = float("-inf")  # both empty
+    prefix_lse[:, 4] = float("-inf")
+
+    results = []
+    for use_td in (False, True):
+        out_buf = torch.full(
+            (num_tokens, num_heads, head_size + out_pad), 7.0, device=DEVICE
+        ).to(out_dtype)
+        output_lse = torch.empty(num_heads, num_tokens, device=DEVICE)
+        merge_attn_states_triton(
+            out_buf[..., :head_size],
+            prefix_output,
+            prefix_lse.clone(),
+            suffix_output,
+            suffix_lse.clone(),
+            output_lse,
+            prefill_tokens_with_context,
+            output_scale,
+            use_td=use_td,
+        )
+        assert (out_buf[..., head_size:].float() == 7.0).all(), "padding written"
+        results.append((out_buf[..., :head_size].float(), output_lse))
+
+    assert spy.use_td == [False, head_size in (64, 128)]
+    (ptr_out, ptr_lse), (td_out, td_lse) = results
+    torch.testing.assert_close(td_out, ptr_out, atol=0, rtol=0)
+    torch.testing.assert_close(td_lse, ptr_lse, atol=0, rtol=0)
+
+    ref_out, ref_lse = _merge_ref(
+        prefix_output,
+        prefix_lse,
+        suffix_output,
+        suffix_lse,
+        n_ctx,
+        scale if use_fp8 else None,
+    )
+    if use_fp8:
+        atol, rtol, td_out = 1.5e-1, 1.5e-1, td_out * scale
+    elif input_dtype == torch.bfloat16:
+        atol, rtol = 1e-3, 1e-2
+    else:
+        atol, rtol = 1e-3, 1e-3
+    torch.testing.assert_close(td_out, ref_out, atol=atol, rtol=rtol)
+    torch.testing.assert_close(td_lse, ref_lse, atol=1e-3, rtol=1e-3)
+
+
+def test_merge_attn_states_triton_td_is_opt_in(monkeypatch) -> None:
+    """The TD path is taken only when requested: an unset VLLM_TRITON_USE_TD
+    keeps the pointer path on every platform, including XPU."""
+    spy = _spy_kernel(monkeypatch)
+    shape = (16, 8, 128)
+    prefix_output = torch.randn(shape, device=DEVICE, dtype=torch.half)
+    suffix_output = torch.randn(shape, device=DEVICE, dtype=torch.half)
+    prefix_lse = torch.randn(8, 16, device=DEVICE)
+    suffix_lse = torch.randn(8, 16, device=DEVICE)
+    for env in (None, "0", "1"):
+        if env is None:
+            monkeypatch.delenv("VLLM_TRITON_USE_TD", raising=False)
+        else:
+            monkeypatch.setenv("VLLM_TRITON_USE_TD", env)
+        output = torch.empty_like(prefix_output)
+        merge_attn_states_triton(
+            output, prefix_output, prefix_lse, suffix_output, suffix_lse
+        )
+    assert spy.use_td == [False, False, True]
+
+
 def generate_markdown_table():
     global all_case_info
     table_header = (
