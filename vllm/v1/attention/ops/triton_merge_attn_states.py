@@ -3,10 +3,34 @@
 
 import torch
 
+import vllm.envs as envs
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.triton_utils.allocation import set_triton_allocator
 
 float8_info = torch.finfo(current_platform.fp8_dtype())
+
+_TD_ALLOCATOR_DEVICES: set[torch.device] = set()
+
+
+def _td_layout_ok(
+    t: torch.Tensor, head_size: int, head_stride: int, num_heads: int
+) -> bool:
+    # Tensor descriptors need a unit innermost stride, a 16-byte aligned base,
+    # leading stride and row width, and the [tokens, heads] axes must collapse
+    # into a single row axis of stride ``head_stride`` (the layout the pointer
+    # path already assumes). ``head_stride`` may exceed ``head_size`` (e.g. MLA
+    # slices ``[..., :v_head_dim]`` out of a wider buffer); the descriptor then
+    # covers only the first ``head_size`` columns of each row.
+    return (
+        t.dim() == 3
+        and t.stride(2) == 1
+        and t.stride(1) == head_stride
+        and t.stride(0) == num_heads * head_stride
+        and (head_size * t.element_size()) % 16 == 0
+        and (head_stride * t.element_size()) % 16 == 0
+        and t.data_ptr() % 16 == 0
+    )
 
 
 # Implements section 2.2 of https://www.arxiv.org/pdf/2501.01005
@@ -20,6 +44,7 @@ def merge_attn_states(
     output_lse: torch.Tensor | None = None,
     prefill_tokens_with_context: int | None = None,
     output_scale: torch.Tensor | None = None,
+    use_td: bool | None = None,
 ) -> None:
     num_tokens = output.shape[0]
     num_query_heads = output.shape[1]
@@ -44,6 +69,28 @@ def merge_attn_states(
     if prefill_tokens_with_context is None:
         prefill_tokens_with_context = num_tokens
 
+    # The TD path is opt-in for this kernel: it is taken only for use_td=True
+    # or an explicit VLLM_TRITON_USE_TD=1. Unlike use_tensor_descriptor(), an
+    # unset variable does NOT enable it on XPU, because no measurement shows a
+    # gain here (one [1, head_size] row per program in a launch-bound kernel).
+    if use_td is None:
+        use_td = envs.VLLM_TRITON_USE_TD is True
+    # TD describes each buffer as a 2D [tokens * heads, head_size] view and
+    # moves one row per program. Restricted to a power-of-2 head_size so the
+    # [1, PADDED_HEAD_SIZE] block covers exactly the described extent; a
+    # non-power-of-2 head_size would rely on descriptor bounds clipping of the
+    # padded tail, which is not exercised by the tests.
+    use_td = (
+        use_td
+        and head_size == padded_head_size
+        and _td_layout_ok(output, head_size, output_head_stride, num_query_heads)
+        and _td_layout_ok(prefix_output, head_size, prefix_head_stride, num_query_heads)
+        and _td_layout_ok(suffix_output, head_size, prefix_head_stride, num_query_heads)
+    )
+    if use_td and output.device not in _TD_ALLOCATOR_DEVICES:
+        set_triton_allocator(output.device)
+        _TD_ALLOCATOR_DEVICES.add(output.device)
+
     # TODO(woosuk): Use CUDA kernel instead of Triton to minimize CPU overhead.
     merge_attn_states_kernel[(num_tokens, num_query_heads)](
         output,
@@ -66,6 +113,7 @@ def merge_attn_states(
         padded_head_size,
         output_lse is not None,
         output_scale is not None,
+        USE_TD=use_td,
     )
 
 
@@ -93,6 +141,7 @@ def merge_attn_states_kernel(
     USE_FP8: tl.constexpr,
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
+    USE_TD: tl.constexpr = False,
 ):
     token_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
@@ -102,6 +151,33 @@ def merge_attn_states_kernel(
 
     head_arange = tl.arange(0, PADDED_HEAD_SIZE)
     head_mask = head_arange < HEAD_SIZE
+
+    if USE_TD:
+        tl.static_assert(
+            HEAD_SIZE == PADDED_HEAD_SIZE,
+            "USE_TD requires a power-of-2 head_size (the host gate falls "
+            "back to the pointer path otherwise).",
+        )
+        row_idx = token_idx * num_heads + head_idx
+        num_rows = tl.num_programs(0) * num_heads
+        prefix_desc = tl.make_tensor_descriptor(
+            prefix_output,
+            shape=[num_rows, HEAD_SIZE],
+            strides=[prefix_head_stride, 1],
+            block_shape=[1, PADDED_HEAD_SIZE],
+        )
+        suffix_desc = tl.make_tensor_descriptor(
+            suffix_output,
+            shape=[num_rows, HEAD_SIZE],
+            strides=[prefix_head_stride, 1],
+            block_shape=[1, PADDED_HEAD_SIZE],
+        )
+        output_desc = tl.make_tensor_descriptor(
+            output,
+            shape=[num_rows, HEAD_SIZE],
+            strides=[output_head_stride, 1],
+            block_shape=[1, PADDED_HEAD_SIZE],
+        )
 
     # For tokens without context (token_idx >= prefill_tokens_with_context),
     # directly copy from suffix_output
@@ -119,27 +195,36 @@ def merge_attn_states_kernel(
                 s_lse,
             )
 
-        s_out = tl.load(
-            suffix_output
-            + token_idx * num_heads * prefix_head_stride
-            + head_idx * prefix_head_stride
-            + head_arange,
-            mask=head_mask,
-        )
+        if USE_TD:
+            s_out = suffix_desc.load([row_idx, 0]).reshape(PADDED_HEAD_SIZE)
+        else:
+            s_out = tl.load(
+                suffix_output
+                + token_idx * num_heads * prefix_head_stride
+                + head_idx * prefix_head_stride
+                + head_arange,
+                mask=head_mask,
+            )
 
         if USE_FP8:
             s_out = s_out * (1.0 / tl.load(output_scale))
             s_out = tl.clamp(s_out, FP8_MIN, FP8_MAX)
             s_out = s_out.to(output.dtype.element_ty)
 
-        tl.store(
-            output
-            + token_idx * num_heads * output_head_stride
-            + head_idx * output_head_stride
-            + head_arange,
-            s_out,
-            mask=head_mask,
-        )
+        if USE_TD:
+            output_desc.store(
+                [row_idx, 0],
+                s_out.to(output.dtype.element_ty).reshape(1, PADDED_HEAD_SIZE),
+            )
+        else:
+            tl.store(
+                output
+                + token_idx * num_heads * output_head_stride
+                + head_idx * output_head_stride
+                + head_arange,
+                s_out,
+                mask=head_mask,
+            )
         return
 
     # For tokens with context (token_idx < prefill_tokens_with_context),
@@ -183,20 +268,24 @@ def merge_attn_states_kernel(
             out_lse,
         )
 
-    p_out = tl.load(
-        prefix_output
-        + token_idx * num_heads * prefix_head_stride
-        + head_idx * prefix_head_stride
-        + head_arange,
-        mask=head_mask,
-    )
-    s_out = tl.load(
-        suffix_output
-        + token_idx * num_heads * prefix_head_stride
-        + head_idx * prefix_head_stride
-        + head_arange,
-        mask=head_mask,
-    )
+    if USE_TD:
+        p_out = prefix_desc.load([row_idx, 0]).reshape(PADDED_HEAD_SIZE)
+        s_out = suffix_desc.load([row_idx, 0]).reshape(PADDED_HEAD_SIZE)
+    else:
+        p_out = tl.load(
+            prefix_output
+            + token_idx * num_heads * prefix_head_stride
+            + head_idx * prefix_head_stride
+            + head_arange,
+            mask=head_mask,
+        )
+        s_out = tl.load(
+            suffix_output
+            + token_idx * num_heads * prefix_head_stride
+            + head_idx * prefix_head_stride
+            + head_arange,
+            mask=head_mask,
+        )
 
     # NOTE(woosuk): Be careful with the numerical stability.
     # We should compute the scale first, and then multiply it with the output.
@@ -213,11 +302,17 @@ def merge_attn_states_kernel(
         out = tl.clamp(out, FP8_MIN, FP8_MAX)
         out = out.to(output.dtype.element_ty)
 
-    tl.store(
-        output
-        + token_idx * num_heads * output_head_stride
-        + head_idx * output_head_stride
-        + head_arange,
-        out,
-        mask=head_mask,
-    )
+    if USE_TD:
+        output_desc.store(
+            [row_idx, 0],
+            out.to(output.dtype.element_ty).reshape(1, PADDED_HEAD_SIZE),
+        )
+    else:
+        tl.store(
+            output
+            + token_idx * num_heads * output_head_stride
+            + head_idx * output_head_stride
+            + head_arange,
+            out,
+            mask=head_mask,
+        )
