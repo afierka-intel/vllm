@@ -74,3 +74,27 @@ steps:
       pytest -v -s
       kernels/attention/test_xpu_mla_sparse.py
       v1/attention/test_xpu_mla_sparse_backend.py'
+
+- label: ":intel: (BMG) FLA Chunk Local Cumsum Tests"
+  key: xpu-fla-chunk-local-cumsum-tests
+  timeout_in_minutes: 20
+  device: intel_gpu
+  agent_tags:
+    label: production
+    gpu: 1+
+    mem: 16+
+  no_plugin: true
+  working_dir: "."
+  env:
+    REGISTRY: "public.ecr.aws/q9t5s3a7"
+    REPO: "vllm-ci-test-repo"
+    VLLM_TEST_DEVICE: "xpu"
+  source_file_dependencies:
+    - vllm/third_party/flash_linear_attention/ops/cumsum.py
+    - vllm/triton_utils/
+    - tests/kernels/fla/test_chunk_local_cumsum.py
+  commands:
+    - >-
+      bash .buildkite/scripts/hardware_ci/run-intel-test.sh
+      'cd tests &&
+      pytest -v -s kernels/fla/test_chunk_local_cumsum.py'

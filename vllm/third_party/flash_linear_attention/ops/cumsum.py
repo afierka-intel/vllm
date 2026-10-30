@@ -10,7 +10,8 @@
 
 import torch
 
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
+from vllm.triton_utils.allocation import set_triton_allocator
 
 from .index import prepare_chunk_indices
 from .utils import check_shared_mem, input_guard
@@ -21,7 +22,7 @@ BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @triton.autotune(
     configs=[triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8]],
-    key=["B", "H", "BT", "IS_VARLEN", "REVERSE"],
+    key=["B", "H", "BT", "IS_VARLEN", "REVERSE", "USE_TD"],
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_local_cumsum_scalar_kernel(
@@ -36,9 +37,15 @@ def chunk_local_cumsum_scalar_kernel(
     REVERSE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     HEAD_FIRST: tl.constexpr,
+    USE_TD: tl.constexpr = False,
+    BH: tl.constexpr = 1,
 ):
     i_t, i_bh = tl.program_id(0).to(tl.int64), tl.program_id(1)
-    i_b, i_h = i_bh // H, i_bh % H
+    if USE_TD:
+        # One program per [BT, BH] tile, i.e. BH heads at once.
+        i_b, i_h = i_bh // tl.cdiv(H, BH), i_bh % tl.cdiv(H, BH)
+    else:
+        i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
         i_n, i_t = (
             tl.load(chunk_indices + i_t * 2).to(tl.int32),
@@ -52,21 +59,48 @@ def chunk_local_cumsum_scalar_kernel(
     else:
         bos, eos = i_b * T, i_b * T + T
 
-    o_t = i_t * BT + tl.arange(0, BT)
-    m_t = o_t < T
-    if HEAD_FIRST:
-        p_s = s + bos * H + i_h * T + o_t
-        p_o = o + bos * H + i_h * T + o_t
+    if USE_TD:
+        # A single head is a [BT] column with stride H, which no descriptor
+        # can describe (the last block dim must be contiguous and >= 16
+        # bytes), so the descriptor block spans BH contiguous heads. Rows
+        # past T and heads past H are zero-filled on load and dropped on
+        # store, so no mask is needed.
+        tl.static_assert(not HEAD_FIRST, "USE_TD needs the [B, T, H] layout")
+        d_s = tl.make_tensor_descriptor(
+            s + bos.to(tl.int64) * H,
+            shape=[T, H],
+            strides=[H, 1],
+            block_shape=[BT, BH],
+        )
+        d_o = tl.make_tensor_descriptor(
+            o + bos.to(tl.int64) * H,
+            shape=[T, H],
+            strides=[H, 1],
+            block_shape=[BT, BH],
+        )
+        # [BT, BH]
+        b_s = d_s.load([(i_t * BT).to(tl.int32), i_h * BH]).to(tl.float32)
+        b_o = tl.cumsum(b_s, axis=0)
+        if REVERSE:
+            b_z = tl.sum(b_s, axis=0)
+            b_o = -b_o + b_z[None, :] + b_s
+        d_o.store([(i_t * BT).to(tl.int32), i_h * BH], b_o.to(o.dtype.element_ty))
     else:
-        p_s = s + bos * H + i_h + o_t * H
-        p_o = o + bos * H + i_h + o_t * H
-    # [BT]
-    b_s = tl.load(p_s, mask=m_t, other=0.0).to(tl.float32)
-    b_o = tl.cumsum(b_s, axis=0)
-    if REVERSE:
-        b_z = tl.sum(b_s, axis=0)
-        b_o = -b_o + b_z[None] + b_s
-    tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=m_t)
+        o_t = i_t * BT + tl.arange(0, BT)
+        m_t = o_t < T
+        if HEAD_FIRST:
+            p_s = s + bos * H + i_h * T + o_t
+            p_o = o + bos * H + i_h * T + o_t
+        else:
+            p_s = s + bos * H + i_h + o_t * H
+            p_o = o + bos * H + i_h + o_t * H
+        # [BT]
+        b_s = tl.load(p_s, mask=m_t, other=0.0).to(tl.float32)
+        b_o = tl.cumsum(b_s, axis=0)
+        if REVERSE:
+            b_z = tl.sum(b_s, axis=0)
+            b_o = -b_o + b_z[None] + b_s
+        tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=m_t)
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
@@ -151,7 +185,23 @@ def chunk_local_cumsum_scalar(
     BT = chunk_size
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
-    grid = (NT, B * H)
+    # The TD path loads [BT, BH] tiles of a [T, H] view, so both descriptors
+    # need a 16-byte aligned base and row stride (H * element size).
+    use_td = (
+        use_tensor_descriptor()
+        and not head_first
+        and all(
+            (H * x.element_size()) % 16 == 0 and x.data_ptr() % 16 == 0
+            for x in (g_org, g)
+        )
+    )
+    if use_td:
+        set_triton_allocator(g.device)
+        BH = min(triton.next_power_of_2(H), 16)
+        grid = (NT, B * triton.cdiv(H, BH))
+    else:
+        BH = 1
+        grid = (NT, B * H)
     chunk_local_cumsum_scalar_kernel[grid](
         g_org,
         g,
@@ -163,6 +213,8 @@ def chunk_local_cumsum_scalar(
         BT=BT,
         HEAD_FIRST=head_first,
         REVERSE=reverse,
+        USE_TD=use_td,
+        BH=BH,
     )
     return g
 
