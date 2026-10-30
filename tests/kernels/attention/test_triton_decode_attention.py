@@ -427,8 +427,8 @@ class _GroupedStage1Spy:
 @pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 def test_decode_attention_mla_tensor_descriptor(monkeypatch, H_Q, D_QK, D_V, kv_dtype):
     """VLLM_TRITON_USE_TD selects the Q tensor-descriptor load of the MLA
-    grouped kernel (unset = on for XPU only), and it matches the pointer load:
-    only the Q load differs, the math is unchanged."""
+    grouped kernel (unset = on for XPU only), and it gives the same bits as the
+    pointer load: only the Q load differs, the math is unchanged."""
     torch.manual_seed(0)
     B, PAGE_SIZE, num_pages, seq_len, num_kv_splits = 3, 16, 1024, 1027, 8
     dtype = torch.bfloat16
@@ -483,7 +483,5 @@ def test_decode_attention_mla_tensor_descriptor(monkeypatch, H_Q, D_QK, D_V, kv_
     for td_env in ("1", None):
         use_td, *out = run(td_env)
         assert use_td == is_xpu
-        # Same math, so allow 1 bf16 ulp for compiler reordering (bf16 or fp8 KV
-        # both give bf16 o / lse; the measured difference is 0).
         for actual, expected in zip(out, ref):
-            torch.testing.assert_close(actual, expected, rtol=2**-7, atol=1e-3)
+            assert torch.equal(actual, expected)
