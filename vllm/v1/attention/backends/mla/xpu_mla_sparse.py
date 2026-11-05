@@ -245,6 +245,9 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata], SharedTopkIndices
             kv_c_and_k_pe_cache,
             topk_indices,
             sm_scale=self.softmax_scale,
+            # RoPE part of the latent row: 64 for DeepSeek V3.2, 0 when the
+            # model has no rope dims (GLM-5.3, qk_rope_head_dim = 0).
+            block_dpe=q.shape[-1] - self.kv_lora_rank,
         )
 
         return output[:, : self.num_heads, :]
@@ -280,7 +283,7 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata], SharedTopkIndices
             topk_indices,
             BLOCK_SIZE=attn_metadata.block_size,
             BLOCK_STRIDE_ROWS=block_stride_rows,
-            NUM_TOPK_TOKENS=attn_metadata.topk_tokens,
+            NUM_TOPK_TOKENS=topk_indices.shape[1],
         )
 
         attn_out = self._forward_bf16_kv(q, kv_rows, topk_indices_global, attn_metadata)
