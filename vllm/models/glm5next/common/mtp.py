@@ -31,7 +31,6 @@ from vllm.model_executor.models.utils import (
     get_fused_shared_expert_layers,
     maybe_prefix,
 )
-from vllm.models.glm5next.nvidia.ops.fused_eh_norm import fused_eh_norm
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
@@ -46,6 +45,11 @@ from .model import (
     get_sparse_topk_buffer_width,
     get_spec_layer_idx_from_weight_name,
 )
+
+if current_platform.is_xpu():
+    from vllm.models.glm5next.xpu.ops.fused_eh_norm import fused_eh_norm
+else:
+    from vllm.models.glm5next.nvidia.ops.fused_eh_norm import fused_eh_norm
 
 
 class Glm5NextMultiTokenPredictorLayer(nn.Module):

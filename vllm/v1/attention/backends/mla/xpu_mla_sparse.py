@@ -77,7 +77,9 @@ class XPUMLASparseBackend(AttentionBackend):
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
-        return [576]
+        # 576 = kv_lora_rank 512 + 64 RoPE dims (DeepSeek-V3.2 / GLM-5);
+        # 512 = latent only, no RoPE split (GLM-5.3-Flash, qk_rope_head_dim 0).
+        return [512, 576]
 
 
 @dataclass
@@ -217,6 +219,8 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata], SharedTopkIndices
         self.num_kv_heads = num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
         self.kv_lora_rank: int = mla_args["kv_lora_rank"]
+        # Trailing RoPE dims of the latent (0 when the model has no RoPE split).
+        self.rope_dim = head_size - self.kv_lora_rank
         self.softmax_scale = scale
         self.init_topk_indices_buffer(indexer, topk_indices_buffer)
 
@@ -245,6 +249,8 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata], SharedTopkIndices
             kv_c_and_k_pe_cache,
             topk_indices,
             sm_scale=self.softmax_scale,
+            d_v=self.kv_lora_rank,
+            block_dpe=self.rope_dim,
         )
 
         return output[:, : self.num_heads, :]
@@ -280,7 +286,10 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata], SharedTopkIndices
             topk_indices,
             BLOCK_SIZE=attn_metadata.block_size,
             BLOCK_STRIDE_ROWS=block_stride_rows,
-            NUM_TOPK_TOKENS=attn_metadata.topk_tokens,
+            # The shared top-k buffer can be wider than index_topk (GLM-5.3
+            # kpool indexers append the incomplete trailing pool), so size the
+            # conversion by the buffer, like the CUDA sparse backends do.
+            NUM_TOPK_TOKENS=topk_indices.shape[1],
         )
 
         attn_out = self._forward_bf16_kv(q, kv_rows, topk_indices_global, attn_metadata)

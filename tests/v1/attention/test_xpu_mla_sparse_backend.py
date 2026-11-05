@@ -22,3 +22,11 @@ def test_xpu_sparse_impl_implements_logical_topk_hook():
     # The XPU impl does not use sparse-MLA index groups: the hook is a no-op.
     impl = object.__new__(XPUMLASparseImpl)
     impl.record_logical_topk_ready()
+
+
+def test_xpu_sparse_backend_accepts_latent_only_head_size():
+    """GLM-5.3-Flash has no RoPE split (qk_rope_head_dim 0), so its MLA head
+    size is the 512-dim latent; DeepSeek-V3.2 / GLM-5 keep 576."""
+    from vllm.v1.attention.backends.mla.xpu_mla_sparse import XPUMLASparseBackend
+
+    assert set(XPUMLASparseBackend.get_supported_head_sizes()) >= {512, 576}
