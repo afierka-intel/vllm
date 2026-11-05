@@ -102,3 +102,34 @@ steps:
       bash .buildkite/scripts/hardware_ci/run-intel-test.sh
       'cd tests &&
       pytest -v -s kernels/mhc/test_mhc_xpu.py'
+
+- label: ":intel: (BMG) GLM-5.3-Flash XPU Kernel Tests"
+  key: glm5next-xpu-kernel-tests
+  timeout_in_minutes: 45
+  device: intel_gpu
+  agent_tags:
+    label: production
+    gpu: 1+
+    mem: 16+
+  no_plugin: true
+  working_dir: "."
+  env:
+    REGISTRY: "public.ecr.aws/q9t5s3a7"
+    REPO: "vllm-ci-test-repo"
+    VLLM_TEST_DEVICE: "xpu"
+  source_file_dependencies:
+    - vllm/models/glm5next
+    - vllm/v1/attention/backends/mla/indexer.py
+    - tests/models/glm5next
+    - tests/kernels/test_kpool_decode_update_batched.py
+    - tests/v1/attention/test_glm5next_indexer_block_sizes.py
+  commands:
+    - >-
+      bash .buildkite/scripts/hardware_ci/run-intel-test.sh
+      'cd tests &&
+      pytest -v -s
+      models/glm5next/test_xpu_ops.py
+      models/glm5next/test_kda_recurrent.py
+      models/glm5next/test_sparse_indexer_topk_dispatch.py
+      kernels/test_kpool_decode_update_batched.py
+      v1/attention/test_glm5next_indexer_block_sizes.py'

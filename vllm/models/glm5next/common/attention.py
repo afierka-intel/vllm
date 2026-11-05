@@ -30,12 +30,16 @@ from vllm.model_executor.models.deepseek_v2 import (
     yarn_get_mscale,
 )
 from vllm.model_executor.utils import maybe_disable_graph_partition, refill_derived
-from vllm.models.glm5next.nvidia.ops.kpool_compress import fwht128_quant_fp8
 from vllm.models.glm5next.sparse_indexer import SparseAttnIndexerKpool
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.v1.attention.backends.mla.indexer import Glm5NextIndexerBackend
 from vllm.v1.kv_cache_interface import CircularBufferSpec, MLAAttentionSpec
+
+if current_platform.is_xpu():
+    from vllm.models.glm5next.xpu.ops.kpool_compress import fwht128_quant_fp8
+else:
+    from vllm.models.glm5next.nvidia.ops.kpool_compress import fwht128_quant_fp8
 
 logger = init_logger(__name__)
 

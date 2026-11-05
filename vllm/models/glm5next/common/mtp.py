@@ -31,9 +31,13 @@ from vllm.model_executor.models.utils import (
     get_fused_shared_expert_layers,
     maybe_prefix,
 )
-from vllm.models.glm5next.nvidia.ops.fused_eh_norm import fused_eh_norm
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+
+if current_platform.is_xpu():
+    from vllm.models.glm5next.xpu.ops.fused_eh_norm import fused_eh_norm
+else:
+    from vllm.models.glm5next.nvidia.ops.fused_eh_norm import fused_eh_norm
 
 from .model import (
     Glm5NextDecoderLayer,

@@ -27,7 +27,9 @@ def _build(indexer_cls, backend: str):
             head_dim=128,
             max_pool_len=4096,
             max_total_seq_len=8192,
-            topk_indices_buffer=torch.empty(8, 2176, dtype=torch.int32, device="cuda"),
+            topk_indices_buffer=torch.empty(
+                8, 2176, dtype=torch.int32, device=current_platform.device_type
+            ),
         )
 
 
@@ -41,6 +43,42 @@ def test_kpool_indexer_dispatches_through_shared_topk_backend(backend: str) -> N
     from vllm.models.glm5next.nvidia.sparse_indexer import SparseAttnIndexerKpool
 
     assert _build(SparseAttnIndexerKpool, backend).topk_backend == backend
+
+
+@pytest.mark.skipif(not current_platform.is_xpu(), reason="XPU-only dispatch")
+@pytest.mark.parametrize("backend", ["auto", "per_row", "torch"])
+def test_kpool_indexer_dispatches_through_shared_topk_backend_xpu(
+    backend: str,
+) -> None:
+    """The XPU kpool indexer goes through the same dispatcher; "auto" resolves
+    to the per-row kernel (cooperative/persistent are CUDA-only)."""
+    from vllm.model_executor.layers.indexer_topk import get_indexer_topk
+    from vllm.models.glm5next.xpu.sparse_indexer import SparseAttnIndexerKpool
+
+    assert _build(SparseAttnIndexerKpool, backend).topk_backend == backend
+    logits = torch.zeros(4, 4096, device="xpu")
+    assert get_indexer_topk("auto")._resolve_auto(logits, 512, 4) == "per_row"
+
+
+@pytest.mark.skipif(not current_platform.is_xpu(), reason="XPU-only")
+def test_kpool_indexer_xpu_rejects_fp4_index_cache() -> None:
+    from vllm.models.glm5next.xpu.sparse_indexer import SparseAttnIndexerKpool
+
+    with (
+        set_current_vllm_config(VllmConfig()),
+        pytest.raises(NotImplementedError, match="FP4"),
+    ):
+        SparseAttnIndexerKpool(
+            k_cache=None,
+            quant_block_size=128,
+            scale_fmt="ue8m0",
+            topk_tokens=2048,
+            head_dim=128,
+            max_pool_len=4096,
+            max_total_seq_len=8192,
+            topk_indices_buffer=torch.empty(8, 2176, dtype=torch.int32),
+            use_fp4_cache=True,
+        )
 
 
 @pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm-only dispatch")

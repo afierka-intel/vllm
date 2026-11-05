@@ -246,6 +246,9 @@ mkdocs.yaml @hmellor
 /vllm/models/*/amd @tjtanaa @dllehr-amd @hongxiayang
 /vllm/models/deepseek_v4/amd @tjtanaa @dllehr-amd @hongxiayang @zyongye
 
+# Intel XPU per-model xpu/ subtrees
+/vllm/models/glm5next/xpu @jikunshang @xuechendi
+
 # TPU
 /vllm/v1/worker/tpu* @NickLucche
 /vllm/platforms/tpu.py @NickLucche
