@@ -65,7 +65,10 @@ steps:
     VLLM_TEST_DEVICE: "xpu"
   source_file_dependencies:
     - vllm/v1/attention/backends/mla/xpu_mla_sparse.py
+    - vllm/v1/attention/ops/xpu_mla_sparse.py
+    - vllm/v1/attention/ops/xpu_mla_sparse_fp8.py
     - tests/kernels/attention/test_xpu_mla_sparse.py
+    - tests/kernels/attention/test_xpu_mla_sparse_fp8.py
     - tests/v1/attention/test_xpu_mla_sparse_backend.py
   commands:
     - >-
@@ -73,6 +76,7 @@ steps:
       'cd tests &&
       pytest -v -s
       kernels/attention/test_xpu_mla_sparse.py
+      kernels/attention/test_xpu_mla_sparse_fp8.py
       v1/attention/test_xpu_mla_sparse_backend.py'
 
 - label: ":intel: (BMG) XPU mHC Tests"

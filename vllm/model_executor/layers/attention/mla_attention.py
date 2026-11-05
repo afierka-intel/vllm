@@ -368,6 +368,9 @@ def _canonicalize_sparse_mla_kv_cache_dtype(
         if kv_cache_dtype == "nvfp4_ds_mla":
             return kv_cache_dtype
         return "fp8_ds_mla"
+    if backend_name == "XPU_MLA_SPARSE" and is_quantized_kv_cache(kv_cache_dtype):
+        # The XPU sparse MLA backend stores quantized KV as fp8_ds_mla rows.
+        return "fp8_ds_mla"
     if backend_name == "FLASHINFER_MLA_SPARSE_SM120" and kv_cache_dtype in (
         "auto",
         "fp8",

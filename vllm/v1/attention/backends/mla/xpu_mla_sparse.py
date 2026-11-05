@@ -32,6 +32,12 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_convert_req_index_to_global_index,
 )
 from vllm.v1.attention.ops.xpu_mla_sparse import triton_bf16_mla_sparse_interface
+from vllm.v1.attention.ops.xpu_mla_sparse_fp8 import (
+    ROW_BYTES_NOPE,
+    ROW_BYTES_ROPE,
+    ds_mla_fp8_write,
+    fp8_ds_mla_sparse_attention,
+)
 from vllm.v1.kv_cache_interface import AttentionSpec, is_quantized_kv_cache
 
 if TYPE_CHECKING:
@@ -45,6 +51,10 @@ class XPUMLASparseBackend(AttentionBackend):
         "auto",
         "float16",
         "bfloat16",
+        # Quantized dtypes are served via the fp8_ds_mla row format.
+        "fp8",
+        "fp8_e4m3",
+        "fp8_ds_mla",
     ]
 
     @staticmethod
@@ -229,6 +239,39 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata], SharedTopkIndices
         self.softmax_scale = scale
         self.init_topk_indices_buffer(indexer, topk_indices_buffer)
 
+    def get_fp8_ds_mla_row_bytes(self) -> int:
+        # NoPE models need no BF16 RoPE tail: 512 fp8 + 4 fp32 scales.
+        return ROW_BYTES_NOPE if self.rope_dim == 0 else ROW_BYTES_ROPE
+
+    def do_kv_cache_update(
+        self,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        kv_cache_dtype: str,
+        k_scale: torch.Tensor,
+        skip_scale: bool = False,
+    ) -> None:
+        if kv_cache_dtype != "fp8_ds_mla":
+            super().do_kv_cache_update(
+                kv_c_normed,
+                k_pe,
+                kv_cache,
+                slot_mapping,
+                kv_cache_dtype,
+                k_scale,
+                skip_scale,
+            )
+            return
+        # The SYCL concat_and_cache_mla op has no fp8_ds_mla row format.
+        ds_mla_fp8_write(
+            kv_c_normed,
+            k_pe.reshape(k_pe.shape[0], k_pe.shape[-1]),
+            kv_cache,
+            slot_mapping.flatten(),
+        )
+
     def record_logical_topk_ready(self) -> None:
         # Called unconditionally by MLAAttention.forward for sparse layers. This
         # impl shares the top-k buffer via SharedTopkIndicesBuffer but does not
@@ -269,8 +312,13 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata], SharedTopkIndices
         # NOTE(lucas): for the sparse FlashMLA kernels the kernels want to use
         # MQA 576/512 approach for both prefill and decode
 
-        if is_quantized_kv_cache(self.kv_cache_dtype):
-            raise NotImplementedError("FP8 kv is not supported with XPU MLA Sparse yet")
+        if is_quantized_kv_cache(self.kv_cache_dtype) and (
+            self.kv_cache_dtype != "fp8_ds_mla"
+        ):
+            raise NotImplementedError(
+                "XPU MLA Sparse supports quantized KV only as fp8_ds_mla, got "
+                f"{self.kv_cache_dtype}"
+            )
 
         # Concatenate q if it's a tuple (ql_nope, q_pe)
         if isinstance(q, tuple):
@@ -296,6 +344,17 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata], SharedTopkIndices
             NUM_TOPK_TOKENS=num_topk_tokens,
         )
 
-        attn_out = self._forward_bf16_kv(q, kv_rows, topk_indices_global, attn_metadata)
+        if self.kv_cache_dtype == "fp8_ds_mla":
+            attn_out = fp8_ds_mla_sparse_attention(
+                q,
+                kv_rows,
+                topk_indices_global,
+                sm_scale=self.softmax_scale,
+                rope_dim=self.rope_dim,
+            )[:, : self.num_heads, :]
+        else:
+            attn_out = self._forward_bf16_kv(
+                q, kv_rows, topk_indices_global, attn_metadata
+            )
 
         return attn_out, None
