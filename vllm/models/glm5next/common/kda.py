@@ -58,6 +58,11 @@ if current_platform.is_rocm():
         chunk_kda_with_fused_gate,
         fused_recurrent_kda,
     )
+elif current_platform.is_xpu():
+    from vllm.models.glm5next.xpu.ops.third_party.kda import (
+        chunk_kda_with_fused_gate,
+        fused_recurrent_kda,
+    )
 else:
     from vllm.models.glm5next.nvidia.ops.third_party.kda import (
         chunk_kda_with_fused_gate,

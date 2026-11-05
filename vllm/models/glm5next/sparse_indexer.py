@@ -12,6 +12,10 @@ if current_platform.is_rocm():
     from .amd.sparse_indexer import (
         SparseAttnIndexerKpool,
     )
+elif current_platform.is_xpu():
+    from .xpu.sparse_indexer import (  # type: ignore[assignment]
+        SparseAttnIndexerKpool,
+    )
 else:
     from .nvidia.sparse_indexer import (
         SparseAttnIndexerKpool,

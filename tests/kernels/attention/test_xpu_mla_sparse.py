@@ -168,3 +168,48 @@ def test_bf16_triton_sparse_mla_masked_chunks(device_str, dtype):
     # lse/max_logits are large-negative finite rather than the reference's
     # +inf/-inf placeholders, so only the output is compared here.
     assert torch.allclose(out[2], torch.zeros_like(out[2]))
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("topk", [2048, 2176])
+@pytest.mark.skipif(
+    not torch.xpu.is_available(),
+    reason="XPU is required",
+)
+def test_bf16_triton_sparse_mla_nope(dtype, topk):
+    """NoPE latent (GLM-5.3-Flash: qk_rope_head_dim == 0) with block_dpe=0.
+
+    topk=2176 is GLM's top-k buffer width (index_topk 2048 + kpool tail); the
+    tail entries at the end of each row must be attended to as well.
+    """
+    device = torch.device("xpu")
+    s_q = 4
+    s_kv = 4096
+    h_q = 64
+    h_kv = 1
+    d_qk = 512
+    d_v = 512
+
+    torch.random.manual_seed(1234)
+    q = torch.randn((s_q, h_q, d_qk), dtype=dtype, device=device)
+    kv = torch.randn((s_kv, h_kv, d_qk), dtype=dtype, device=device)
+    indices = torch.full((s_q, h_kv, topk), -1, dtype=torch.int32, device=device)
+    for t in range(s_q):
+        # Partially filled main part, plus valid entries in the last columns
+        # (where a kpool tail lands), with -1 holes in between.
+        n_main = 512 * (t + 1)
+        indices[t, 0, :n_main] = torch.randperm(s_kv - 128)[:n_main].to(device)
+        indices[t, 0, topk - 64 :] = torch.arange(
+            s_kv - 64, s_kv, dtype=torch.int32, device=device
+        )
+
+    sm_scale = d_qk**-0.5
+    out, max_logits, lse = triton_bf16_mla_sparse_interface(
+        q, kv, indices, sm_scale, d_v, block_dpe=0
+    )
+    ref_out, _, ref_max_logits, ref_lse = reference_mla_sparse_prefill(
+        q, kv, indices, sm_scale, d_v
+    )
+    torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(max_logits, ref_max_logits, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(lse, ref_lse, atol=1e-3, rtol=1e-3)

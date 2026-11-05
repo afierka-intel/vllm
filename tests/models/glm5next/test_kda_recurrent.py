@@ -15,12 +15,16 @@ from vllm.platforms import current_platform
 
 if current_platform.is_rocm():
     from vllm.models.glm5next.amd.ops.third_party.kda import fused_recurrent_kda
+elif current_platform.is_xpu():
+    from vllm.models.glm5next.xpu.ops.third_party.kda import fused_recurrent_kda
 else:
     from vllm.models.glm5next.nvidia.ops.third_party.kda import fused_recurrent_kda
 
 pytestmark = pytest.mark.skipif(
-    not current_platform.is_cuda_alike(), reason="Requires CUDA or ROCm"
+    not (current_platform.is_cuda_alike() or current_platform.is_xpu()),
+    reason="Requires CUDA, ROCm or XPU",
 )
+DEVICE = current_platform.device_type
 
 H, D = 16, 128
 LOWER_BOUND = -5.0
@@ -111,7 +115,7 @@ def run_kernel(inputs: dict, state: torch.Tensor) -> torch.Tensor:
 @torch.inference_mode()
 def test_fused_recurrent_kda_matches_reference(num_seqs: int, query_len: int):
     torch.manual_seed(0)
-    device = torch.device("cuda")
+    device = torch.device(DEVICE)
     inputs, state = make_inputs(num_seqs, query_len, device)
     expected_state = state.clone()
     out = run_kernel(inputs, state)
@@ -149,7 +153,7 @@ def test_fused_recurrent_kda_strided_inputs_bit_identical_to_contiguous(
     num_seqs: int, query_len: int
 ):
     torch.manual_seed(0)
-    device = torch.device("cuda")
+    device = torch.device(DEVICE)
     inputs, state = make_inputs(num_seqs, query_len, device)
     for name in ("q", "k", "v", "beta"):
         assert not inputs[name].is_contiguous()
@@ -165,8 +169,8 @@ def test_fused_recurrent_kda_strided_inputs_bit_identical_to_contiguous(
 
 
 @pytest.mark.skipif(
-    not current_platform.is_cuda_alike(),
-    reason="Both implementations require zero-copy token-strided layouts",
+    not (current_platform.is_cuda_alike() or current_platform.is_xpu()),
+    reason="All implementations require zero-copy token-strided layouts",
 )
 @torch.inference_mode()
 def test_fused_recurrent_kda_rejects_unaddressable_layouts():
@@ -176,7 +180,7 @@ def test_fused_recurrent_kda_rejects_unaddressable_layouts():
     (transposed) block.
     """
     torch.manual_seed(0)
-    device = torch.device("cuda")
+    device = torch.device(DEVICE)
     inputs, state = make_inputs(1, 1, device)
     T = 4
     base = torch.randn(4, T, 2 * H * D, dtype=torch.bfloat16, device=device)
@@ -195,7 +199,8 @@ def test_fused_recurrent_kda_rejects_unaddressable_layouts():
 
 
 @pytest.mark.skipif(
-    not current_platform.is_cuda(), reason="The large-grid fix is NVIDIA-only"
+    not (current_platform.is_cuda() or current_platform.is_xpu()),
+    reason="The large-grid fix is in the NVIDIA kernel and its XPU copy",
 )
 @pytest.mark.parametrize("num_seqs,num_heads", [(1024, 64), (2048, 48)])
 def test_fused_recurrent_kda_more_than_65535_programs(num_seqs: int, num_heads: int):
@@ -212,7 +217,7 @@ def test_fused_recurrent_kda_more_than_65535_programs(num_seqs: int, num_heads: 
     the same batch run in two halves.
     """
     torch.manual_seed(0)
-    dev = torch.device("cuda")
+    dev = torch.device(DEVICE)
     head_dim = 16
     pool = num_seqs + 8
     q = torch.randn(1, num_seqs, num_heads, head_dim, device=dev, dtype=torch.bfloat16)

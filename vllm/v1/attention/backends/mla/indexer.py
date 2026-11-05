@@ -256,7 +256,9 @@ class Glm5NextIndexerBackend(DeepseekV32IndexerBackend):
             # Platform block-size selection: no spec yet, under the current config.
             model_config = get_current_vllm_config().model_config
             index_kpool = model_config.hf_text_config.index_kpool
-        return [index_kpool * n for n in get_paged_mqa_page_sizes()]
+        # The XPU paged MQA-logits kernel only takes 64-entry pages.
+        page_sizes = (64,) if current_platform.is_xpu() else get_paged_mqa_page_sizes()
+        return [index_kpool * n for n in page_sizes]
 
 
 class KpoolTailBackend(DeepseekV32IndexerBackend):

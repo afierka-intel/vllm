@@ -353,6 +353,11 @@ class Glm5NextMoE(nn.Module):
     ) -> None:
         """DeepGEMM FP8xFP8 MegaMoE: the kernel dispatches, runs the routed and
         shared experts and combines across the EP group."""
+        if current_platform.is_xpu():
+            raise NotImplementedError(
+                "GLM-5.3 MegaMoE needs DeepGEMM (CUDA); pick another moe backend "
+                "on XPU."
+            )
         from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe import (
             MegaMoEActivation,
         )
