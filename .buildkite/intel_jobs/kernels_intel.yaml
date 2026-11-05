@@ -65,7 +65,9 @@ steps:
     VLLM_TEST_DEVICE: "xpu"
   source_file_dependencies:
     - vllm/v1/attention/backends/mla/xpu_mla_sparse.py
+    - vllm/models/glm5next/nvidia/sparse_indexer.py
     - tests/kernels/attention/test_xpu_mla_sparse.py
+    - tests/kernels/attention/test_xpu_indexer_mqa_logits.py
     - tests/v1/attention/test_xpu_mla_sparse_backend.py
   commands:
     - >-
@@ -73,4 +75,5 @@ steps:
       'cd tests &&
       pytest -v -s
       kernels/attention/test_xpu_mla_sparse.py
+      kernels/attention/test_xpu_indexer_mqa_logits.py
       v1/attention/test_xpu_mla_sparse_backend.py'

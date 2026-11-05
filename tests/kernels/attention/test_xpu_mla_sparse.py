@@ -168,3 +168,48 @@ def test_bf16_triton_sparse_mla_masked_chunks(device_str, dtype):
     # lse/max_logits are large-negative finite rather than the reference's
     # +inf/-inf placeholders, so only the output is compared here.
     assert torch.allclose(out[2], torch.zeros_like(out[2]))
+
+
+@pytest.mark.parametrize("device_str", ["xpu"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.skipif(
+    not torch.xpu.is_available(),
+    reason="XPU is required",
+)
+def test_bf16_triton_sparse_mla_latent_only(device_str, dtype):
+    """GLM-5.3-Flash layout: 512-dim latent with no RoPE split
+    (``block_dpe=0``) and a top-k width of ``round_up(2048 + 4 - 1, 128)``
+    (the kpool indexer appends the incomplete trailing pool)."""
+    device = torch.device(device_str)
+    s_q = 4
+    s_kv = 4096
+    h_q = 64
+    h_kv = 1
+    d_qk = 512
+    d_v = 512
+    topk = 2176
+
+    torch.random.manual_seed(1234)
+
+    q = torch.randn((s_q, h_q, d_qk), dtype=dtype, device=device)
+    kv = torch.randn((s_kv, h_kv, d_qk), dtype=dtype, device=device)
+    indices = torch.full((s_q, h_kv, topk), -1, dtype=torch.int32, device=device)
+    # Row t keeps a different number of valid keys, the rest is -1 padding.
+    for t, n_valid in enumerate((1, 700, 2051, topk)):
+        indices[t, 0, :n_valid] = torch.randperm(s_kv, device=device)[:n_valid].to(
+            torch.int32
+        )
+
+    sm_scale = d_qk**-0.5
+
+    out, max_logits, lse = triton_bf16_mla_sparse_interface(
+        q, kv, indices, sm_scale, d_v, block_dpe=0
+    )
+    assert out.shape == (s_q, h_q, d_v)
+
+    ref_out, _, ref_max_logits, ref_lse = reference_mla_sparse_prefill(
+        q, kv, indices, sm_scale, d_v
+    )
+    assert torch.allclose(out, ref_out, atol=1e-2, rtol=1e-2)
+    assert torch.allclose(max_logits, ref_max_logits, atol=1e-3, rtol=1e-3)
+    assert torch.allclose(lse, ref_lse, atol=1e-3, rtol=1e-3)

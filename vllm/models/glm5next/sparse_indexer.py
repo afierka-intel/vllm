@@ -4,6 +4,8 @@
 
 The implementation lives under ``nvidia/`` and ``amd/`` (with shared helpers
 in ``common/``); this module picks the right one for the current platform.
+XPU uses the ``nvidia/`` implementation, which swaps the DeepGEMM MQA-logits
+calls for the XPU ``fp8_mqa_logits`` / ``fp8_paged_mqa_logits`` ops.
 """
 
 from vllm.platforms import current_platform

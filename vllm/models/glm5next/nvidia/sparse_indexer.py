@@ -55,7 +55,7 @@ from vllm.v1.attention.backends.mla.indexer import (
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.worker.workspace import current_workspace_manager
 
-if current_platform.is_cuda_alike():
+if current_platform.is_cuda_alike() or current_platform.is_xpu():
     from vllm import _custom_ops as ops
 
 logger = init_logger(__name__)
@@ -419,32 +419,55 @@ def sparse_attn_indexer_kpool(
                 # One pass also for 0 rows: the merge is collective.
                 for sub in range(0, max(1, num_rows), dense_rows):
                     rows = slice(sub, min(sub + dense_rows, num_rows))
-                    q_scale_rows, chunk_weights = mqa_logits_mx_inputs(
-                        q_slice_cast[rows],
-                        q_scale_slice[rows] if q_scale_slice is not None else None,
-                        prefill_weights[row_start + rows.start : row_start + rows.stop],
-                        logits_dtype,
-                    )
-                    # Compressed: row i starts at K position cu_seqlen_ks[i].
-                    row_ends = cu_seqlen_ke[rows] - cu_seqlen_ks[rows]
-                    logits = as_fp32_logits(
-                        fp8_fp4_mqa_logits(
-                            (q_slice_cast[rows], q_scale_rows),
-                            (k_quant_cast, k_scale_cast),
-                            chunk_weights,
+                    row_weights = prefill_weights[
+                        row_start + rows.start : row_start + rows.stop
+                    ]
+                    if current_platform.is_xpu():
+                        if q_scale_slice is not None:
+                            raise RuntimeError(
+                                "XPU fp8_mqa_logits does not support FP4 Q"
+                            )
+                        # Uncompressed FP32 logits: row i spans K positions
+                        # [cu_seqlen_ks[i], cu_seqlen_ke[i]).
+                        logits = torch.ops.vllm.xpu_fp8_mqa_logits(
+                            q_slice_cast[rows],
+                            k_quant_cast,
+                            k_scale_cast,
+                            row_weights,
                             cu_seqlen_ks[rows],
                             cu_seqlen_ke[rows],
-                            chunk.max_seqlen_k,
-                            logits_dtype=logits_dtype,
-                        ),
-                        row_ends,
-                    )
+                        )
+                        row_starts = cu_seqlen_ks[rows]
+                        row_ends = cu_seqlen_ke[rows]
+                    else:
+                        q_scale_rows, chunk_weights = mqa_logits_mx_inputs(
+                            q_slice_cast[rows],
+                            q_scale_slice[rows] if q_scale_slice is not None else None,
+                            row_weights,
+                            logits_dtype,
+                        )
+                        # Compressed: row i starts at K position cu_seqlen_ks[i].
+                        row_ends = cu_seqlen_ke[rows] - cu_seqlen_ks[rows]
+                        row_starts = torch.zeros_like(row_ends)
+                        logits = as_fp32_logits(
+                            fp8_fp4_mqa_logits(
+                                (q_slice_cast[rows], q_scale_rows),
+                                (k_quant_cast, k_scale_cast),
+                                chunk_weights,
+                                cu_seqlen_ks[rows],
+                                cu_seqlen_ke[rows],
+                                chunk.max_seqlen_k,
+                                logits_dtype=logits_dtype,
+                            ),
+                            row_ends,
+                        )
                     if logits.shape[1] == 0:
                         topk_dst[rows].fill_(-1)
                     else:
+                        # Indices come back relative to each row's start.
                         torch.ops._C.top_k_per_row_prefill(
                             logits,
-                            torch.zeros_like(row_ends),
+                            row_starts,
                             row_ends,
                             topk_dst[rows],
                             logits.shape[0],
@@ -658,27 +681,41 @@ def sparse_attn_indexer_kpool(
             if use_fp4_cache
             else padded_q_quant_decode_tokens
         )
-        padded_q_scale, decode_weights = mqa_logits_mx_inputs(
-            padded_q_quant_cast,
-            padded_q_scale,
-            padded_weights[:num_padded_tokens],
-            logits_dtype,
-        )
-        # SM100 decode is varlen: one row and context length per token.
-        logits = as_fp32_logits(
-            fp8_fp4_paged_mqa_logits(
-                (padded_q_quant_cast, padded_q_scale),
+        if current_platform.is_xpu():
+            if padded_q_scale is not None:
+                raise RuntimeError("XPU fp8_paged_mqa_logits does not support FP4 Q")
+            # The XPU kernel takes one (pool-granular) context length per request.
+            logits = torch.ops.vllm.xpu_fp8_paged_mqa_logits(
+                padded_q_quant_cast,
                 kv_cache,
-                decode_weights,
-                seq_lens,
+                padded_weights[:num_padded_tokens],
+                seq_lens[:, -1].contiguous() if seq_lens.ndim == 2 else seq_lens,
                 decode_metadata.block_table,
                 decode_metadata.schedule_metadata,
-                max_model_len=max_pool_len,
-                logits_dtype=logits_dtype,
-                indices=decode_metadata.indices,
-            ),
-            seq_lens.view(-1),
-        )
+                max_pool_len,
+            )
+        else:
+            padded_q_scale, decode_weights = mqa_logits_mx_inputs(
+                padded_q_quant_cast,
+                padded_q_scale,
+                padded_weights[:num_padded_tokens],
+                logits_dtype,
+            )
+            # SM100 decode is varlen: one row and context length per token.
+            logits = as_fp32_logits(
+                fp8_fp4_paged_mqa_logits(
+                    (padded_q_quant_cast, padded_q_scale),
+                    kv_cache,
+                    decode_weights,
+                    seq_lens,
+                    decode_metadata.block_table,
+                    decode_metadata.schedule_metadata,
+                    max_model_len=max_pool_len,
+                    logits_dtype=logits_dtype,
+                    indices=decode_metadata.indices,
+                ),
+                seq_lens.view(-1),
+            )
         num_rows = logits.shape[0]
         # kpool: logits are pool-granular -> select topk_tokens//kpool pools,
         # then expand each pool back to its kpool tokens.
@@ -812,6 +849,10 @@ class SparseAttnIndexerKpool(CustomOp):
             if _parallel.prefill_context_parallel_size > 1:
                 raise NotImplementedError(
                     "SparseAttnIndexerKpool does not support PCP+DCP."
+                )
+            if current_platform.is_xpu():
+                raise NotImplementedError(
+                    "SparseAttnIndexerKpool does not support DCP on XPU."
                 )
             self.dcp_world_size = _parallel.decode_context_parallel_size
             self.dcp_rank = get_dcp_group().rank_in_group
