@@ -19,10 +19,14 @@ from vllm.third_party.flash_linear_attention.ops.chunk_delta_h import (
 from vllm.third_party.flash_linear_attention.ops.cumsum import chunk_local_cumsum
 from vllm.third_party.flash_linear_attention.ops.index import prepare_chunk_indices
 from vllm.third_party.flash_linear_attention.ops.l2norm import l2norm_fwd
-from vllm.third_party.flash_linear_attention.ops.op import exp2, log
+from vllm.third_party.flash_linear_attention.ops.op import (
+    exp2,
+    log,
+    make_tensor_descriptor,
+)
 from vllm.third_party.flash_linear_attention.ops.solve_tril import solve_tril
 from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE, is_amd
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, triton, use_tensor_descriptor
 from vllm.utils.math_utils import RCP_LN2, cdiv, next_power_of_2
 
 from .fused_recurrent import (
@@ -31,6 +35,19 @@ from .fused_recurrent import (
 )
 
 BT_LIST_AUTOTUNE = [32, 64, 128]
+
+
+def _td_ok(*tensors: torch.Tensor) -> bool:
+    """Tensor descriptors (XPU 2D block IO) need contiguous tensors with
+    16-byte aligned base pointers and rows; otherwise use pointer loads."""
+    return all(
+        t.is_contiguous()
+        and t.data_ptr() % 16 == 0
+        and (t.shape[-1] * t.element_size()) % 16 == 0
+        for t in tensors
+    )
+
+
 NUM_WARPS_AUTOTUNE = [2, 4, 8, 16] if is_amd else [4, 8, 16, 32]
 
 
@@ -230,6 +247,7 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
     BK: tl.constexpr,
     NC: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     i_t, i_c, i_bh = tl.program_id(0).to(tl.int64), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
@@ -267,31 +285,47 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
 
     b_A = tl.zeros([BC, BC], dtype=tl.float32)
     b_Aqk = tl.zeros([BC, BC], dtype=tl.float32)
+    if USE_TD:
+        r_i = (i_t * BT + i_i * BC).to(tl.int32)
+        r_j = (i_t * BT + i_j * BC).to(tl.int32)
+        d_q = make_tensor_descriptor(q, [T, K], [H * K, 1], [BC, BK])
+        d_k = make_tensor_descriptor(k, [T, K], [H * K, 1], [BC, BK])
+        d_g = make_tensor_descriptor(g, [T, K], [H * K, 1], [BC, BK])
     for i_k in range(tl.cdiv(K, BK)):
         o_k = i_k * BK + tl.arange(0, BK)
         m_k = o_k < K
         m_qk = m_i[:, None] & m_k[None, :]
         m_kj = m_k[:, None] & m_j[None, :]
 
-        p_q = q + o_i[:, None] * (H * K) + o_k[None, :]
-        p_k = k + o_i[:, None] * (H * K) + o_k[None, :]
-        p_g = g + o_i[:, None] * (H * K) + o_k[None, :]
-        b_kt = k + o_k[:, None] + o_j[None, :] * (H * K)
-        p_gk = g + o_k[:, None] + o_j[None, :] * (H * K)
-
         # [BK,]
         b_gn = tl.load(g + (i_t * BT + i_i * BC) * H * K + o_k, mask=m_k, other=0)
-        # [BC, BK]
-        b_g = tl.load(p_g, mask=m_qk, other=0.0)
-        b_k = tl.load(p_k, mask=m_qk, other=0.0) * exp2(b_g - b_gn[None, :])
-        # [BK, BC]
-        b_gk = tl.load(p_gk, mask=m_kj, other=0.0)
-        b_kt = tl.load(b_kt, mask=m_kj, other=0.0)
+        if USE_TD:
+            # [BC, BK]
+            b_g = d_g.load([r_i, i_k * BK])
+            b_k = d_k.load([r_i, i_k * BK]) * exp2(b_g - b_gn[None, :])
+            # [BK, BC]: rows j, transposed
+            b_gk = tl.trans(d_g.load([r_j, i_k * BK]))
+            b_kt = tl.trans(d_k.load([r_j, i_k * BK]))
+        else:
+            p_k = k + o_i[:, None] * (H * K) + o_k[None, :]
+            p_g = g + o_i[:, None] * (H * K) + o_k[None, :]
+            p_kt = k + o_k[:, None] + o_j[None, :] * (H * K)
+            p_gk = g + o_k[:, None] + o_j[None, :] * (H * K)
+            # [BC, BK]
+            b_g = tl.load(p_g, mask=m_qk, other=0.0)
+            b_k = tl.load(p_k, mask=m_qk, other=0.0) * exp2(b_g - b_gn[None, :])
+            # [BK, BC]
+            b_gk = tl.load(p_gk, mask=m_kj, other=0.0)
+            b_kt = tl.load(p_kt, mask=m_kj, other=0.0)
         # [BC, BC]
         b_ktg = b_kt * exp2(b_gn[:, None] - b_gk)
         b_A += tl.dot(b_k, b_ktg)
 
-        b_q = tl.load(p_q, mask=m_qk, other=0.0)
+        if USE_TD:
+            b_q = d_q.load([r_i, i_k * BK])
+        else:
+            p_q = q + o_i[:, None] * (H * K) + o_k[None, :]
+            b_q = tl.load(p_q, mask=m_qk, other=0.0)
         b_qg = b_q * exp2(b_g - b_gn[None, :]) * scale
         b_Aqk += tl.dot(b_qg, b_ktg)
 
@@ -449,6 +483,7 @@ def chunk_kda_scaled_dot_kkt_fwd(
         BT=BT,
         BC=BC,
         NC=NC,
+        USE_TD=use_tensor_descriptor() and _td_ok(q, k, gk),
     )
 
     grid = (NT, NC, B * H)
@@ -657,6 +692,7 @@ def chunk_gla_fwd_kernel_o(
     BK: tl.constexpr,
     BV: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1).to(tl.int64), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
@@ -687,36 +723,63 @@ def chunk_gla_fwd_kernel_o(
     m_v = o_v < V
     m_tv = m_t[:, None] & m_v[None, :]
     m_A = m_t[:, None] & (o_i[None, :] < BT)
+    if USE_TD:
+        row0 = (i_t * BT).to(tl.int32)
+        d_q = make_tensor_descriptor(
+            q + (bos * H + i_h) * K, [T, K], [H * K, 1], [BT, BK]
+        )
+        d_g = make_tensor_descriptor(
+            g + (bos * H + i_h) * K, [T, K], [H * K, 1], [BT, BK]
+        )
+        d_h = make_tensor_descriptor(
+            h + (i_tg * H + i_h) * K * V, [V, K], [K, 1], [BV, BK]
+        )
     for i_k in range(tl.cdiv(K, BK)):
         o_k = i_k * BK + tl.arange(0, BK)
         m_k = o_k < K
-        m_qk = m_t[:, None] & m_k[None, :]
-        m_h = m_v[:, None] & m_k[None, :]
-        p_q = q + (bos * H + i_h) * K + o_t[:, None] * (H * K) + o_k[None, :]
-        p_g = g + (bos * H + i_h) * K + o_t[:, None] * (H * K) + o_k[None, :]
-        p_h = h + (i_tg * H + i_h) * K * V + o_v[:, None] * K + o_k[None, :]
-
-        # [BT, BK]
-        b_q = tl.load(p_q, mask=m_qk, other=0.0)
+        if USE_TD:
+            b_q = d_q.load([row0, i_k * BK])
+            b_g = d_g.load([row0, i_k * BK])
+            b_h = d_h.load([i_v * BV, i_k * BK])
+        else:
+            m_qk = m_t[:, None] & m_k[None, :]
+            m_h = m_v[:, None] & m_k[None, :]
+            p_q = q + (bos * H + i_h) * K + o_t[:, None] * (H * K) + o_k[None, :]
+            p_g = g + (bos * H + i_h) * K + o_t[:, None] * (H * K) + o_k[None, :]
+            p_h = h + (i_tg * H + i_h) * K * V + o_v[:, None] * K + o_k[None, :]
+            # [BT, BK]
+            b_q = tl.load(p_q, mask=m_qk, other=0.0)
+            # [BT, BK]
+            b_g = tl.load(p_g, mask=m_qk, other=0.0)
+            # [BV, BK]
+            b_h = tl.load(p_h, mask=m_h, other=0.0)
         b_q = (b_q * scale).to(b_q.dtype)
         # [BT, BK]
-        b_g = tl.load(p_g, mask=m_qk, other=0.0)
-        # [BT, BK]
         b_qg = (b_q * exp2(b_g)).to(b_q.dtype)
-        # [BV, BK]
-        b_h = tl.load(p_h, mask=m_h, other=0.0)
         # [BT, BV]
         if i_k >= 0:
             b_o += tl.dot(b_qg, tl.trans(b_h).to(b_qg.dtype))
-    p_v = v + (bos * H + i_h) * V + o_t[:, None] * (H * V) + o_v[None, :]
-    p_o = o + (bos * H + i_h) * V + o_t[:, None] * (H * V) + o_v[None, :]
-    p_A = A + (bos * H + i_h) * BT + o_t[:, None] * (H * BT) + o_i[None, :]
-    # [BT, BV]
-    b_v = tl.load(p_v, mask=m_tv, other=0.0)
-    # [BT, BT]
-    b_A = tl.load(p_A, mask=m_A, other=0.0)
+    if USE_TD:
+        d_v = make_tensor_descriptor(
+            v + (bos * H + i_h) * V, [T, V], [H * V, 1], [BT, BV]
+        )
+        d_A = make_tensor_descriptor(
+            A + (bos * H + i_h) * BT, [T, BT], [H * BT, 1], [BT, BT]
+        )
+        # [BT, BV]
+        b_v = d_v.load([row0, i_v * BV])
+        # [BT, BT]
+        b_A = d_A.load([row0, 0])
+    else:
+        p_v = v + (bos * H + i_h) * V + o_t[:, None] * (H * V) + o_v[None, :]
+        p_A = A + (bos * H + i_h) * BT + o_t[:, None] * (H * BT) + o_i[None, :]
+        # [BT, BV]
+        b_v = tl.load(p_v, mask=m_tv, other=0.0)
+        # [BT, BT]
+        b_A = tl.load(p_A, mask=m_A, other=0.0)
     b_A = tl.where(m_s, b_A, 0.0).to(b_v.dtype)
     b_o += tl.dot(b_A, b_v, allow_tf32=False)
+    p_o = o + (bos * H + i_h) * V + o_t[:, None] * (H * V) + o_v[None, :]
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=m_tv)
 
 
@@ -757,6 +820,7 @@ def chunk_gla_fwd_o_gk(
         K=K,
         V=V,
         BT=BT,
+        USE_TD=use_tensor_descriptor() and _td_ok(q, v, g, A, h),
     )
     return o
 

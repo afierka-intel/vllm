@@ -195,3 +195,50 @@ def test_xpu_paged_logits_per_row_context(next_n):
         k_fp8, k_scale = _quantize_rows(k_all[b][:n])
         ref = _ref_logits(q_fp8[r], k_fp8, k_scale, weights[r : r + 1])[0]
         torch.testing.assert_close(logits[r, :n], ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("seqs", [[300], [1000, 77, 513]])
+def test_kda_chunk_prefill_td_matches_pointer_path(seqs, monkeypatch):
+    """The tensor-descriptor (2D block IO) loads in the XPU KDA chunk kernels
+    must give the same result as the pointer loads, including partial chunks
+    at the end of each sequence."""
+    import vllm.models.glm5next.xpu.ops.third_party.kda.kernels as kda_k
+
+    torch.manual_seed(0)
+    h, d, t = 8, 128, sum(seqs)
+
+    def r(*shape, dtype=torch.bfloat16, s=1.0):
+        return (torch.randn(*shape, device=DEVICE) * s).to(dtype)
+
+    x = dict(
+        q=r(1, t, h, d),
+        k=r(1, t, h, d),
+        v=r(1, t, h, d),
+        raw_g=r(1, t, h, d, s=0.5),
+        beta=torch.sigmoid(r(1, t, h, dtype=torch.float32)),
+        A_log=r(h, dtype=torch.float32, s=0.1),
+        g_bias=r(h * d, dtype=torch.float32, s=0.1),
+        initial_state=r(len(seqs), h, d, d, dtype=torch.float32, s=0.01),
+        cu_seqlens=torch.tensor(
+            [0, *torch.tensor(seqs).cumsum(0).tolist()],
+            device=DEVICE,
+            dtype=torch.int32,
+        ),
+    )
+
+    outs = []
+    for td in (False, True):
+        monkeypatch.setattr(kda_k, "use_tensor_descriptor", lambda td=td: td)
+        # Fresh inputs per run: the chunk path may update states in place.
+        outs.append(
+            kda_k.chunk_kda_with_fused_gate(
+                **{name: t.clone() for name, t in x.items()},
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+                safe_gate=True,
+                lower_bound=-5.0,
+            )
+        )
+    (o0, s0), (o1, s1) = outs
+    torch.testing.assert_close(o1, o0, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(s1, s0, atol=2e-2, rtol=2e-2)
