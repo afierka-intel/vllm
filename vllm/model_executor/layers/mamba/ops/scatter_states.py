@@ -81,7 +81,7 @@ def scatter_states(
     is the read-side counterpart.
     """
     assert state.ndim >= 2
-    assert state.is_cuda
+    assert state.is_cuda or state.is_xpu
     assert src.ndim == state.ndim
     assert indices.ndim == 1
     assert indices.device == state.device
