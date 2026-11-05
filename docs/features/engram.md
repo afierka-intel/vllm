@@ -174,7 +174,9 @@ IPC namespace across the co-located replicas.
 
 ## Limitations
 
-- CUDA-alike platforms only.
+- CUDA-alike platforms only. The exception is Qwen4Exp on Intel XPU: there
+  the PLE table always stays in device memory, `cpu_offload` is ignored with a
+  warning, and `disk_offload` is rejected.
 - DeepSeek V4.1 Engram does not support DBO or microbatching; disable
   `--enable-dbo` and set `--ubatch-size 0`.
 - `dp_shared_memory` requires `cpu_offload`, `data_parallel_size > 1`, and is
