@@ -261,7 +261,7 @@ class MHCPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return torch.ops._xpu_C.mhc_pre(
+        post_mix, comb_mix, layer_input = torch.ops._xpu_C.mhc_pre(
             residual,
             fn,
             hc_scale,
@@ -271,6 +271,13 @@ class MHCPreOp(CustomOp):
             hc_sinkhorn_eps,
             hc_post_mult_value,
             sinkhorn_repeat,
+        )
+        # The SYCL op has no fused-norm argument: apply the layer's RMSNorm
+        # here, as the CUDA/ROCm fallbacks do.
+        return (
+            post_mix,
+            comb_mix,
+            _apply_mhc_norm(layer_input, norm_weight, norm_eps),
         )
 
     def forward_cpu(
@@ -958,19 +965,29 @@ class MHCFusedPostPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        return torch.ops._xpu_C.mhc_fused_post_pre(
-            x,
-            residual,
-            post_layer_mix,
-            comb_res_mix,
-            fn,
-            hc_scale,
-            hc_base,
-            rms_eps,
-            hc_pre_eps,
-            hc_sinkhorn_eps,
-            hc_post_mult_value,
-            sinkhorn_repeat,
+        residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur = (
+            torch.ops._xpu_C.mhc_fused_post_pre(
+                x,
+                residual,
+                post_layer_mix,
+                comb_res_mix,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+            )
+        )
+        # The SYCL op has no fused-norm argument: apply the layer's RMSNorm
+        # here, as the CUDA/ROCm fallbacks do.
+        return (
+            residual_cur,
+            post_mix_cur,
+            comb_mix_cur,
+            _apply_mhc_norm(layer_input_cur, norm_weight, norm_eps),
         )
 
     def forward_cpu(
