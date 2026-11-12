@@ -176,6 +176,18 @@ class XPUPlatform(Platform):
 
         dtype = attn_selector_config.dtype
         if attn_selector_config.use_sparse:
+            from vllm.v1.attention.backends.mla.xpu_mla_sparse import (
+                XPUMLASparseBackend,
+            )
+
+            # Reject an unsupported KV cache dtype at backend selection instead
+            # of raising in the first forward pass (profile run).
+            if not XPUMLASparseBackend.supports_kv_cache_dtype(kv_cache_dtype):
+                raise ValueError(
+                    f"XPU MLA Sparse backend does not support kv_cache_dtype="
+                    f"{kv_cache_dtype!r}; supported: "
+                    f"{XPUMLASparseBackend.supported_kv_cache_dtypes}"
+                )
             logger.info_once("Using XPU MLA Sparse backend.")
             return AttentionBackendEnum.XPU_MLA_SPARSE.get_path()
         if attn_selector_config.use_mla:
