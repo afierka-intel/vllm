@@ -317,6 +317,49 @@ def test_top_k_per_row(
     ), "CUDA top_k_per_row_prefill results don't match torch.topk"
 
 
+@pytest.mark.parametrize("contiguous", [True, False])
+@pytest.mark.parametrize("top_k", [64, 512])
+@pytest.mark.skipif(
+    not (current_platform.is_cuda_alike() or current_platform.is_xpu()),
+    reason="This test requires CUDA, ROCm or XPU",
+)
+@torch.inference_mode()
+def test_top_k_per_row_prefill_row_starts(contiguous: bool, top_k: int) -> None:
+    """Rows whose window [row_start, row_end) starts past column 0 (several
+    requests sharing one logits buffer, as the sparse indexers pass them):
+    indices must be relative to row_start on every platform, for contiguous
+    and strided logits and for rows shorter than top_k."""
+    device = current_platform.device_type
+    set_random_seed(0)
+    width = 3000
+    row_starts = torch.tensor([0, 700, 700, 2900, 1200], dtype=torch.int32)
+    row_ends = torch.tensor([600, 2700, 760, 3000, 2900], dtype=torch.int32)
+    num_rows = row_starts.numel()
+    if contiguous:
+        logits = torch.randn(num_rows, width, device=device)
+    else:
+        logits = torch.randn(num_rows, 2 * width, device=device)[:, ::2]
+    assert logits.stride(1) == (1 if contiguous else 2)
+    indices = torch.full((num_rows, top_k), -2, dtype=torch.int32, device=device)
+    torch.ops._C.top_k_per_row_prefill(
+        logits,
+        row_starts.to(device),
+        row_ends.to(device),
+        indices,
+        num_rows,
+        logits.stride(0),
+        logits.stride(1),
+        top_k,
+    )
+    for r in range(num_rows):
+        s, e = int(row_starts[r]), int(row_ends[r])
+        k = min(top_k, e - s)
+        expected = set(logits[r, s:e].topk(k).indices.tolist())
+        got = indices[r].tolist()
+        assert set(got[:k]) == expected, f"row {r}"
+        assert all(i == -1 for i in got[k:]), f"row {r}"
+
+
 def _run_top_k_per_row_decode_test(
     top_k: int,
     batch_size: int,

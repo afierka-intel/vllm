@@ -29,9 +29,6 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.models.glm5next.common.ops.fused_eh_norm import fused_eh_norm
-from vllm.models.glm5next.nvidia.specialized_decode.runtime import (
-    specialized_decode_config,
-)
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
@@ -46,6 +43,7 @@ from .model import (
     get_sparse_topk_buffer_width,
     get_spec_layer_idx_from_weight_name,
 )
+from .specialized_decode import specialized_decode_config
 
 if typing.TYPE_CHECKING:
     from ..nvidia.specialized_decode.runtime.draft import SpecializedDraft

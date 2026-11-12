@@ -19,7 +19,8 @@ else:
     from vllm.models.glm5next.common.ops.third_party.kda import fused_recurrent_kda
 
 pytestmark = pytest.mark.skipif(
-    not current_platform.is_cuda_alike(), reason="Requires CUDA or ROCm"
+    not (current_platform.is_cuda_alike() or current_platform.is_xpu()),
+    reason="Requires CUDA, ROCm or XPU",
 )
 
 H, D = 16, 128
@@ -111,7 +112,7 @@ def run_kernel(inputs: dict, state: torch.Tensor) -> torch.Tensor:
 @torch.inference_mode()
 def test_fused_recurrent_kda_matches_reference(num_seqs: int, query_len: int):
     torch.manual_seed(0)
-    device = torch.device("cuda")
+    device = torch.device(current_platform.device_type)
     inputs, state = make_inputs(num_seqs, query_len, device)
     expected_state = state.clone()
     out = run_kernel(inputs, state)
@@ -149,7 +150,7 @@ def test_fused_recurrent_kda_strided_inputs_bit_identical_to_contiguous(
     num_seqs: int, query_len: int
 ):
     torch.manual_seed(0)
-    device = torch.device("cuda")
+    device = torch.device(current_platform.device_type)
     inputs, state = make_inputs(num_seqs, query_len, device)
     for name in ("q", "k", "v", "beta"):
         assert not inputs[name].is_contiguous()
@@ -165,7 +166,7 @@ def test_fused_recurrent_kda_strided_inputs_bit_identical_to_contiguous(
 
 
 @pytest.mark.skipif(
-    not current_platform.is_cuda_alike(),
+    not (current_platform.is_cuda_alike() or current_platform.is_xpu()),
     reason="Both implementations require zero-copy token-strided layouts",
 )
 @torch.inference_mode()
@@ -176,7 +177,7 @@ def test_fused_recurrent_kda_rejects_unaddressable_layouts():
     (transposed) block.
     """
     torch.manual_seed(0)
-    device = torch.device("cuda")
+    device = torch.device(current_platform.device_type)
     inputs, state = make_inputs(1, 1, device)
     T = 4
     base = torch.randn(4, T, 2 * H * D, dtype=torch.bfloat16, device=device)
@@ -212,7 +213,7 @@ def test_fused_recurrent_kda_more_than_65535_programs(num_seqs: int, num_heads: 
     the same batch run in two halves.
     """
     torch.manual_seed(0)
-    dev = torch.device("cuda")
+    dev = torch.device(current_platform.device_type)
     head_dim = 16
     pool = num_seqs + 8
     q = torch.randn(1, num_seqs, num_heads, head_dim, device=dev, dtype=torch.bfloat16)
@@ -289,7 +290,7 @@ def test_prefill_checkpoint_resumes_suffix(monkeypatch, dim_first, num_spec, off
     import vllm._flashkda_C  # noqa: F401
 
     torch.manual_seed(42)
-    device = torch.device("cuda")
+    device = torch.device(current_platform.device_type)
     length, heads = 273, 2
     width, state_len = 3 * heads * D, 3 + num_spec
     layer = object.__new__(kda.Glm5NextLinearAttention)

@@ -104,7 +104,6 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import round_up
 
-from ..nvidia.specialized_decode.runtime import specialized_decode_config
 from .attention import Glm5NextMLAAttention
 from .kda import Glm5NextLinearAttention
 from .multimodal import (
@@ -112,6 +111,7 @@ from .multimodal import (
     Glm5NextProcessingInfo,
     Glm5NextVisionTransformer,
 )
+from .specialized_decode import specialized_decode_config
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.model_states.interface import ModelState
@@ -371,6 +371,11 @@ class Glm5NextMoE(nn.Module):
         """DeepGEMM MegaMoE, BF16xBF16 for an unquantized checkpoint and
         FP8xFP8 for a block-FP8 one: the kernel dispatches, runs the routed and
         shared experts and combines across the EP group."""
+        if current_platform.is_xpu():
+            raise NotImplementedError(
+                "GLM-5.3 MegaMoE needs DeepGEMM (CUDA); choose another "
+                "moe_backend on XPU."
+            )
         from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe import (
             MegaMoEActivation,
         )
@@ -624,7 +629,12 @@ class Glm5NextDecoderLayer(nn.Module):
             self.mhc_post_op = MHCPostOp()
             self.mhc_fused_post_pre_op = MHCFusedPostPreOp()
 
-            if vllm_config.kernel_config.enable_jit_warmup:
+            # The TileLang mHC kernels back the CUDA/ROCm paths; XPU runs the
+            # SYCL mHC ops (forward_xpu) and has no TileLang.
+            if (
+                vllm_config.kernel_config.enable_jit_warmup
+                and not current_platform.is_xpu()
+            ):
                 from vllm.model_executor.kernels.mhc.tilelang_kernels import (
                     _HC_PRENORM_GEMM_TILELANG_KERNEL,
                     _MHC_FUSED_TILELANG_KERNEL,
@@ -1295,6 +1305,14 @@ class Glm5NextForCausalLM(
         self.specialized_decode.build_logits(self.logits_processor, self.lm_head)
 
     def get_model_state_cls(self) -> "type[ModelState]":
+        if current_platform.is_xpu():
+            # No specialized decode on XPU, which is all Glm5NextModelState
+            # adds to the hybrid state; keep nvidia/ out of the XPU imports.
+            from vllm.v1.worker.gpu.model_states.mamba_hybrid import (
+                MambaHybridModelState,
+            )
+
+            return MambaHybridModelState
         from ..nvidia.model_state import Glm5NextModelState
 
         return Glm5NextModelState

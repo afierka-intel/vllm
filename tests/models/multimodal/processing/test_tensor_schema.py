@@ -179,9 +179,6 @@ def test_model_tensor_schema(model_id: str):
     ):
         pytest.skip("Deepseek V4 vision is only supported on CUDA and ROCm")
 
-    if model_id == "zai-org/GLM-5.3-Flash" and (current_platform.is_xpu()):
-        pytest.skip("GLM-5.3-Flash is not supported on XPU")
-
     model_info = HF_EXAMPLE_MODELS.find_hf_info(model_id)
 
     model_arch = next(
