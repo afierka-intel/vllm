@@ -168,3 +168,57 @@ def test_bf16_triton_sparse_mla_masked_chunks(device_str, dtype):
     # lse/max_logits are large-negative finite rather than the reference's
     # +inf/-inf placeholders, so only the output is compared here.
     assert torch.allclose(out[2], torch.zeros_like(out[2]))
+
+
+@pytest.mark.skipif(
+    not torch.xpu.is_available(),
+    reason="XPU is required",
+)
+@torch.inference_mode()
+def test_dequant_gather_ds_mla_rows_matches_upconvert():
+    """Top-k-only dequantization of fp8_ds_mla rows reads the same bytes with
+    the same math as the SYCL cp_gather_and_upconvert_fp8_kv_cache op, and
+    -1 slots become zeros."""
+    from vllm import _custom_ops as ops
+    from vllm.v1.attention.ops.xpu_mla_sparse import (
+        DS_MLA_ENTRY_BYTES,
+        dequant_gather_ds_mla_rows,
+    )
+
+    device = torch.device("xpu")
+    torch.random.manual_seed(0)
+    num_blocks, block_size = 8, 64
+    num_slots = num_blocks * block_size
+    kv_c = torch.randn(num_slots, 512, dtype=torch.bfloat16, device=device) * 4
+    k_pe = torch.randn(num_slots, 64, dtype=torch.bfloat16, device=device)
+    cache = torch.zeros(
+        num_blocks, block_size, DS_MLA_ENTRY_BYTES, dtype=torch.uint8, device=device
+    )
+    ops.concat_and_cache_mla(
+        kv_c,
+        k_pe,
+        cache,
+        torch.arange(num_slots, dtype=torch.int64, device=device),
+        kv_cache_dtype="fp8_ds_mla",
+        scale=torch.ones(1, dtype=torch.float32, device=device),
+    )
+    full = torch.empty(num_slots, 576, dtype=torch.bfloat16, device=device)
+    ops.cp_gather_and_upconvert_fp8_kv_cache(
+        src_cache=cache,
+        dst=full,
+        block_table=torch.arange(num_blocks, dtype=torch.int32, device=device)[None],
+        workspace_starts=torch.zeros(1, dtype=torch.int32, device=device),
+        batch_size=1,
+    )
+
+    rows = torch.randint(0, num_slots, (5, 96), dtype=torch.int32, device=device)
+    rows[:, -7:] = -1
+    got = dequant_gather_ds_mla_rows(cache.view(num_slots, DS_MLA_ENTRY_BYTES), rows)
+    expected = full[rows.clamp(min=0).flatten().long()]
+    expected[rows.flatten() < 0] = 0
+    torch.testing.assert_close(got, expected, atol=0, rtol=0)
+    # fp8 storage stays close to the BF16 values it was written from.
+    ref = torch.cat([kv_c, k_pe], dim=-1)[rows.clamp(min=0).flatten().long()]
+    valid = rows.flatten() >= 0
+    rel = (got[valid].float() - ref[valid].float()).norm() / ref[valid].float().norm()
+    assert rel < 0.05
