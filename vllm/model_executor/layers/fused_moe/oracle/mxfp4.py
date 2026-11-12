@@ -514,6 +514,43 @@ def _backend_activation_key(backend: Mxfp4MoeBackend) -> QuantKey | None:
     return None  # BF16 activation
 
 
+def log_mxfp4_moe_activation(
+    backend: Mxfp4MoeBackend, requested_activation_key: QuantKey | None
+) -> QuantKey | None:
+    """Log which activation format the selected backend runs for a checkpoint
+    that declares `requested_activation_key`, and return it (None = BF16).
+
+    Lower precision than requested (MXFP4 activations for FP8/MXFP8) is a
+    warning; BF16 or the requested format is info.
+    """
+    if requested_activation_key is None:
+        return None
+    # Humming and emulation quantize activations to the layer's requested key.
+    executed: QuantKey | None
+    if backend in (Mxfp4MoeBackend.HUMMING, Mxfp4MoeBackend.EMULATION):
+        executed = requested_activation_key
+    else:
+        executed = _backend_activation_key(backend)
+    if executed == requested_activation_key:
+        return executed
+    if executed == kMxfp4Dynamic:
+        logger.warning_once(
+            "Mxfp4 MoE backend '%s' runs MXFP4 activations, lower precision "
+            "than the checkpoint's %s activations.",
+            backend.value,
+            requested_activation_key,
+        )
+    else:
+        logger.info_once(
+            "Mxfp4 MoE backend '%s' runs %s activations for a checkpoint "
+            "with %s activations.",
+            backend.value,
+            "BF16" if executed is None else executed,
+            requested_activation_key,
+        )
+    return executed
+
+
 def _user_moe_activation_override() -> QuantKey | None:
     """User's MoE activation override from quantization_config, or None."""
     return user_activation_override("moe", get_current_vllm_config())[0]

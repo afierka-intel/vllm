@@ -27,3 +27,27 @@ steps:
     tests/models/quantization/test_fp8_per_channel.py
     --deselect="tests/models/quantization/test_fp8_per_channel.py::test_fp8_per_channel_logprobs[moe]"
 
+
+- label: ":intel: (BMG) MXFP4 W4A8 Quantization"
+  key: mxfp4-w4a8-quantization
+  timeout_in_minutes: 20
+  env:
+    VLLM_TEST_DEVICE: "xpu"
+  device: intel_gpu_k8s
+  num_devices: 1
+  resource_claim_template: b70-1
+  working_dir: "/vllm-workspace/"
+  source_file_dependencies:
+  - vllm/model_executor/kernels/linear/mxfp4
+  - vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
+  - vllm/model_executor/layers/quantization/compressed_tensors
+  - vllm/model_executor/layers/quantization/utils/mxfp4_utils.py
+  - tests/kernels/quantization/test_mxfp4_kernel_selection.py
+  - tests/quantization/test_compressed_tensors.py
+  - tests/kernels/moe/test_ocp_mx_moe.py
+  commands:
+  - pytest -v -s tests/kernels/quantization/test_mxfp4_kernel_selection.py
+  - >-
+    pytest -v -s tests/quantization/test_compressed_tensors.py
+    -k "mxfp4_linear_with_fp8_inputs or mxfp4_w4a8_emulation"
+  - pytest -v -s tests/kernels/moe/test_ocp_mx_moe.py -k xpu_mxfp4_moe

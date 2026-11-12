@@ -663,6 +663,7 @@ _POSSIBLE_MXFP4_KERNELS: dict[PlatformEnum, list[type[MxFp4LinearKernel]]] = {
     PlatformEnum.XPU: [
         XPUMxFp4LinearKernel,
         TorchMxFp4LinearKernel,
+        EmulationMxfp4LinearKernel,
     ],
 }
 

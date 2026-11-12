@@ -1116,11 +1116,13 @@ def test_mxfp4_moe_with_fp8_inputs_shares_native_mxfp4_method(monkeypatch):
 
 
 @pytest.mark.skipif(
-    not current_platform.is_cuda(), reason="FP8 x MXFP4 linear kernels need CUDA"
+    not (current_platform.is_cuda() or current_platform.is_xpu()),
+    reason="FP8 x MXFP4 linear kernels need CUDA or XPU",
 )
 def test_mxfp4_linear_with_fp8_inputs_requests_fp8_activations():
     """Dense MXFP4 layers with dynamic FP8 inputs (e.g. GLM-5.3 dense MLPs)
-    must not be routed as W4A4."""
+    must not be routed as W4A4. On XPU no native kernel takes FP8
+    activations, so this lands on the emulation kernel."""
     from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
         CompressedTensorsW4A8Mxfp4,
     )
@@ -1165,3 +1167,68 @@ def test_mxfp4_moe_with_mxfp4_inputs_keeps_w4a4_method(monkeypatch):
     )
 
     assert isinstance(layer.quant_method, CompressedTensorsW4A4Mxfp4MoEMethod)
+
+
+@pytest.mark.skipif(
+    not (current_platform.is_cuda() or current_platform.is_xpu()),
+    reason="needs a GPU for per_token_group_quant_fp8",
+)
+@pytest.mark.parametrize("group_size", [128, -1])
+@torch.inference_mode()
+def test_mxfp4_w4a8_emulation_matches_fp8_group_quant(
+    group_size, dist_init, workspace_init
+):
+    """The emulated W4A8 MXFP4 linear equals FP8-quantized activations (vLLM's
+    per_token_group_quant_fp8) times dequantized MXFP4 weights."""
+    from tests.quantization.reference_mxfp4 import dq_mxfp4_torch
+    from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
+        CompressedTensorsW4A8Mxfp4,
+    )
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+        per_token_group_quant_fp8,
+    )
+
+    device = current_platform.device_type
+    in_features, out_features, tokens = 512, 256, 7
+    weights = QuantizationArgs(
+        num_bits=4, type="float", strategy="group", group_size=32, symmetric=True
+    )
+    inputs = QuantizationArgs(
+        num_bits=8,
+        type="float",
+        strategy="group" if group_size > 0 else "token",
+        group_size=group_size if group_size > 0 else None,
+        symmetric=True,
+        dynamic=True,
+    )
+    config = CompressedTensorsConfig.from_config(
+        {"format": "mxfp4-pack-quantized", "config_groups": {}}
+    )
+    vllm_config = VllmConfig(kernel_config=KernelConfig(linear_backend="emulation"))
+    with set_current_vllm_config(vllm_config):
+        scheme = config._get_scheme_from_parts(weights, inputs)
+    assert isinstance(scheme, CompressedTensorsW4A8Mxfp4)
+
+    layer = torch.nn.Module()
+    scheme.create_weights(
+        layer, [out_features], in_features, torch.bfloat16, weight_loader=None
+    )
+    torch.manual_seed(0)
+    packed = torch.randint(0, 256, (out_features, in_features // 2), dtype=torch.uint8)
+    scale = torch.randint(
+        118, 128, (out_features, in_features // 32), dtype=torch.uint8
+    )
+    layer.weight_packed.data.copy_(packed)
+    layer.weight_scale.data.copy_(scale)
+    layer.to(device)
+    scheme.process_weights_after_loading(layer)
+
+    x = torch.randn(tokens, in_features, dtype=torch.bfloat16, device=device) * 3
+    out = scheme.apply_weights(layer, x)
+
+    g = in_features if group_size == -1 else group_size
+    x_q, x_s = per_token_group_quant_fp8(x, g, use_ue8m0=False)
+    x_dq = (x_q.float() * x_s.repeat_interleave(g, dim=-1)).to(torch.bfloat16)
+    w_dq = dq_mxfp4_torch(packed, scale, torch.bfloat16).to(device)
+    ref = torch.nn.functional.linear(x_dq, w_dq)
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)

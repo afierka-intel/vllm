@@ -24,12 +24,17 @@ from vllm.model_executor.kernels.linear import (
 )
 from vllm.model_executor.layers.quantization.utils import quant_utils
 from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
+    dequant_mxfp4_torch,
     quant_dequant_mxfp4,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    kFp8Dynamic128Sym,
+    kFp8DynamicTokenSym,
     kMxfp4Dynamic,
+    kMxfp4Static,
     kMxfp6E2M3Dynamic,
     kMxfp6E3M2Dynamic,
+    kMxfp8Dynamic,
 )
 from vllm.platforms import PlatformEnum
 
@@ -327,3 +332,71 @@ def test_init_mxfp4_linear_kernel_raises_when_no_kernel_matches(platform_mock):
 
     with pytest.raises(ValueError, match="Failed to find a kernel"):
         init_mxfp4_linear_kernel()
+
+
+@pytest.mark.parametrize(
+    "activation_quant_key", [kFp8Dynamic128Sym, kFp8DynamicTokenSym]
+)
+def test_emulation_kernel_runs_fp8_activations_without_quark(
+    activation_quant_key, monkeypatch
+):
+    """W4A8 (MXFP4 x dynamic FP8) emulation needs no amd-quark: weights have a
+    PyTorch dequant and the FP8 quant-dequant is native."""
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.mxfp4.emulation.has_quark",
+        lambda: False,
+    )
+    assert EmulationMxfp4LinearKernel._supports_quant_scheme(
+        kMxfp4Static, activation_quant_key
+    )
+    config = MxFp4LinearLayerConfig(activation_quant_key=activation_quant_key)
+    can_implement, reason = EmulationMxfp4LinearKernel.can_implement(config)
+    assert can_implement, reason
+    # MX activation quant-dequant still needs amd-quark.
+    can_implement, reason = EmulationMxfp4LinearKernel.can_implement(
+        MxFp4LinearLayerConfig(activation_quant_key=kMxfp4Dynamic)
+    )
+    assert not can_implement
+    assert reason is not None and "amd-quark" in reason
+
+
+def test_emulation_kernel_does_not_treat_mxfp8_as_fp8_groups():
+    """MXFP8 shares the FP8 dtype but has E8M0 scales over 32 elements; it is
+    not a dynamic FP8 group-32 activation."""
+    assert not EmulationMxfp4LinearKernel._supports_quant_scheme(
+        kMxfp4Static, kMxfp8Dynamic
+    )
+
+
+def test_dequant_mxfp4_torch_matches_reference():
+    """The PyTorch MXFP4 dequant (used without amd-quark) matches the
+    reference bit for bit."""
+    from tests.quantization.reference_mxfp4 import dq_mxfp4_torch
+
+    torch.manual_seed(0)
+    packed = torch.randint(0, 256, (16, 64), dtype=torch.uint8)
+    # Exponents keep 6 * 2^(e - 127) inside the float16 range.
+    scale = torch.randint(110, 138, (16, 4), dtype=torch.uint8)
+    for dtype in (torch.bfloat16, torch.float16):
+        torch.testing.assert_close(
+            dequant_mxfp4_torch(packed, scale, dtype),
+            dq_mxfp4_torch(packed, scale, dtype),
+            rtol=0,
+            atol=0,
+        )
+
+
+@patch("vllm.model_executor.kernels.linear.current_platform")
+def test_w4a8_scheme_never_falls_back_to_w4a4(platform_mock):
+    """MXFP4 weights with FP8 activations must not silently run as W4A4 when
+    no kernel takes FP8 activations: selection fails instead."""
+    from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
+        CompressedTensorsW4A8Mxfp4,
+    )
+
+    platform_mock._enum = PlatformEnum.OOT
+    # Accepts MXFP4 / unquantized activations only (default quant scheme).
+    register_linear_kernel(OOTMxFp4LinearKernel, PlatformEnum.OOT, "mxfp4")
+
+    with pytest.raises(ValueError, match="Failed to find a kernel"):
+        CompressedTensorsW4A8Mxfp4(activation_quant_key=kFp8Dynamic128Sym)

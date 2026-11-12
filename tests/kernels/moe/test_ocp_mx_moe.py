@@ -2831,3 +2831,72 @@ def test_rocm_mxfp4_round_up_hidden_and_intermediate(
         f"hidden {hidden_in}->{hidden} (expected {hidden_out}), "
         f"intermediate {inter_in}->{intermediate} (expected {inter_out})"
     )
+
+
+@pytest.mark.skipif(not current_platform.is_xpu(), reason="XPU MXFP4 MoE path")
+@pytest.mark.parametrize("num_tokens", [1, 33])
+@torch.inference_mode()
+def test_xpu_mxfp4_moe_with_fp8_checkpoint_activations(
+    num_tokens, default_vllm_config, workspace_init
+):
+    """MXFP4 experts of a checkpoint with dynamic FP8 activations (RedHatAI
+    GLM-5.3 MXFP4xFP8) run W4A16 on XPU: BF16 activations, at least the
+    checkpoint's precision, matching dequantized weights in BF16."""
+    from tests.kernels.utils import torch_experts
+    from tests.quantization.reference_mxfp4 import dq_mxfp4_torch
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
+        Mxfp4MoeBackend,
+        log_mxfp4_moe_activation,
+        make_mxfp4_moe_kernel,
+        make_mxfp4_moe_quant_config,
+        select_deepseek_v4_mxfp4_moe_backend,
+    )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kFp8Dynamic128Sym,
+    )
+
+    e, topk, hidden, inter, dev = 8, 2, 512, 256, current_platform.device_type
+    moe_config = make_dummy_moe_config(
+        num_experts=e,
+        experts_per_token=topk,
+        hidden_dim=hidden,
+        intermediate_size=inter,
+    )
+    backend, experts_cls = select_deepseek_v4_mxfp4_moe_backend(moe_config)
+    assert backend == Mxfp4MoeBackend.XPU
+    assert log_mxfp4_moe_activation(backend, kFp8Dynamic128Sym) is None  # BF16
+
+    torch.manual_seed(0)
+    w13, w2 = (
+        torch.randint(0, 256, (e, n, k // 2), dtype=torch.uint8, device=dev)
+        for n, k in ((2 * inter, hidden), (hidden, inter))
+    )
+    w13_s, w2_s = (
+        torch.randint(118, 124, (e, n, k // 32), dtype=torch.uint8, device=dev)
+        for n, k in ((2 * inter, hidden), (hidden, inter))
+    )
+    kernel = make_mxfp4_moe_kernel(
+        make_mxfp4_moe_quant_config(backend, w1_scale=w13_s, w2_scale=w2_s),
+        moe_config,
+        experts_cls,
+        backend,
+    )
+    a = torch.randn(num_tokens, hidden, dtype=torch.bfloat16, device=dev) / 4
+    scores = torch.randn(num_tokens, e, device=dev)
+    topk_weights, topk_ids = scores.softmax(-1).topk(topk)
+    out = kernel.apply(
+        hidden_states=a,
+        w1=w13,
+        w2=w2,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids.to(torch.int32),
+        activation=MoEActivation.SILU,
+        global_num_experts=e,
+        expert_map=None,
+        apply_router_weight_on_input=False,
+    )
+    w13_ref = dq_mxfp4_torch(w13.cpu(), w13_s.cpu(), torch.bfloat16).to(dev)
+    w2_ref = dq_mxfp4_torch(w2.cpu(), w2_s.cpu(), torch.bfloat16).to(dev)
+    ref = torch_experts(a, w13_ref, w2_ref, topk_weights, topk_ids)
+    torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
