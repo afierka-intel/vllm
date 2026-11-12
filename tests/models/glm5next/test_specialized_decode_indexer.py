@@ -53,7 +53,7 @@ def test_projection_matches_linear(tokens):
 
 @pytest.mark.parametrize("tokens", [1, 40])
 def test_query_epilogue_matches_unfused(tokens):
-    from vllm.models.glm5next.nvidia.ops.kpool_compress import fwht128_quant_fp8
+    from vllm.models.glm5next.common.ops.kpool_compress import fwht128_quant_fp8
     from vllm.models.glm5next.nvidia.specialized_decode.indexer_query import (
         indexer_query,
     )

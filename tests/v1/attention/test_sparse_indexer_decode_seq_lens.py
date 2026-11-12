@@ -29,7 +29,7 @@ import torch
 # modules. Production always enters via attention.py first.
 # isort: off
 import vllm.models.glm5next  # noqa: F401
-from vllm.models.glm5next.nvidia.ops.kpool_compress import (  # noqa: E402
+from vllm.models.glm5next.common.ops.kpool_compress import (  # noqa: E402
     append_tail_to_topk,
     expand_pools_to_tokens,
 )
@@ -120,7 +120,7 @@ def test_decode_scatter_cuda_graph_replays_with_smaller_live_budget():
 
 
 def test_kpool_ops_dispatch_matches_platform():
-    expected_backend = ".amd." if current_platform.is_rocm() else ".nvidia."
+    expected_backend = ".amd." if current_platform.is_rocm() else ".common."
     assert expected_backend in indexer_mod.kpool_ops.__name__
 
 

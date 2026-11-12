@@ -16,7 +16,7 @@ from vllm.platforms import current_platform
 if current_platform.is_rocm():
     from vllm.models.glm5next.amd.ops.third_party.kda import fused_recurrent_kda
 else:
-    from vllm.models.glm5next.nvidia.ops.third_party.kda import fused_recurrent_kda
+    from vllm.models.glm5next.common.ops.third_party.kda import fused_recurrent_kda
 
 pytestmark = pytest.mark.skipif(
     not current_platform.is_cuda_alike(), reason="Requires CUDA or ROCm"

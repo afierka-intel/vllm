@@ -25,6 +25,7 @@ from vllm.model_executor.layers.sparse_attn_indexer import (
     _merge_dcp_topk_global,
     as_fp32_logits,
 )
+from vllm.models.glm5next.common.ops import kpool_compress as kpool_ops
 from vllm.models.glm5next.common.sparse_indexer import (
     RADIX_TOPK_WORKSPACE_SIZE,
     _build_decode_scatter_indices,
@@ -35,7 +36,6 @@ from vllm.models.glm5next.common.sparse_indexer import (
     _scatter_decode_tokens_by_request,
     kv_cache_as_quant_view,
 )
-from vllm.models.glm5next.nvidia.ops import kpool_compress as kpool_ops
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import (
     fp8_fp4_mqa_logits,

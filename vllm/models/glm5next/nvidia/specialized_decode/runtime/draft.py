@@ -17,7 +17,7 @@ import torch
 from vllm.config import CUDAGraphMode
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
-from vllm.models.glm5next.nvidia.ops.fused_eh_norm import fused_eh_norm
+from vllm.models.glm5next.common.ops.fused_eh_norm import fused_eh_norm
 
 from ..linear import MAX_TOKENS as PROJECTION_MAX_TOKENS
 from ..linear import planned_step

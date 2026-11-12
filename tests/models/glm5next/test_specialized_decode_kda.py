@@ -92,7 +92,7 @@ class _Case:
         from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
             causal_conv1d_update,
         )
-        from vllm.models.glm5next.nvidia.ops.third_party.kda import (
+        from vllm.models.glm5next.common.ops.third_party.kda import (
             fused_recurrent_kda,
         )
         from vllm.third_party.flash_linear_attention.ops.kda import rms_norm_gated
