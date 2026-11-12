@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pytest
+import torch
 
 from vllm.platforms import current_platform
 
@@ -56,8 +57,6 @@ def test_xpu_sparse_forward_mqa_head_size_and_topk_width(head_size, width):
     """forward_mqa must split the cached row by the model's RoPE dim (64, or 0
     for NoPE) and attend to every column of the shared top-k buffer, including
     tail entries past index_topk."""
-    import torch
-
     from tests.kernels.attention.test_xpu_mla_sparse import (
         reference_mla_sparse_prefill,
     )
@@ -113,12 +112,11 @@ def test_xpu_sparse_forward_mqa_head_size_and_topk_width(head_size, width):
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.parametrize("kv_cache_dtype", ["fp8", "fp8_e4m3"])
+@pytest.mark.parametrize("kv_cache_dtype", ["fp8_e5m2", "fp8_inc"])
 def test_xpu_sparse_rejects_unsupported_kv_cache_dtype_at_selection(kv_cache_dtype):
-    """An FP8 KV cache is not supported by XPU_MLA_SPARSE yet: backend selection
-    must fail with a clear error instead of the first forward pass."""
-    import torch
-
+    """A KV cache dtype XPU_MLA_SPARSE cannot store (only fp8 as fp8_ds_mla is
+    supported): backend selection must fail with a clear error instead of the
+    first forward pass."""
     from vllm.platforms.xpu import XPUPlatform
     from vllm.v1.attention.selector import AttentionSelectorConfig
 
@@ -133,5 +131,171 @@ def test_xpu_sparse_rejects_unsupported_kv_cache_dtype_at_selection(kv_cache_dty
     with pytest.raises(ValueError, match="kv_cache_dtype"):
         XPUPlatform.get_attn_backend_cls(None, cfg)
     # Supported dtypes still select the backend.
-    path = XPUPlatform.get_attn_backend_cls(None, cfg._replace(kv_cache_dtype="auto"))
-    assert path.endswith("XPUMLASparseBackend")
+    for supported in ("auto", "fp8", "fp8_e4m3", "fp8_ds_mla"):
+        path = XPUPlatform.get_attn_backend_cls(
+            None, cfg._replace(kv_cache_dtype=supported)
+        )
+        assert path.endswith("XPUMLASparseBackend")
+
+
+@pytest.mark.parametrize("pe_dim", [64, 0])
+@pytest.mark.parametrize("max_rows", [None, 300])
+@torch.inference_mode()
+def test_xpu_sparse_fp8_ds_mla_forward(pe_dim: int, max_rows: int | None):
+    """forward_mqa over an fp8_ds_mla cache equals sparse attention over the
+    dequantized cache, and stays close to the BF16 KV it was written from.
+
+    The batch mixes decode-like requests (only their top-k rows are
+    dequantized) and a prefill-like one (its whole context is gathered with
+    cp_gather_and_upconvert_fp8_kv_cache); max_rows=300 splits it into
+    several runs. pe_dim=0 is a rope-free model (zero RoPE envelope).
+    """
+    import numpy as np
+
+    from tests.kernels.attention.test_xpu_mla_sparse import (
+        reference_mla_sparse_prefill,
+    )
+    from vllm import _custom_ops as ops
+    from vllm.model_executor.layers.attention.mla_attention import (
+        _canonicalize_sparse_mla_kv_cache_dtype,
+    )
+    from vllm.v1.attention.backends.mla.xpu_mla_sparse import (
+        XPUMLASparseBackend,
+        XPUMLASparseImpl,
+        XPUMLASparseMetadata,
+        build_fp8_ds_mla_chunks,
+        xpu_supports_rope_free_fp8_ds_mla,
+    )
+    from vllm.v1.attention.ops.xpu_mla_sparse import DS_MLA_ENTRY_BYTES
+
+    # --kv-cache-dtype fp8 is stored as fp8_ds_mla on this backend.
+    for alias in ("fp8", "fp8_e4m3"):
+        assert (
+            _canonicalize_sparse_mla_kv_cache_dtype(XPUMLASparseBackend, alias)
+            == "fp8_ds_mla"
+        )
+
+    device = torch.device("xpu")
+    torch.random.manual_seed(0)
+    num_heads, topk, block_size, num_blocks = 64, 128, 64, 32
+    dim_qk = 512 + pe_dim
+    scale = dim_qk**-0.5
+    # (query_len, context_len): decode-like, prefill-like, decode-like.
+    reqs = [(2, 900), (200, 200), (1, 450)]
+    query_start_loc = np.cumsum([0] + [q for q, _ in reqs]).astype(np.int32)
+    seq_lens = np.array([c for _, c in reqs], dtype=np.int32)
+    num_tokens = int(query_start_loc[-1])
+
+    topk_buffer = torch.full((num_tokens, topk), -1, dtype=torch.int32, device=device)
+    impl_kwargs = dict(
+        num_heads=num_heads,
+        head_size=dim_qk,
+        scale=scale,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        logits_soft_cap=None,
+        attn_type="decoder",
+        kv_sharing_target_layer_name=None,
+        topk_indices_buffer=topk_buffer,
+        kv_lora_rank=512,
+        qk_rope_head_dim=pe_dim,
+    )
+    if pe_dim == 0 and not xpu_supports_rope_free_fp8_ds_mla():
+        with pytest.raises(ValueError, match="pe_dim=0"):
+            XPUMLASparseImpl(kv_cache_dtype="fp8_ds_mla", **impl_kwargs)
+        return
+    impl = XPUMLASparseImpl(kv_cache_dtype="fp8_ds_mla", **impl_kwargs)
+
+    # Each request owns a disjoint, shuffled set of blocks.
+    perm = torch.randperm(num_blocks).to(torch.int32)
+    max_blocks = 16
+    block_table = torch.zeros(len(reqs), max_blocks, dtype=torch.int32)
+    used = 0
+    for r, (_, ctx) in enumerate(reqs):
+        n = -(-ctx // block_size)
+        block_table[r, :n] = perm[used : used + n]
+        used += n
+    block_table = block_table.to(device)
+
+    kv_c = torch.randn(num_blocks * block_size, 512, dtype=torch.bfloat16) * 2
+    k_pe = torch.randn(num_blocks * block_size, pe_dim, dtype=torch.bfloat16)
+    kv_c, k_pe = kv_c.to(device), k_pe.to(device)
+    cache = torch.zeros(
+        num_blocks, block_size, DS_MLA_ENTRY_BYTES, dtype=torch.uint8, device=device
+    )
+    ops.concat_and_cache_mla(
+        kv_c,
+        k_pe,
+        cache,
+        torch.arange(num_blocks * block_size, dtype=torch.int64, device=device),
+        kv_cache_dtype="fp8_ds_mla",
+        scale=torch.ones(1, dtype=torch.float32, device=device),
+    )
+
+    # Causal request-local top-k with -1 padding, and the slot each maps to.
+    req_ids, global_rows = [], []
+    for r, (q_len, ctx) in enumerate(reqs):
+        for i in range(q_len):
+            t = int(query_start_loc[r]) + i
+            visible = ctx - q_len + i + 1
+            sel = torch.randperm(visible)[: min(topk, visible)].to(torch.int32)
+            topk_buffer[t, : sel.numel()] = sel.to(device)
+            req_ids.append(r)
+            row = torch.full((topk,), -1, dtype=torch.int64)
+            row[: sel.numel()] = (
+                block_table[r, (sel // block_size).long()].cpu().long() * block_size
+                + (sel % block_size).long()
+            )
+            global_rows.append(row)
+    req_id_per_token = torch.tensor(req_ids, dtype=torch.int32, device=device)
+    global_rows_t = torch.stack(global_rows).to(device)
+
+    chunk_kwargs = {} if max_rows is None else {"max_rows": max_rows}
+    chunks, context_starts = build_fp8_ds_mla_chunks(
+        query_start_loc, seq_lens, topk, **chunk_kwargs
+    )
+    assert any(c[4] > 0 for c in chunks) and any(c[4] == 0 for c in chunks)
+    if max_rows is not None:
+        assert len(chunks) > 2
+    metadata = XPUMLASparseMetadata(
+        num_reqs=len(reqs),
+        max_query_len=max(q for q, _ in reqs),
+        max_seq_len=int(seq_lens.max()),
+        num_actual_tokens=num_tokens,
+        query_start_loc=torch.from_numpy(query_start_loc).to(device),
+        slot_mapping=torch.empty(0, dtype=torch.int64, device=device),
+        block_table=block_table,
+        req_id_per_token=req_id_per_token,
+        block_size=block_size,
+        topk_tokens=topk,
+        fp8_chunks=chunks,
+        fp8_context_starts=torch.from_numpy(context_starts).to(device),
+    )
+
+    q = torch.randn(num_tokens, num_heads, dim_qk, dtype=torch.bfloat16, device=device)
+    out, _ = impl.forward_mqa(q, cache, metadata, None)
+
+    # Reference: sparse attention over the dequantized cache (pe_dim=0
+    # entries read back with a zero RoPE tail).
+    dequant = torch.empty(
+        num_blocks * block_size, 576, dtype=torch.bfloat16, device=device
+    )
+    ops.cp_gather_and_upconvert_fp8_kv_cache(
+        src_cache=cache,
+        dst=dequant,
+        block_table=torch.arange(num_blocks, dtype=torch.int32, device=device)[None],
+        workspace_starts=torch.zeros(1, dtype=torch.int32, device=device),
+        batch_size=1,
+    )
+    indices = global_rows_t.to(torch.int32).view(num_tokens, 1, topk)
+    ref, _, _, _ = reference_mla_sparse_prefill(
+        q, dequant[:, None, :dim_qk], indices, scale, 512
+    )
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
+
+    # fp8 KV vs the unquantized BF16 KV.
+    bf16_kv = torch.cat([kv_c, k_pe], dim=-1)[:, None, :]
+    ref_bf16, _, _, _ = reference_mla_sparse_prefill(q, bf16_kv, indices, scale, 512)
+    rel = (out.float() - ref_bf16.float()).norm() / ref_bf16.float().norm()
+    assert rel < 0.05, f"fp8 KV vs BF16 KV relative L2 {rel:.4f}"

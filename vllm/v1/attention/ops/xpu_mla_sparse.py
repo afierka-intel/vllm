@@ -280,3 +280,77 @@ def triton_bf16_mla_sparse_interface(
     )
 
     return out, max_logits, softmax_lse
+
+
+# fp8_ds_mla entry (656 bytes): 512 fp8-e4m3 NoPE values in 4 tiles of 128,
+# 4 fp32 tile scales, then 64 BF16 RoPE values (zeros for rope-free models).
+DS_MLA_NOPE_DIM = 512
+DS_MLA_PE_DIM = 64
+DS_MLA_TILE = 128
+DS_MLA_SCALES_OFFSET = DS_MLA_NOPE_DIM
+DS_MLA_ROPE_OFFSET = DS_MLA_SCALES_OFFSET + 4 * (DS_MLA_NOPE_DIM // DS_MLA_TILE)
+DS_MLA_ENTRY_BYTES = DS_MLA_ROPE_OFFSET + 2 * DS_MLA_PE_DIM
+
+
+@triton.jit
+def _dequant_gather_ds_mla_kernel(
+    out_ptr,  # bf16 [num_rows_out, NOPE + PE]
+    cache_ptr,  # uint8, rows of ENTRY_BYTES at row_stride
+    rows_ptr,  # int32 [num_rows_out], -1 = invalid
+    row_stride,
+    NOPE: tl.constexpr,
+    PE: tl.constexpr,
+    TILE: tl.constexpr,
+    SCALES_OFFSET: tl.constexpr,
+    ROPE_OFFSET: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    row = tl.load(rows_ptr + pid).to(tl.int64)
+    out_row = out_ptr + pid.to(tl.int64) * (NOPE + PE)
+    nope_offs = tl.arange(0, NOPE)
+    pe_offs = tl.arange(0, PE)
+    if row < 0:
+        tl.store(out_row + nope_offs, tl.zeros([NOPE], dtype=tl.bfloat16))
+        tl.store(out_row + NOPE + pe_offs, tl.zeros([PE], dtype=tl.bfloat16))
+        return
+    entry = cache_ptr + row * row_stride
+    x = tl.load(entry + nope_offs).to(tl.float8e4nv, bitcast=True).to(tl.float32)
+    scales = tl.load(
+        (entry + SCALES_OFFSET).to(tl.pointer_type(tl.float32)) + nope_offs // TILE
+    )
+    tl.store(out_row + nope_offs, (x * scales).to(tl.bfloat16))
+    rope = tl.load((entry + ROPE_OFFSET).to(tl.pointer_type(tl.bfloat16)) + pe_offs)
+    tl.store(out_row + NOPE + pe_offs, rope)
+
+
+def dequant_gather_ds_mla_rows(
+    kv_rows: torch.Tensor,  # uint8 [num_cache_rows, 656] (row view of the cache)
+    rows: torch.Tensor,  # int32, any shape; -1 marks an invalid slot
+) -> torch.Tensor:
+    """BF16 [rows.numel(), 576] copy of the selected fp8_ds_mla cache rows.
+
+    Dequantizes only the rows a sparse attention step reads (the top-k of
+    each query), the same math as cp_gather_and_upconvert_fp8_kv_cache.
+    Invalid rows become zeros; the attention kernel never reads them.
+    """
+    assert kv_rows.dtype == torch.uint8 and kv_rows.shape[-1] == DS_MLA_ENTRY_BYTES
+    assert kv_rows.stride(-1) == 1
+    flat = rows.reshape(-1).to(torch.int32)
+    out = torch.empty(
+        (flat.numel(), DS_MLA_NOPE_DIM + DS_MLA_PE_DIM),
+        dtype=torch.bfloat16,
+        device=kv_rows.device,
+    )
+    if flat.numel():
+        _dequant_gather_ds_mla_kernel[(flat.numel(),)](
+            out,
+            kv_rows,
+            flat,
+            kv_rows.stride(0),
+            NOPE=DS_MLA_NOPE_DIM,
+            PE=DS_MLA_PE_DIM,
+            TILE=DS_MLA_TILE,
+            SCALES_OFFSET=DS_MLA_SCALES_OFFSET,
+            ROPE_OFFSET=DS_MLA_ROPE_OFFSET,
+        )
+    return out
