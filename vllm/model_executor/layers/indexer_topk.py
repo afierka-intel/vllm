@@ -622,6 +622,14 @@ class SparseIndexerTopk(torch.nn.Module):
         topk_indices: torch.Tensor,
         topk_tokens: int,
     ) -> None:
+        if current_platform.is_xpu():
+            # The XPU kernel (vllm_xpu_kernels <= 0.1.17) reads seq_lens as
+            # (B,) even when it is (B, next_n), so per-row lengths land on the
+            # wrong rows. Pass one end per row with next_n=1, the same
+            # contract. Drop this once the XPU kernel accepts 2D seq_lens like
+            # the CUDA one.
+            seq_lens = SparseIndexerTopk._row_ends(seq_lens, next_n, logits.shape[0])
+            next_n = 1
         ops.top_k_per_row_decode(
             logits,
             next_n,
