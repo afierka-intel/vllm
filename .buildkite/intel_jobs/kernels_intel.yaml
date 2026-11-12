@@ -69,6 +69,8 @@ steps:
     - tests/v1/attention/test_xpu_mla_sparse_backend.py
     - vllm/model_executor/layers/indexer_topk.py
     - tests/kernels/test_top_k_per_row.py
+    - vllm/model_executor/layers/mhc.py
+    - tests/kernels/mhc/test_mhc_kernels.py
   commands:
     - >-
       bash .buildkite/scripts/hardware_ci/run-intel-test.sh
@@ -76,4 +78,5 @@ steps:
       pytest -v -s
       kernels/attention/test_xpu_mla_sparse.py
       v1/attention/test_xpu_mla_sparse_backend.py &&
-      pytest -v -s kernels/test_top_k_per_row.py -k sparse_indexer_decode_topk'
+      pytest -v -s kernels/test_top_k_per_row.py -k sparse_indexer_decode_topk &&
+      pytest -v -s kernels/mhc/test_mhc_kernels.py -k xpu_applies_norm'
