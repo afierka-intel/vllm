@@ -9,6 +9,9 @@ from .quant_config import DeepseekV4FP8Config
 if current_platform.is_rocm():
     from .amd.dspark import DSparkDeepseekV4ForCausalLM
     from .amd.vl_model import DeepseekV41ForCausalLM
+elif current_platform.is_xpu():
+    from .xpu.dspark import DSparkDeepseekV4ForCausalLM  # type: ignore[assignment]
+    from .xpu.vl_model import DeepseekV41ForCausalLM  # type: ignore[assignment]
 else:
     from .nvidia.dspark import DSparkDeepseekV4ForCausalLM
     from .nvidia.vl_model import DeepseekV41ForCausalLM

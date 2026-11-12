@@ -1096,15 +1096,32 @@ def sparse_attn_indexer(
             seq_lens_xpu = (
                 seq_lens[:, -1].contiguous() if seq_lens.ndim == 2 else seq_lens
             )
-            logits = torch.ops.vllm.xpu_fp8_paged_mqa_logits(
-                padded_q_quant_cast,
-                kv_cache,
-                weights[:num_padded_tokens],
-                seq_lens_xpu,
-                decode_metadata.block_table,
-                decode_metadata.schedule_metadata,
-                max_model_len,
-            )
+            if kv_cache.shape[1] == 64:
+                logits = torch.ops.vllm.xpu_fp8_paged_mqa_logits(
+                    padded_q_quant_cast,
+                    kv_cache,
+                    weights[:num_padded_tokens],
+                    seq_lens_xpu,
+                    decode_metadata.block_table,
+                    decode_metadata.schedule_metadata,
+                    max_model_len,
+                )
+            else:
+                # The SYCL op only takes 64-row pages; DeepSeek V4.1 ratio-1
+                # indexer pages hold 128. The Triton kernel reads the same
+                # block-flat layout for any multiple of 64.
+                from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+                    rocm_fp8_paged_mqa_logits_triton,
+                )
+
+                logits = rocm_fp8_paged_mqa_logits_triton(
+                    padded_q_quant_cast,
+                    kv_cache,
+                    weights[:num_padded_tokens],
+                    seq_lens_xpu,
+                    decode_metadata.block_table,
+                    max_model_len,
+                )
         else:
             padded_q_scale, decode_weights = mqa_logits_mx_inputs(
                 padded_q_quant_cast,

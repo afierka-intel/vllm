@@ -789,17 +789,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 assert swa_metadata.cache_positions is not None
                 slot_mapping = swa_metadata.cache_slot_mapping
                 cache_positions = swa_metadata.cache_positions
-            torch.ops._C.fused_deepseek_v4_kv_rope_insert(
+            self._kv_rope_insert(
                 cache_kv,
                 cache,
                 slot_mapping,
                 cache_positions,
-                self.rotary_emb.cos_sin_cache,
                 self.swa_cache_layer.block_size,
-                self._flashinfer_fp8_kv_scale
-                if cache.dtype == torch.float8_e4m3fn
-                else None,
-                self.kv_mxfp8,
             )
         if self.compressor is not None:
             latent = self.compressor(kv_score, positions)
@@ -1095,6 +1090,32 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # ([num_tokens, padded_heads, head_dim]).
         self.forward_mqa(q, kv, positions, out)
 
+    def _kv_rope_insert(
+        self,
+        kv: torch.Tensor,
+        cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        positions: torch.Tensor,
+        block_size: int,
+    ) -> None:
+        """RoPE + quantize + insert KV rows only (no query).
+
+        Used by `forward_kv` and the PCP gather path. A platform without the
+        fused `_C` op overrides this.
+        """
+        torch.ops._C.fused_deepseek_v4_kv_rope_insert(
+            kv,
+            cache,
+            slot_mapping,
+            positions,
+            self.rotary_emb.cos_sin_cache,
+            block_size,
+            self._flashinfer_fp8_kv_scale
+            if cache.dtype == torch.float8_e4m3fn
+            else None,
+            self.kv_mxfp8,
+        )
+
     def _fused_qnorm_rope_kv_insert(
         self,
         q: torch.Tensor,
@@ -1146,17 +1167,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             cache_kv = get_pcp_group().all_gather(kv.contiguous(), dim=0)
             assert swa_metadata.cache_slot_mapping is not None
             assert swa_metadata.cache_positions is not None
-            torch.ops._C.fused_deepseek_v4_kv_rope_insert(
+            self._kv_rope_insert(
                 cache_kv,
                 swa_kv_cache,
                 swa_metadata.cache_slot_mapping,
                 swa_metadata.cache_positions,
-                cos_sin_cache,
                 swa_metadata.block_size,
-                self._flashinfer_fp8_kv_scale
-                if cache_dtype == torch.float8_e4m3fn
-                else None,
-                self.kv_mxfp8,
             )
             # The fused op now only prepares the rank-local queries.
             slot_mapping = slot_mapping[:0]

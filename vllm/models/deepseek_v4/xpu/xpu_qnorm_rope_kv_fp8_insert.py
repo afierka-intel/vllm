@@ -30,8 +30,9 @@ def _xpu_qnorm_rope_kernel(
     ROPE_DIM: tl.constexpr,
     NOPE_DIM: tl.constexpr,
     HALF_ROPE: tl.constexpr,
+    APPLY_Q_NORM: tl.constexpr,
 ):
-    """Apply per-head RMSNorm + GPT-J RoPE on Q, GPT-J RoPE on KV.
+    """Apply per-head RMSNorm (if APPLY_Q_NORM) + GPT-J RoPE on Q, GPT-J RoPE on KV.
 
     GPT-J interleaved format: pairs are (data[2i], data[2i+1]).
     cos_sin_cache layout: [max_pos, ROPE_DIM] with first HALF_ROPE=cos,
@@ -60,9 +61,12 @@ def _xpu_qnorm_rope_kernel(
         offs = tl.arange(0, HEAD_DIM)
         q_vals = tl.load(q_base + offs).to(tl.float32)
 
-        # RMSNorm (no weight)
-        sq_sum = tl.sum(q_vals * q_vals, axis=0)
-        rms = tl.rsqrt(sq_sum / HEAD_DIM + eps)
+        # RMSNorm (no weight). DeepSeek V4.1 norms qr before wq_b instead.
+        if APPLY_Q_NORM:
+            sq_sum = tl.sum(q_vals * q_vals, axis=0)
+            rms = tl.rsqrt(sq_sum / HEAD_DIM + eps)
+        else:
+            rms = 1.0
         q_vals = q_vals * rms
 
         # Store ONLY the NoPE portion (positions 0..NOPE_DIM-1)
@@ -111,7 +115,7 @@ def _xpu_qnorm_rope_kernel(
 
 
 def xpu_qnorm_rope_kv_fp8_insert(
-    q: torch.Tensor,  # [num_tokens, num_heads, HEAD_DIM] bf16, in-place
+    q: torch.Tensor | None,  # [num_tokens, num_heads, HEAD_DIM] bf16, in-place
     kv: torch.Tensor,  # [num_tokens, HEAD_DIM] bf16
     swa_kv_cache: torch.Tensor,  # [num_blocks, block_size, 584] or flat uint8
     slot_mapping: torch.Tensor,  # [num_tokens] int64
@@ -119,14 +123,19 @@ def xpu_qnorm_rope_kv_fp8_insert(
     cos_sin_cache: torch.Tensor,  # [max_pos, ROPE_DIM]
     eps: float,
     block_size: int,
+    apply_q_norm: bool = True,
 ):
-    """XPU Triton: qnorm+rope on Q, rope on KV, then FP8 UE8M0 quant+insert."""
+    """XPU Triton: qnorm+rope on Q, rope on KV, then FP8 UE8M0 quant+insert.
+
+    `q=None` writes only the KV half (DeepSeek V4.1 `forward_kv`, PCP).
+    """
     from vllm.models.deepseek_v4.common.ops.cache_utils import (
         quantize_and_insert_k_cache,
     )
 
-    num_tokens = q.shape[0]
-    num_heads = q.shape[1]
+    num_tokens = kv.shape[0]
+    # With no Q, the grid has only the KV program (head_idx == num_heads == 0).
+    num_heads = 0 if q is None else q.shape[1]
 
     # Allocate temp buffer for RoPE-applied KV
     kv_roped = torch.empty_like(kv)
@@ -136,7 +145,7 @@ def xpu_qnorm_rope_kv_fp8_insert(
     # head_idx == num_heads: process KV
     grid = (num_tokens, num_heads + 1)
     _xpu_qnorm_rope_kernel[grid](
-        q,
+        kv if q is None else q,
         kv,
         kv_roped,
         positions,
@@ -148,6 +157,7 @@ def xpu_qnorm_rope_kv_fp8_insert(
         ROPE_DIM=ROPE_DIM,
         NOPE_DIM=NOPE_DIM,
         HALF_ROPE=HALF_ROPE,
+        APPLY_Q_NORM=apply_q_norm,
     )
 
     # FP8 UE8M0 quant + paged insert (reuse existing Triton kernel)
