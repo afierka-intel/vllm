@@ -172,17 +172,40 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps=8):
     return quant_tensor, InFlexData(), scale
 
 
+# E2M1 magnitudes indexed by the low 3 bits of an FP4 code.
+_E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+def dequant_mxfp4_torch(
+    x: torch.Tensor, scale: torch.Tensor, float_dtype: torch.dtype
+) -> torch.Tensor:
+    """Dequantize packed OCP MXFP4 in plain PyTorch.
+
+    x holds two E2M1 codes per byte (low nibble first) on its last dim, and
+    scale one E8M0 exponent per 32 output elements. Every E2M1 value times a
+    power of two is exact in float32, so this matches a dedicated kernel
+    bit for bit after the cast to float_dtype.
+    """
+    assert x.dtype == torch.uint8 and scale.dtype == torch.uint8
+    codes = torch.stack((x & 0x0F, x >> 4), dim=-1).flatten(-2)
+    lut = torch.tensor(_E2M1_VALUES, dtype=torch.float32, device=x.device)
+    values = lut[(codes & 0x07).long()]
+    values = torch.where((codes & 0x08) != 0, -values, values)
+    values = values.unflatten(-1, (-1, 32))
+    # E8M0: 2^(e - 127); 0xFF is NaN.
+    exp = scale.to(torch.int32) - 127
+    factor = torch.exp2(exp.to(torch.float32))
+    factor = torch.where(scale == 0xFF, torch.nan, factor)
+    return (values * factor.unsqueeze(-1)).flatten(-2).to(float_dtype)
+
+
 def _dequant_mxfp4(
     x: torch.Tensor, scale: torch.Tensor, float_dtype: torch.dtype
 ) -> torch.Tensor:
     try:
         from quark.torch.kernel import mx
-    except ImportError as err:
-        raise ImportError(
-            "The package `amd-quark` is required to use "
-            "MX-FP4 models. Please install it with `pip install "
-            "amd-quark`."
-        ) from err
+    except ImportError:
+        return dequant_mxfp4_torch(x, scale, float_dtype)
 
     return mx.dq_mxfp4(x, scale, float_dtype)
 

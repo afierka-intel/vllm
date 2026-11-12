@@ -17,7 +17,9 @@ from vllm.model_executor.layers.quantization.utils.mxfp6_utils import (
     quant_dequant_mxfp6,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    FP8_DTYPE,
     QuantKey,
+    get_fp8_min_max,
     kMxfp4Dynamic,
     kMxfp4Static,
     kMxfp6E2M3Dynamic,
@@ -31,6 +33,7 @@ from .base import MxFp4LinearKernel, MxFp4LinearLayerConfig
 
 logger = init_logger(__name__)
 
+# MX activation formats; their quant-dequant needs amd-quark.
 _ACTIVATION_QUANT_DEQUANT_FUNCS: dict[
     QuantKey, Callable[[torch.Tensor], torch.Tensor]
 ] = {
@@ -40,19 +43,69 @@ _ACTIVATION_QUANT_DEQUANT_FUNCS: dict[
 }
 
 
+def quant_dequant_fp8_dynamic(
+    x: torch.Tensor, group_size: int, eps: float = 1e-10
+) -> torch.Tensor:
+    """Dynamic symmetric FP8 quant-dequant of x over groups of the last dim
+    (group_size == -1: one scale per token).
+
+    Same arithmetic as per_token_group_quant_fp8 with linear scales:
+    scale = max(amax, eps) / fp8_max, q = clamp(x / scale) cast to FP8.
+    """
+    fp8_min, fp8_max = get_fp8_min_max()
+    k = x.shape[-1]
+    g = k if group_size == -1 else group_size
+    assert k % g == 0, f"last dim {k} is not a multiple of group size {g}"
+    xg = x.float().unflatten(-1, (k // g, g))
+    scale = xg.abs().amax(dim=-1, keepdim=True).clamp(min=eps) * (1.0 / fp8_max)
+    q = (xg / scale).clamp(fp8_min, fp8_max).to(FP8_DTYPE)
+    return (q.float() * scale).flatten(-2).to(x.dtype)
+
+
+def _fp8_dynamic_group_size(key: QuantKey | None) -> int | None:
+    """Group size of a dynamic symmetric per-token / per-token-group FP8
+    activation key (-1 = per token), or None for any other key."""
+    if (
+        key is None
+        or key.dtype != FP8_DTYPE
+        or key.scale.dtype != torch.float32  # excludes MXFP8 (E8M0 scales)
+        or key.scale.static
+        or not key.symmetric
+        or key.scale2 is not None
+    ):
+        return None
+    rows, cols = key.scale.group_shape
+    if rows != 1 or cols == 0 or cols < -1:
+        return None
+    return cols
+
+
+def _activation_quant_dequant_func(
+    key: QuantKey | None,
+) -> Callable[[torch.Tensor], torch.Tensor] | None:
+    if key is None:
+        return lambda x: x
+    if key in _ACTIVATION_QUANT_DEQUANT_FUNCS:
+        return _ACTIVATION_QUANT_DEQUANT_FUNCS[key]
+    group_size = _fp8_dynamic_group_size(key)
+    if group_size is not None:
+        return partial(quant_dequant_fp8_dynamic, group_size=group_size)
+    return None
+
+
 class EmulationMxfp4LinearKernel(MxFp4LinearKernel):
-    """Software emulation fallback for OCP MXFP4/MXFP6 (dequant + F.linear)."""
+    """Software emulation fallback for MXFP4 weights (dequant + F.linear) with
+    unquantized, MXFP4/MXFP6 or dynamic per-token(-group) FP8 activations.
+
+    Activations get the requested quant-dequant, so the result keeps the
+    checkpoint's activation precision (e.g. W4A8 stays W4A8).
+    """
 
     def __init__(self, config: MxFp4LinearLayerConfig) -> None:
         super().__init__(config)
-        if config.activation_quant_key is None:
-            # no input Q/DQ for weight-only
-            qdq_fn: Callable[[torch.Tensor], torch.Tensor] = lambda x: x
-            self.quant_dequant_func = qdq_fn
-        else:
-            self.quant_dequant_func = _ACTIVATION_QUANT_DEQUANT_FUNCS[
-                config.activation_quant_key
-            ]
+        qdq = _activation_quant_dequant_func(config.activation_quant_key)
+        assert qdq is not None
+        self.quant_dequant_func = qdq
 
     @classmethod
     def is_supported(
@@ -66,21 +119,24 @@ class EmulationMxfp4LinearKernel(MxFp4LinearKernel):
         weight_key: QuantKey | None,
         activation_key: QuantKey | None,
     ) -> bool:
-        return weight_key == kMxfp4Static and (
-            activation_key is None or activation_key in _ACTIVATION_QUANT_DEQUANT_FUNCS
+        return (
+            weight_key == kMxfp4Static
+            and _activation_quant_dequant_func(activation_key) is not None
         )
 
     @classmethod
     def can_implement(cls, config: MxFp4LinearLayerConfig) -> tuple[bool, str | None]:
-        if config.activation_quant_key not in (
-            None,
-            kMxfp4Dynamic,
-            kMxfp6E3M2Dynamic,
-            kMxfp6E2M3Dynamic,
-        ):
-            return False, "only supports MXFP4 or MXFP6 or unquantized activations"
+        if _activation_quant_dequant_func(config.activation_quant_key) is None:
+            return False, (
+                "only supports MXFP4, MXFP6, dynamic per-token(-group) FP8 or "
+                "unquantized activations"
+            )
 
-        if not has_quark():
+        # Weight dequant has a PyTorch fallback; only the MX activation
+        # quant-dequant needs amd-quark.
+        if config.activation_quant_key in _ACTIVATION_QUANT_DEQUANT_FUNCS and (
+            not has_quark()
+        ):
             return False, "amd-quark package not available"
 
         if (

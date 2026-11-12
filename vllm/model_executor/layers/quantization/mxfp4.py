@@ -26,6 +26,7 @@ from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
     backend_to_kernel_cls,
     convert_gpt_oss_weight_to_mxfp4_moe_kernel_format,
     convert_weight_to_mxfp4_moe_kernel_format,
+    log_mxfp4_moe_activation,
     make_mxfp4_moe_kernel,
     make_mxfp4_moe_quant_config,
     mxfp4_round_up_hidden_size_and_intermediate_size,
@@ -682,6 +683,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.mxfp4_backend, self.experts_cls = select_deepseek_v4_mxfp4_moe_backend(
                 moe
             )
+            log_mxfp4_moe_activation(self.mxfp4_backend, activation_key)
 
         self.max_capture_size = moe.max_capture_size
 
