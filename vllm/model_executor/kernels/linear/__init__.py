@@ -980,11 +980,13 @@ def init_mxfp8_linear_kernel(
     platform = current_platform._enum
     possible: list[type[Mxfp8LinearKernel]]
     if bmm_batch_size is not None:
-        possible = (
-            [DeepGemmMxfp8BmmLinearKernel, EmulationMxfp8LinearKernel]
-            if current_platform.is_cuda()
-            else []
-        )
+        if current_platform.is_cuda():
+            possible = [DeepGemmMxfp8BmmLinearKernel, EmulationMxfp8LinearKernel]
+        elif current_platform.is_xpu():
+            # Prepares bmm_weight / bmm_scale for torch.ops.vllm.xpu_fp8_bmm.
+            possible = [XPUMxFp8LinearKernel]
+        else:
+            possible = []
     else:
         possible = list(_POSSIBLE_MXFP8_KERNELS.get(platform, []))
 
