@@ -2596,7 +2596,8 @@ SPARSE_INDEXER_EXPLICIT_BACKENDS = [
     pytest.param(
         "per_row",
         marks=pytest.mark.skipif(
-            not current_platform.is_cuda_alike(), reason="requires CUDA or ROCm"
+            not (current_platform.is_cuda_alike() or current_platform.is_xpu()),
+            reason="requires CUDA, ROCm or XPU",
         ),
     ),
     "torch",
@@ -2624,7 +2625,7 @@ SPARSE_INDEXER_EXPLICIT_BACKENDS = [
 ]
 
 
-@pytest.mark.parametrize("next_n", [1, 4])
+@pytest.mark.parametrize("next_n", [1, 2, 4])
 @pytest.mark.parametrize("backend", SPARSE_INDEXER_EXPLICIT_BACKENDS)
 @torch.inference_mode()
 def test_sparse_indexer_decode_topk_explicit_backends(
@@ -2637,27 +2638,28 @@ def test_sparse_indexer_decode_topk_explicit_backends(
     from vllm.model_executor.layers.indexer_topk import SparseIndexerTopk
 
     set_random_seed(0)
-    torch.set_default_device("cuda:0")
+    device = current_platform.device_type
+    torch.set_default_device(device)
 
     top_k = 2048
     batch_size = 4
     num_rows = batch_size * next_n
 
     # Per-row effective lens in the (B, next_n) "native spec decode" form.
-    row_ends = torch.randint(4000, 16000, (num_rows,), dtype=torch.int32, device="cuda")
+    row_ends = torch.randint(4000, 16000, (num_rows,), dtype=torch.int32, device=device)
     seq_lens = row_ends.reshape(batch_size, next_n)
     max_seq_len = int(row_ends.max())
     # Pad the stride: multiple of 4 for cooperative_topk (TMA) and
     # 1024B-aligned (256 fp32) for DeepSelect.
     stride = (max_seq_len + 255) // 256 * 256
 
-    row_starts = torch.zeros(num_rows, dtype=torch.int32, device="cuda")
+    row_starts = torch.zeros(num_rows, dtype=torch.int32, device=device)
 
-    logits = torch.randn(num_rows, stride, dtype=torch.float32, device="cuda")
-    col_idx = torch.arange(stride, device="cuda")
+    logits = torch.randn(num_rows, stride, dtype=torch.float32, device=device)
+    col_idx = torch.arange(stride, device=device)
     logits[col_idx[None, :] >= row_ends[:, None]] = 1e30  # dirty tail
 
-    indices = torch.full((num_rows, top_k), -2, dtype=torch.int32, device="cuda")
+    indices = torch.full((num_rows, top_k), -2, dtype=torch.int32, device=device)
     cfg = VllmConfig(kernel_config={"sparse_indexer_topk_backend": backend})
     with set_current_vllm_config(cfg):
         SparseIndexerTopk()(logits, seq_lens, next_n, indices, top_k, max_seq_len)
@@ -2665,7 +2667,7 @@ def test_sparse_indexer_decode_topk_explicit_backends(
 
     # k_i == top_k for every row here (row_ends >= 3997 > top_k).
     assert torch.all(indices >= 0)
-    torch_indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
+    torch_indices = torch.empty((num_rows, top_k), dtype=torch.int32, device=device)
     for i in range(num_rows):
         row_end = int(row_ends[i])
         torch_indices[i] = logits[i, :row_end].topk(top_k, dim=-1)[1]
@@ -2689,15 +2691,16 @@ def test_sparse_indexer_decode_topk_short_seq_lens(
     from vllm.model_executor.layers.indexer_topk import SparseIndexerTopk
 
     set_random_seed(0)
+    device = current_platform.device_type
     next_n = 4
     top_k = 512
     vocab = 8192  # 1024B-aligned rows for DeepSelect
     # 1D (B,) seq_lens: rows of a request share its len and each kernel
     # derives per-row ends (with clamping) itself.
-    seq_lens = torch.tensor([2, 6], dtype=torch.int32, device="cuda")
+    seq_lens = torch.tensor([2, 6], dtype=torch.int32, device=device)
     num_rows = 2 * next_n
-    logits = torch.randn(num_rows, vocab, dtype=torch.float32, device="cuda")
-    indices = torch.full((num_rows, top_k), -2, dtype=torch.int32, device="cuda")
+    logits = torch.randn(num_rows, vocab, dtype=torch.float32, device=device)
+    indices = torch.full((num_rows, top_k), -2, dtype=torch.int32, device=device)
 
     cfg = VllmConfig(kernel_config={"sparse_indexer_topk_backend": backend})
     with set_current_vllm_config(cfg):
