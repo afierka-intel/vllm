@@ -127,12 +127,15 @@ from .interfaces import (
 )
 from .utils import (
     PPMissingLayer,
+    compute_skip_topk_layers,
+    copy_pp_buffers,
     get_pp_missing_layer_names,
     get_spec_layer_idx_from_weight_name,
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
+    pp_topk_buffers,
 )
 
 logger = init_logger(__name__)
@@ -328,6 +331,14 @@ class DeepseekV2MoE(nn.Module):
             config.hidden_size,
             config.n_routed_experts,
             out_dtype=self.router_dtype,
+            # CUDA and ROCm get fp32 router logits from bf16 weights through the
+            # fp32-output GEMM tiers of GateLinear. Elsewhere it falls back to
+            # F.linear, which rounds the logits to bf16 before the cast, so keep
+            # the weight in fp32 there instead.
+            force_fp32_compute=(
+                self.router_dtype == torch.float32
+                and not current_platform.is_cuda_alike()
+            ),
             prefix=f"{prefix}.gate",
         )
         if getattr(config, "topk_method", None) == "noaux_tc":
@@ -1149,18 +1160,8 @@ class DeepseekV2MLAAttention(nn.Module):
         _skip_topk = False
         is_mtp_layer = False
         if self.is_v32:
-            _index_topk_freq = getattr(config, "index_topk_freq", 1)
-            _index_topk_pattern = getattr(config, "index_topk_pattern", None)
-            _index_skip_topk_offset = getattr(config, "index_skip_topk_offset", 2)
             layer_id = extract_layer_index(prefix)
-
-            if _index_topk_pattern is None:
-                _skip_topk = (
-                    max(layer_id - _index_skip_topk_offset + 1, 0) % _index_topk_freq
-                    != 0
-                )
-            elif 0 <= layer_id < len(_index_topk_pattern):
-                _skip_topk = _index_topk_pattern[layer_id] == "S"
+            _skip_topk = layer_id in compute_skip_topk_layers(config)
 
             # The skip pattern only governs backbone layers. MTP/nextn
             # layers (layer_id >= num_hidden_layers) always build a full
@@ -1500,8 +1501,17 @@ class DeepseekV2Model(nn.Module):
             self.norm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
+        # A later PP stage that starts on a layer reusing the shared top-k must
+        # receive it from the previous stage instead of reading a stale buffer.
+        self.pp_buffers = (
+            pp_topk_buffers(
+                config, topk_indices_buffer, range(config.num_hidden_layers)
+            )
+            if topk_indices_buffer is not None
+            else {}
+        )
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states", "residual"], self.hidden_size
+            ["hidden_states", "residual"], self.hidden_size, self.pp_buffers
         )
 
         self.aux_hidden_state_layers = tuple[int, ...]()
@@ -1541,6 +1551,7 @@ class DeepseekV2Model(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
+            copy_pp_buffers(intermediate_tensors, self.pp_buffers)
 
         # Compute llama 4 scaling once per forward pass if enabled
         llama_4_scaling_config = getattr(self.config, "llama_4_scaling", None)
@@ -1585,8 +1596,13 @@ class DeepseekV2Model(nn.Module):
             )
 
         if not get_pp_group().is_last_rank:
+            num_tokens = positions.shape[0]
             return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
+                {
+                    "hidden_states": hidden_states,
+                    "residual": residual,
+                    **{k: v[:num_tokens] for k, v in self.pp_buffers.items()},
+                }
             )
 
         if hidden_states.shape[0] != positions.shape[0]:
