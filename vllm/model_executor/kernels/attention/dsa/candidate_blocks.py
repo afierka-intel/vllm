@@ -169,7 +169,7 @@ def select_candidate_blocks(
     Row bounds are in packed column space; absent starts mean zero.
     Decode rows share bounds in groups of `row_repeat`. Output is -1 padded.
     """
-    assert logits.is_cuda
+    assert not logits.is_cpu  # Triton kernel: GPU tensors (CUDA, ROCm, XPU)
     rows, width = logits.shape
     if not rows:
         return
@@ -236,7 +236,7 @@ def apply_candidate_mask(
     row_repeat: int = 1,
 ) -> None:
     """Mask packed logits outside causal bounds and request-local candidates."""
-    assert logits.is_cuda
+    assert not logits.is_cpu  # Triton kernel: GPU tensors (CUDA, ROCm, XPU)
     rows, width = logits.shape
     if not rows or not width:
         return
