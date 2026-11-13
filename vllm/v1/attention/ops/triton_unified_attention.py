@@ -1160,10 +1160,9 @@ def unified_attention(
     elif sliding_window_val <= 0:
         chunk_lookback = -1
 
-    if use_td and q.element_size() == 1 and block_size % 32 != 0:
+    if q.element_size() == 1 and block_size % 32 != 0:
         raise ValueError(
-            "FP8 queries with use_td=True require block_size to be a multiple of 32 "
-            f"(got {block_size})."
+            f"FP8 queries require block_size to be a multiple of 32 (got {block_size})."
         )
 
     if is_xpu:
@@ -1182,13 +1181,11 @@ def unified_attention(
     elif rdna_prefill_tile is not None:
         TILE_SIZE_PREFILL = rdna_prefill_tile
 
-    # USE_TD requires BLOCK_SIZE % TILE_SIZE == 0 (enforced by a
-    # ``tl.static_assert`` in the kernel).  The default prefill tile
-    # size (32) is larger than a common ``block_size=16``, so clamp it
-    # down when TD is enabled.  Zero overhead when disabled.
-    if use_td:
-        TILE_SIZE_PREFILL = min(TILE_SIZE_PREFILL, block_size)
-        TILE_SIZE_DECODE = min(TILE_SIZE_DECODE, block_size)
+    # The kernel requires BLOCK_SIZE % TILE_SIZE == 0 (``tl.static_assert``)
+    # on every path.  The default CUDA prefill tile (32) is larger than the
+    # default ``block_size=16``, so clamp it down.
+    TILE_SIZE_PREFILL = min(TILE_SIZE_PREFILL, block_size)
+    TILE_SIZE_DECODE = min(TILE_SIZE_DECODE, block_size)
 
     # Tensor descriptors for Q load / output store require every element
     # of ``block_shape`` to be a power of 2.  ``num_queries_per_kv`` is

@@ -165,7 +165,7 @@ def use_3d_attention(
     tuned_large_head=False,
 ) -> bool:
     """Choose the execution path independently of offline configs."""
-    from vllm.v1.attention.ops.triton_unified_attention import MAX_3D_QUERY_LEN
+    from vllm.v1.attention.ops import triton_unified_attention as attention
 
     return not (
         seq_threshold_3D is None
@@ -176,7 +176,7 @@ def use_3d_attention(
         or (
             max_seqlen_q > 1
             and (
-                max_seqlen_q > MAX_3D_QUERY_LEN
+                max_seqlen_q > attention.MAX_3D_QUERY_LEN
                 or not use_causal
                 or use_per_seq_causal
                 or use_mm_prefix
@@ -184,7 +184,7 @@ def use_3d_attention(
             )
         )
         or num_seqs * -(-max_seqlen_q // block_q) > seq_threshold_3D
-        or is_batch_invariant
+        or attention.is_batch_invariant
         # Keep short-window attention on the optimized 2D path.
         or (is_xpu and 0 < sliding_window <= 1024)
     )
