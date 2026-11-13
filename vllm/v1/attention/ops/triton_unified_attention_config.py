@@ -342,13 +342,24 @@ def override_config(config: AttentionConfig | None):
         _override = previous
 
 
+_PROFILE_BACKENDS = ("xpu", "cuda")
+
+
+def _device_index(device) -> int:
+    import torch
+
+    if device.index is not None:
+        return device.index
+    return getattr(torch, device.type).current_device()
+
+
 @cache
-def _device_identity(index: int) -> dict:
+def _device_identity(backend: str, index: int) -> dict:
     import torch
     import triton
 
     return {
-        "device_name": torch.xpu.get_device_name(index),
+        "device_name": getattr(torch, backend).get_device_name(index),
         "triton_version": triton.__version__,
     }
 
@@ -357,10 +368,11 @@ def get_profile_identity(device) -> dict:
     import torch
 
     device = torch.device(device)
-    if device.type != "xpu":
-        raise ValueError("Offline attention profiles currently target XPU")
-    index = device.index if device.index is not None else torch.xpu.current_device()
-    return dict(_device_identity(index))
+    if device.type not in _PROFILE_BACKENDS:
+        raise ValueError(
+            f"Offline attention profiles target {_PROFILE_BACKENDS}, not {device.type}"
+        )
+    return dict(_device_identity(device.type, _device_index(device)))
 
 
 def profile_filename(identity: dict, static_key: AttentionStaticKey) -> str:
@@ -383,7 +395,7 @@ def profile_filename(identity: dict, static_key: AttentionStaticKey) -> str:
 
 
 def _parse_profile(
-    data: dict, device_name: str, static_key: AttentionStaticKey
+    data: dict, device_name: str, static_key: AttentionStaticKey, backend: str
 ) -> dict:
     if data["device_name"] != device_name or data["static_key"] != asdict(static_key):
         raise ValueError("profile device or static key mismatch")
@@ -403,7 +415,7 @@ def _parse_profile(
             AttentionConfig(**entry["config"]) if entry["config"] is not None else None
         )
         key = AttentionKey(**asdict(static_key), **asdict(dynamic))
-        if config is not None and not validate_config(config, key, "xpu"):
+        if config is not None and not validate_config(config, key, backend):
             raise ValueError("invalid attention config")
         anchors = tables.setdefault(dynamic.regime(), {}).setdefault(
             dynamic.num_seqs, {}
@@ -424,10 +436,12 @@ def _parse_profile(
 
 
 @cache
-def _load_profile(path: str, device_name: str, static_key: AttentionStaticKey) -> dict:
+def _load_profile(
+    path: str, device_name: str, static_key: AttentionStaticKey, backend: str
+) -> dict:
     try:
         with open(path) as source:
-            return _parse_profile(json.load(source), device_name, static_key)
+            return _parse_profile(json.load(source), device_name, static_key, backend)
     except FileNotFoundError:
         return {}
     except (OSError, KeyError, TypeError, ValueError) as error:
@@ -436,19 +450,22 @@ def _load_profile(path: str, device_name: str, static_key: AttentionStaticKey) -
 
 
 @cache
-def _profile_sources(index: int, static_key: AttentionStaticKey, folder: str | None):
-    identity = _device_identity(index)
+def _profile_sources(
+    backend: str, index: int, static_key: AttentionStaticKey, folder: str | None
+):
+    identity = _device_identity(backend, index)
     filename = profile_filename(identity, static_key)
     paths = [Path(folder) / filename] if folder else []
     paths.append(_BUNDLED_DIR / filename)
     return tuple(
-        _load_profile(str(path), identity["device_name"], static_key) for path in paths
+        _load_profile(str(path), identity["device_name"], static_key, backend)
+        for path in paths
     )
 
 
 @lru_cache(maxsize=4096)
-def _resolve_profile(key: AttentionKey, index: int, folder: str | None):
-    for tables in _profile_sources(index, key.static_key(), folder):
+def _resolve_profile(key: AttentionKey, backend: str, index: int, folder: str | None):
+    for tables in _profile_sources(backend, index, key.static_key(), folder):
         table = tables.get(key.regime())
         if table is None:
             continue
@@ -465,8 +482,8 @@ def _resolve_profile(key: AttentionKey, index: int, folder: str | None):
 
 
 @cache
-def _has_device_profiles(index: int, folder: str | None) -> bool:
-    device_name = _device_identity(index)["device_name"].replace(" ", "_")
+def _has_device_profiles(backend: str, index: int, folder: str | None) -> bool:
+    device_name = _device_identity(backend, index)["device_name"].replace(" ", "_")
     marker = f",dev={device_name},dt="
     directories = [Path(folder), _BUNDLED_DIR] if folder else [_BUNDLED_DIR]
     for directory in directories:
@@ -489,14 +506,13 @@ def needs_config_key(device) -> bool:
     """Skip profile work on devices without configs; always honor tuning overrides."""
     if _override is not _UNSET:
         return True
-    if device.type != "xpu":
+    if device.type not in _PROFILE_BACKENDS:
         return False
-    index = device.index
-    if index is None:
-        import torch
-
-        index = torch.xpu.current_device()
-    return _has_device_profiles(index, os.environ.get("VLLM_TUNED_CONFIG_FOLDER"))
+    return _has_device_profiles(
+        device.type,
+        _device_index(device),
+        os.environ.get("VLLM_TUNED_CONFIG_FOLDER"),
+    )
 
 
 def clear_profile_cache():
@@ -516,17 +532,24 @@ def resolve_config(key: AttentionKey, device, *, eligible: bool = True):
         ):
             raise ValueError("Forced attention config is invalid for this workload")
         return override
-    if not eligible or device.type != "xpu":
+    if not eligible or device.type not in _PROFILE_BACKENDS:
         return None
-    index = device.index
-    if index is None:
-        import torch
+    return _resolve_profile(
+        key,
+        device.type,
+        _device_index(device),
+        os.environ.get("VLLM_TUNED_CONFIG_FOLDER"),
+    )
 
-        index = torch.xpu.current_device()
-    return _resolve_profile(key, index, os.environ.get("VLLM_TUNED_CONFIG_FOLDER"))
 
-
-def write_profile(path, identity: dict, entries, *, static_key: AttentionStaticKey):
+def write_profile(
+    path,
+    identity: dict,
+    entries,
+    *,
+    static_key: AttentionStaticKey,
+    backend: str = "xpu",
+):
     data = dict(identity, static_key=asdict(static_key))
     data["entries"] = [
         {
@@ -535,7 +558,7 @@ def write_profile(path, identity: dict, entries, *, static_key: AttentionStaticK
         }
         for dynamic, config in entries
     ]
-    _parse_profile(data, identity["device_name"], static_key)
+    _parse_profile(data, identity["device_name"], static_key, backend)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")

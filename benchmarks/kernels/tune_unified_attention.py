@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-r"""Tune XPU attention with graph replay and export device-specific JSON configs.
+r"""Tune XPU/CUDA attention with graph replay and export device-specific JSON configs.
 
 Generate attention workloads from model configuration and requested batches.
 Measure candidates over three rounds using graph replay. Replay counts adapt
@@ -33,7 +33,8 @@ For variable-length batches, pass `--workloads workloads.json` with a JSON list:
 Each pair is [Q, KV]. The file replaces the sequence/batch range options;
 model properties still come from `--model`. No file is needed for CLI inputs.
 
-Set `VLLM_TRITON_USE_TD=0` for pointer loads; unset or `1` uses TD.
+Set `VLLM_TRITON_USE_TD=0` for pointer loads or `1` for TD. Unset follows the
+runtime default (TD on XPU, pointer loads elsewhere).
 Each run tunes one mode, with separate configs for TD and pointer loads.
 """
 
@@ -57,6 +58,7 @@ from vllm import envs
 from vllm.transformers_utils.config import get_config, get_hf_text_config
 from vllm.triton_utils import triton
 from vllm.utils.argparse_utils import FlexibleArgumentParser
+from vllm.v1.attention.backends.triton_attn import MIN_LAUNCH_GRID_SIZE_2D
 from vllm.v1.attention.ops import triton_unified_attention_config as runtime
 from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 
@@ -70,8 +72,10 @@ def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
-def candidate_configs(key):
+def candidate_configs(key, backend="xpu"):
     """Generate candidate configs before legality pruning."""
+    # grf_mode is an XPU-only launch option.
+    grf_modes = ("default", "256") if backend == "xpu" else (None,)
     # MAX preserves the model's full GQA group, including non-power-of-two ratios.
     heads = ["MAX"] + [
         h
@@ -92,7 +96,7 @@ def candidate_configs(key):
         for t in (16, 32, 64, 128)
         for w in (2, 4, 8, 16)
         for s in (1, 2, 3)
-        for g in ("default", "256")
+        for g in grf_modes
     ]
 
 
@@ -201,10 +205,14 @@ def model_workloads(args):
     dtype = "float8_e4m3fn" if dtype == "fp8" else dtype
     if dtype not in ("bfloat16", "float16", "float8_e4m3fn"):
         raise ValueError("Specify --dtype bfloat16, float16 or fp8 for this model")
-    use_td = envs.VLLM_TRITON_USE_TD is not False
+    use_td = envs.VLLM_TRITON_USE_TD
+    if use_td is None:
+        use_td = torch.device(args.device).type == "xpu"
     if args.block_size % (32 if dtype == "float8_e4m3fn" else 16):
         raise ValueError("block_size must be divisible by 16, or 32 for FP8")
     windows = model_windows(config, args.sliding_window)
+    # Same rule as the TRITON_ATTN backend (before CUDA-graph size snapping).
+    seq_threshold_3d = args.seq_threshold_3d or MIN_LAUNCH_GRID_SIZE_2D // kv_heads
     softcap = getattr(config, "attn_logit_softcapping", None) or 0.0
     softmax_scale = (
         getattr(config, "query_pre_attn_scalar", None) or head_size
@@ -238,7 +246,7 @@ def model_workloads(args):
                 "softmax_scale": softmax_scale,
                 "q_layout": args.q_layout,
                 "kv_layout": args.kv_layout,
-                "seq_threshold_3d": 32,
+                "seq_threshold_3d": seq_threshold_3d,
                 "num_segments": 16,
             }
         )
@@ -306,7 +314,7 @@ def grouped_cases(cases):
     return grouped
 
 
-def save_configs(winners, identity, output):
+def save_configs(winners, identity, output, backend):
     """Write winning configs to one JSON file per device and static key."""
     partitions = defaultdict(list)
     for key, winner in winners.items():
@@ -316,7 +324,9 @@ def save_configs(winners, identity, output):
     for static, entries in partitions.items():
         name = runtime.profile_filename(identity, static)
         destination = Path(output) / name
-        runtime.write_profile(destination, identity, entries, static_key=static)
+        runtime.write_profile(
+            destination, identity, entries, static_key=static, backend=backend
+        )
         profiles[name] = str(destination)
     return {"profiles": profiles, "accepted_keys": sum(map(len, partitions.values()))}
 
@@ -440,7 +450,7 @@ def benchmark_callable(fn, device):
         backend.synchronize(device)
         eager_ms = max((time.perf_counter_ns() - started) / 5e6, 1e-6)
         calls, warmup_replays = 10, 5
-    graph = backend.XPUGraph()
+    graph = backend.XPUGraph() if device.type == "xpu" else backend.CUDAGraph()
     try:
         with backend.graph(graph):
             for _ in range(calls):
@@ -514,7 +524,7 @@ def tune(args, workloads, device):
         # Prune invalid configs for this key.
         configs = (
             config
-            for config in candidate_configs(key)
+            for config in candidate_configs(key, device.type)
             if runtime.validate_config(
                 runtime.AttentionConfig(**config), key, device.type
             )
@@ -544,7 +554,7 @@ def tune(args, workloads, device):
             f"{config_id(winners[key])}",
             flush=True,
         )
-    return save_configs(winners, identity, args.save_dir)
+    return save_configs(winners, identity, args.save_dir, device.type)
 
 
 @torch.inference_mode()
@@ -649,6 +659,11 @@ def parse_args(argv=None):
         nargs="+",
         help="Override model windows; 0 selects full attention",
     )
+    parser.add_argument(
+        "--seq-threshold-3d",
+        type=int,
+        help="Max decode sequences on the 3D path (default: 128 // KV heads)",
+    )
     parser.add_argument("--q-layout", choices=("contiguous", "qkv"), default="qkv")
     parser.add_argument(
         "--kv-layout", choices=("contiguous", "interleaved"), default="interleaved"
@@ -690,9 +705,9 @@ def main(args: argparse.Namespace):
     print(args)
     workloads = model_workloads(args)
     device = torch.device(args.device)
-    if device.type != "xpu":
-        raise ValueError("XPU is currently the only supported device")
-    torch.xpu.set_device(device)
+    if device.type not in ("xpu", "cuda"):
+        raise ValueError("XPU and CUDA are the only supported devices")
+    getattr(torch, device.type).set_device(device)
     print(f"{'Tuning' if args.tune else 'Benchmarking'} {len(workloads)} workloads")
     started = time.perf_counter()
     if args.tune:
