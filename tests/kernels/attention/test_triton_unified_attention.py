@@ -176,7 +176,6 @@ def test_reduce_segments_ignores_empty_softmax_states(empty_state: str) -> None:
         32,
         torch.tensor([0, 1], dtype=torch.int32, device=DEVICE_TYPE),
         16,
-        16,
         False,
     )
     torch.testing.assert_close(
@@ -230,7 +229,6 @@ def test_reduce_segments_leaves_graph_padding_untouched(query_lens, seq_lens) ->
         32,
         32,
         query_starts,
-        16,
         16,
         False,
     )
