@@ -312,7 +312,7 @@ def test_prompt_logprobs_requests_keep_their_rows(state):
 @pytest.mark.parametrize("state", [2], indirect=True)
 def test_pcp_replay_keeps_global_tail_after_prefix_hit(state, monkeypatch):
     """The 128-row tail spans two owners; early segments keep no rows."""
-    import vllm.models.deepseek_v41.nvidia.model_state as module
+    import vllm.models.deepseek_v41.common.model_state as module
     from vllm.distributed.device_communicators.pynccl_wrapper import ncclDataTypeEnum
 
     def all_gather(tensor, dim):
@@ -444,7 +444,7 @@ def test_whole_batch_forwards_get_no_replay_batch(state):
 def dp_state(state, monkeypatch):
     """`state` on DP rank 0 of 2; `state.other` sets what rank 1 reports
     (trims, replay tokens)."""
-    import vllm.models.deepseek_v41.nvidia.model_state as module
+    import vllm.models.deepseek_v41.common.model_state as module
 
     state.vllm_config.parallel_config.data_parallel_size = 2
     state.vllm_config.parallel_config.data_parallel_rank = 0
@@ -487,7 +487,7 @@ def test_idle_dp_rank_dummy_trims_with_its_peers(dp_state):
 def test_zero_prefix_window_warms_gather_and_skips_pad(monkeypatch):
     """ROCm leaves the prefix-cache window at 0. Replay still needs replay_start
     and a warmed gather kernel. The pad kernel stays on the prefix-cache path."""
-    import vllm.models.deepseek_v41.nvidia.model_state as model_state
+    import vllm.models.deepseek_v41.common.model_state as model_state
 
     calls = {"pad_warmup": 0, "gather_warmup": 0, "pad_launch": 0}
 
@@ -621,7 +621,7 @@ def test_prefill_replays_only_the_prompt_tail(state):
 def test_skipped_tails_stay_out_of_graphs(override, min_remaining):
     """Chunks whose window reaches past the replayed tail must miss CUDA graphs: a
     chunk cut short runs with at least its prefill cap less every draft."""
-    from vllm.models.deepseek_v41.nvidia import model_state
+    from vllm.models.deepseek_v41.common import model_state
 
     config = SimpleNamespace(
         supports_multimodal_inputs=False,

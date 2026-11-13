@@ -782,12 +782,15 @@ def _check_dummy_hash_model_forward(
 ):
     """A metadata-less replica looks up dead rows, so it joins DP sharding and
     the memory profile sees the Engram activations."""
+    from vllm.models.deepseek_v41.common import model_base
     from vllm.models.deepseek_v41.common.engram import NgramHashState
 
     if current_platform.is_rocm():
         from vllm.models.deepseek_v41.amd import model as model_ops
     else:
         from vllm.models.deepseek_v41.nvidia import model as model_ops
+    # The NVIDIA model's forward lives in the shared base module.
+    forward_ops = model_ops if current_platform.is_rocm() else model_base
 
     dp_rank = vllm_config.parallel_config.data_parallel_rank
     if dp_shared_memory and dp_rank != 1:
@@ -848,7 +851,7 @@ def _check_dummy_hash_model_forward(
     )
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(
-            model_ops,
+            forward_ops,
             "get_pp_group",
             lambda: SimpleNamespace(
                 is_first_rank=True,

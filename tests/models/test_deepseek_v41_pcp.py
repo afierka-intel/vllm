@@ -9,6 +9,7 @@ import torch
 
 from vllm.forward_context import ForwardContext, override_forward_context
 from vllm.models.deepseek_v41 import attention as attention_module
+from vllm.models.deepseek_v41.common import model_base as base_module
 from vllm.models.deepseek_v41.compressor import CompressorStateCache
 from vllm.models.deepseek_v41.decoder_replay_layers import (
     DecoderReplayLayers,
@@ -162,19 +163,18 @@ def test_pcp_gathers_routing_ids_once_after_local_input_preparation(
     """Embedding keeps local IDs; all decoder layers receive aligned routing IDs."""
     gather = Mock(side_effect=lambda ids, dim: torch.cat([ids] * pcp_size, dim=dim))
     monkeypatch.setattr(
-        model_module, "get_pcp_group", lambda: SimpleNamespace(all_gather=gather)
+        base_module, "get_pcp_group", lambda: SimpleNamespace(all_gather=gather)
     )
     monkeypatch.setattr(
-        model_module,
+        base_module,
         "get_pp_group",
         lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
     )
-    monkeypatch.setattr(model_module, "is_forward_context_available", lambda: False)
-    monkeypatch.setattr(model_module, "sp_shard", lambda tensor: tensor[::2])
+    monkeypatch.setattr(base_module, "is_forward_context_available", lambda: False)
+    monkeypatch.setattr(base_module, "sp_shard", lambda tensor: tensor[::2])
     monkeypatch.setattr(
-        model_module, "sp_all_gather", lambda tensor: tensor.repeat_interleave(2, dim=0)
+        base_module, "sp_all_gather", lambda tensor: tensor.repeat_interleave(2, dim=0)
     )
-    monkeypatch.setattr(model_module, "hc_collapse_triton", lambda hidden, mix: hidden)
     embed = Mock(side_effect=lambda ids: ids[:, None].float())
     run_layers = Mock(
         side_effect=lambda layer_ids, hidden, *args: (hidden, None, None, None, hidden)
@@ -194,6 +194,7 @@ def test_pcp_gathers_routing_ids_once_after_local_input_preparation(
         _mtp_hidden_buffer=None,
         _run_layers=run_layers,
         _collapse=lambda hidden, *args: hidden,
+        _hc_collapse=lambda hidden, mix: hidden,
         norm=lambda hidden: hidden,
     )
     for offset in (0, 10):
@@ -241,7 +242,7 @@ def test_pcp_replay_pads_inputs_and_scatters_only_real_rows(rows):
 def test_pcp_replay_gathers_compacted_routing_ids(monkeypatch):
     gather = Mock(side_effect=lambda ids, dim: ids.repeat(2))
     monkeypatch.setattr(
-        model_module, "get_pcp_group", lambda: SimpleNamespace(all_gather=gather)
+        base_module, "get_pcp_group", lambda: SimpleNamespace(all_gather=gather)
     )
     run_layers = Mock(side_effect=lambda _, hidden, *args: (hidden,) * 5)
     model = SimpleNamespace(

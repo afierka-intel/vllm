@@ -35,7 +35,12 @@ def test_stage_entry_injects_engram_before_mhc_pre(monkeypatch):
         mhc_pre_calls.append((residual, pre_mix))
         raise StopAfterMhcPre
 
-    layer = SimpleNamespace(
+    # A bare layer: forward and its mHC seam hooks come from the class.
+    layer = model_module.DeepseekV4DecoderLayer.__new__(
+        model_module.DeepseekV4DecoderLayer
+    )
+    torch.nn.Module.__init__(layer)
+    vars(layer).update(
         mhc_stream=None,
         engram=Engram(),
         hc_attn_fn=None,

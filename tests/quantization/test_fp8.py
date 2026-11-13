@@ -159,6 +159,7 @@ def test_deepseek_v41_mxfp8_scale_loading(
         RowParallelLinear,
     )
     from vllm.models.deepseek_v41 import quant_config as quant_module
+    from vllm.models.deepseek_v41.common import model_base as model_base_module
     from vllm.models.deepseek_v41.nvidia import model as model_module
 
     default_vllm_config.model_config = SimpleNamespace(dtype=torch.bfloat16)
@@ -166,7 +167,7 @@ def test_deepseek_v41_mxfp8_scale_loading(
         is_checkpoint_fp8_serialized=True, weight_block_size=[32, 32]
     )
     quant_config._resolved_expert_dtype = "fp4"
-    for module in (model_module, linear_module):
+    for module in (model_base_module, linear_module):
         monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 2)
     monkeypatch.setattr(
         linear_module, "get_tensor_model_parallel_rank", lambda: tp_rank
