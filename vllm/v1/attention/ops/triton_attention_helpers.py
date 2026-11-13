@@ -68,7 +68,7 @@ def resolve_seq_and_query_len(
     """
     # find_seq_idx is defined below; forward use is fine inside @triton.jit.
     seq_idx = find_seq_idx(
-        query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True
+        query_start_len_ptr, q_block_global_idx, num_seqs, True, BLOCK_Q
     )
     q_block_start_idx = tl.load(query_start_len_ptr + seq_idx) // BLOCK_Q + seq_idx
     q_block_local_idx = q_block_global_idx - q_block_start_idx
@@ -84,8 +84,8 @@ def find_seq_idx(
     query_start_len_ptr,
     target_idx,
     num_seqs,
-    BLOCK_Q: tl.constexpr,
     use_q_block_mode: tl.constexpr,
+    BLOCK_Q: tl.constexpr = -1,
 ):
     """Binary search over the cumulative query-length prefix.
 
@@ -95,6 +95,10 @@ def find_seq_idx(
     we search the plain cumulative-length prefix (used by
     `reduce_segments` which iterates over raw query tokens).
     """
+    tl.static_assert(
+        (not use_q_block_mode) or BLOCK_Q > 0,
+        "BLOCK_Q must be provided when use_q_block_mode=True",
+    )
     left: tl.int32 = 0
     right = num_seqs
     while left < right:
