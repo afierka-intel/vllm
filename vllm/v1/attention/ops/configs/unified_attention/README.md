@@ -1,9 +1,12 @@
+# Unified attention offline-tuned configs
+
 This directory contains offline-tuned configurations for the unified attention kernel.
 Each JSON file covers one device name and static attention key.
 
 Static keys are: Q/K/V and output dtypes, head size, query heads per KV head, KV block size, tensor-descriptor usage, KV quantization mode, sliding window size, and softcap usage.
 
 Example filename:
+
 ```text
 H=128,G=16,B=16,dev=Intel(R)_Arc(TM)_B580_Graphics,dt=401736f1,td=1,kq=0,sc=0,w=0.json
 ```

@@ -426,7 +426,9 @@ def kernel_unified_attention(
     MM_PREFIX_CLAMP_SW: tl.constexpr = False,
     HEADS_PER_PROGRAM: tl.constexpr = 0,
 ):
-    tl.static_assert(BLOCK_SIZE % TILE_SIZE == 0, "BLOCK_SIZE must be multiple of TILE_SIZE")
+    tl.static_assert(
+        BLOCK_SIZE % TILE_SIZE == 0, "BLOCK_SIZE must be multiple of TILE_SIZE"
+    )
     tl.static_assert(BLOCK_SIZE >= TILE_SIZE, "BLOCK_SIZE must be >= TILE_SIZE")
 
     heads_per_program: tl.constexpr = (
@@ -704,8 +706,9 @@ def kernel_unified_attention(
         M, L, P, alpha = softmax_step(S, M, L)
         acc = acc * alpha[:, None]
 
-        # In the upstream there is an additional zeroing of V for tokens outside of the sliding window which is redundant.
-        # Adding it decreases performance for sliding window case
+        # Upstream additionally zeroes V for tokens outside the sliding
+        # window; that is redundant with the S mask and slows down the
+        # sliding-window case, so it is omitted here.
         if USE_PER_TOKEN_HEAD_SCALES:
             # Per-token-head quant: apply v_scale to P instead of V.
             P_v = (P * v_token_head_scales[None, :]).to(V.dtype)
@@ -1437,7 +1440,8 @@ def unified_attention(
             softmax_segm_max=softmax_segm_max,
             softmax_segm_expsum=softmax_segm_expsum,
         )
-        # Dtypes match the static key; keep uncalibrated features and layouts on fallback.
+        # Dtypes match the static key; keep uncalibrated features and
+        # layouts on fallback.
         profile_eligible = (
             use_causal
             and not use_per_seq_causal
@@ -1477,9 +1481,7 @@ def unified_attention(
             grid += (num_segments,)
 
     assert tile_size <= block_size, "TILE_SIZE must be <= block_size"
-    assert block_size % tile_size == 0, (
-        "block_size must be multiple of TILE_SIZE"
-    )
+    assert block_size % tile_size == 0, "block_size must be multiple of TILE_SIZE"
 
     kernel_unified_attention[grid](
         output_ptr=out,

@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, fields
 from functools import cache, lru_cache
 from pathlib import Path
+from typing import Any, cast
 
 from vllm import envs
 
@@ -35,11 +36,11 @@ class AttentionConfig:
         return (
             num_queries_per_kv
             if self.heads_per_program == "MAX"
-            else self.heads_per_program
+            else int(self.heads_per_program)
         )
 
     def launch_kwargs(self, backend: str) -> dict:
-        options = {
+        options: dict[str, Any] = {
             "num_warps": self.num_warps,
             "num_stages": self.num_stages,
         }
@@ -290,8 +291,7 @@ def validate_config(config: AttentionConfig, key: AttentionKey, backend: str) ->
     ):
         return False
     if config.heads_per_program != "MAX" and (
-        type(config.heads_per_program) is not int
-        or config.heads_per_program <= 0
+        type(config.heads_per_program) is not int or config.heads_per_program <= 0
     ):
         return False
     heads = config.get_heads_per_program(key.num_queries_per_kv)
@@ -387,7 +387,7 @@ def _parse_profile(
 ) -> dict:
     if data["device_name"] != device_name or data["static_key"] != asdict(static_key):
         raise ValueError("profile device or static key mismatch")
-    tables = {}
+    tables: dict[tuple, Any] = {}
     for entry in data["entries"]:
         dynamic = AttentionDynamicKey(**entry["key"])
         if (
@@ -405,7 +405,9 @@ def _parse_profile(
         key = AttentionKey(**asdict(static_key), **asdict(dynamic))
         if config is not None and not validate_config(config, key, "xpu"):
             raise ValueError("invalid attention config")
-        anchors = tables.setdefault(dynamic.regime(), {}).setdefault(dynamic.num_seqs, {})
+        anchors = tables.setdefault(dynamic.regime(), {}).setdefault(
+            dynamic.num_seqs, {}
+        )
         if dynamic.query_work in anchors:
             raise ValueError("duplicate query-work point")
         anchors[dynamic.query_work] = config
@@ -477,7 +479,9 @@ def _has_device_profiles(index: int, folder: str | None) -> bool:
         except FileNotFoundError:
             continue
         except OSError as error:
-            logger.warning("Cannot inspect attention configs in %s: %s", directory, error)
+            logger.warning(
+                "Cannot inspect attention configs in %s: %s", directory, error
+            )
     return False
 
 
@@ -506,11 +510,12 @@ def clear_profile_cache():
 
 def resolve_config(key: AttentionKey, device, *, eligible: bool = True):
     if _override is not _UNSET:
-        if _override is not None and (
-            not eligible or not validate_config(_override, key, device.type)
+        override = cast(AttentionConfig | None, _override)
+        if override is not None and (
+            not eligible or not validate_config(override, key, device.type)
         ):
             raise ValueError("Forced attention config is invalid for this workload")
-        return _override
+        return override
     if not eligible or device.type != "xpu":
         return None
     index = device.index
