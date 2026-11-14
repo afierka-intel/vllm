@@ -12,6 +12,7 @@ from vllm.scalar_type import ScalarType
 from vllm.utils.flashinfer import (
     flashinfer_quant_nvfp4_8x4_sf_layout,
 )
+from vllm.utils.kernel_probe import kernel_usable
 
 logger = init_logger(__name__)
 
@@ -2065,13 +2066,133 @@ def wvSplitKQ(
 
 
 # moe
+def _moe_sum_torch(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    topk_ids: torch.Tensor | None = None,
+    expert_map: torch.Tensor | None = None,
+) -> None:
+    """Torch implementation of `_moe_C.moe_sum`.
+
+    Sums `input` [num_tokens, topk, d] over topk in fp32 into `output`. With
+    `topk_ids`, slots routed to a negative expert id, or to an expert that
+    `expert_map` maps to -1, are skipped.
+    """
+    if topk_ids is not None:
+        skip = topk_ids < 0
+        if expert_map is not None:
+            skip |= expert_map[topk_ids.clamp(min=0).long()] < 0
+        input = input.masked_fill(skip.unsqueeze(-1), 0)
+    output.copy_(input.sum(dim=1, dtype=torch.float32))
+
+
+def _moe_sum_usable() -> bool:
+    def make_input() -> torch.Tensor:
+        # Small integers: the fp32 sum is exact in bf16.
+        x = torch.arange(2 * 3 * 16, device=current_platform.device_type) % 7 - 3
+        return x.to(torch.bfloat16).view(2, 3, 16)
+
+    def run() -> torch.Tensor:
+        x = make_input()
+        out = x.new_empty(2, 16)
+        torch.ops._moe_C.moe_sum(x, out, None, None)
+        return out
+
+    def ref() -> torch.Tensor:
+        x = make_input()
+        out = x.new_empty(2, 16)
+        _moe_sum_torch(x, out)
+        return out
+
+    return kernel_usable("_moe_C.moe_sum", run, ref)
+
+
 def moe_sum(
     input: torch.Tensor,
     output: torch.Tensor,
     topk_ids: torch.Tensor | None = None,
     expert_map: torch.Tensor | None = None,
 ):
+    if current_platform.is_xpu() and not _moe_sum_usable():
+        _moe_sum_torch(input, output, topk_ids, expert_map)
+        return
     torch.ops._moe_C.moe_sum(input, output, topk_ids, expert_map)
+
+
+def _moe_align_block_size_torch(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    block_size: int,
+    sorted_token_ids: torch.Tensor,
+    experts_ids: torch.Tensor,
+    num_tokens_post_pad: torch.Tensor,
+    expert_map: torch.Tensor | None = None,
+) -> None:
+    """Torch implementation of `_moe_C.moe_align_block_size`.
+
+    Same output contract as the compiled op: the routes of each expert are
+    padded to a multiple of `block_size` with the sentinel `topk_ids.numel()`,
+    `experts_ids` holds the expert of each block and -1 for unused blocks,
+    and routes to an expert outside [0, num_experts), or mapped to -1 by
+    `expert_map`, are dropped. Routes keep their original order within an
+    expert. Free of host synchronization, so it can be graph-captured.
+    """
+    numel = topk_ids.numel()
+    device = topk_ids.device
+    expert = topk_ids.flatten().long()
+    valid = (expert >= 0) & (expert < num_experts)
+    if expert_map is not None:
+        local = expert_map[expert.clamp(0, num_experts - 1)].long()
+        valid &= local >= 0
+        expert = local
+    # Dropped routes go to the extra bucket `num_experts`, which sorts last.
+    expert = torch.where(valid, expert, num_experts)
+
+    counts = torch.zeros(num_experts + 1, dtype=torch.long, device=device)
+    counts.scatter_add_(0, expert, torch.ones_like(expert))
+    counts = counts[:num_experts]
+    padded_counts = (counts + block_size - 1) // block_size * block_size
+    padded_ends = padded_counts.cumsum(0)
+    num_tokens_post_pad.copy_(padded_ends[-1:])
+
+    # Rank of each route within its expert, shifted to the padded layout.
+    order = torch.argsort(expert, stable=True)
+    sorted_expert = expert[order]
+    bucket = sorted_expert.clamp(max=num_experts - 1)
+    shift = (padded_ends - padded_counts) - (counts.cumsum(0) - counts)
+    dest = torch.arange(numel, device=device) + shift[bucket]
+    # Dropped routes are written to a scratch slot past the end.
+    scratch = sorted_token_ids.numel()
+    dest = torch.where(sorted_expert < num_experts, dest, scratch)
+    out = torch.full((scratch + 1,), numel, dtype=torch.int32, device=device)
+    out[dest] = order.to(torch.int32)
+    sorted_token_ids.copy_(out[:scratch])
+
+    blocks = torch.arange(experts_ids.numel(), device=device)
+    block_expert = torch.searchsorted(padded_ends // block_size, blocks, right=True)
+    experts_ids.copy_(torch.where(block_expert < num_experts, block_expert, -1))
+
+
+def _moe_align_block_size_usable() -> bool:
+    def run(fn) -> list[torch.Tensor]:
+        # One route per expert and an empty expert, so the expected output
+        # does not depend on the order of routes within an expert.
+        topk_ids = torch.tensor(
+            [[2, 0], [3, 1]], dtype=torch.int32, device=current_platform.device_type
+        )
+        sorted_ids = topk_ids.new_full((24,), -2)
+        expert_ids = topk_ids.new_full((6,), -2)
+        num_post_pad = topk_ids.new_zeros(1)
+        fn(topk_ids, 5, 4, sorted_ids, expert_ids, num_post_pad, None)
+        # Compare only the entries the op defines; buffer tails are unspecified.
+        n = int(num_post_pad.item())
+        return [num_post_pad, sorted_ids[:n], expert_ids[: n // 4]]
+
+    return kernel_usable(
+        "_moe_C.moe_align_block_size",
+        lambda: run(torch.ops._moe_C.moe_align_block_size),
+        lambda: run(_moe_align_block_size_torch),
+    )
 
 
 def moe_align_block_size(
@@ -2087,7 +2208,12 @@ def moe_align_block_size(
     if current_platform.is_xpu():
         if scatter_idx is not None:
             raise NotImplementedError("scatter_idx is not supported on XPU")
-        torch.ops._moe_C.moe_align_block_size(
+        align = (
+            torch.ops._moe_C.moe_align_block_size
+            if _moe_align_block_size_usable()
+            else _moe_align_block_size_torch
+        )
+        align(
             topk_ids,
             num_experts,
             block_size,
