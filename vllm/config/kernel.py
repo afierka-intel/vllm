@@ -181,6 +181,8 @@ SparseIndexerTopkBackend = Literal[
     "aiter",
 ]
 
+SparseIndexerBackend = Literal["auto", "native", "triton"]
+
 FlashInferSparseMLAKernel = Literal["auto", "trtllm", "prims_ts"]
 
 # DeepGEMM consumes the DeepSeek-V4 MXFP4 checkpoint recipe. CuTeDSL is
@@ -385,6 +387,23 @@ class KernelConfig:
     kernel, avoiding a full FP32 logits copy.
     """
 
+    sparse_indexer_backend: SparseIndexerBackend = "auto"
+    """Implementation of the DSA sparse indexer operators other than top-k
+    (FP8 MQA logits and the indexer K cache ops) on XPU. Available options:
+
+    - "auto": Use the native kernels from vllm-xpu-kernels when a one-time
+      probe shows they work on the device, else the Triton kernels
+    - "native": Always use the native kernels
+    - "triton": Always use the Triton kernels
+
+    On XPU this also selects the MLA KV cache ops concat_and_cache_mla and
+    cp_gather_and_upconvert_fp8_kv_cache, whose portable implementation is
+    plain torch rather than Triton.
+
+    Other platforms only accept "auto". Explicit values raise RuntimeError
+    when their constraints are not met.
+    """
+
     flashinfer_sparse_mla_kernel: FlashInferSparseMLAKernel = "auto"
     """Kernel of the SM100 FLASHINFER_MLA_SPARSE backend for D576 sparse MLA.
     Available options:
@@ -465,6 +484,13 @@ class KernelConfig:
     @field_validator("sparse_indexer_topk_backend", mode="before")
     @classmethod
     def _normalize_sparse_indexer_topk_backend(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.lower().replace("-", "_")
+        return value
+
+    @field_validator("sparse_indexer_backend", mode="before")
+    @classmethod
+    def _normalize_sparse_indexer_backend(cls, value: Any) -> Any:
         if isinstance(value, str):
             return value.lower().replace("-", "_")
         return value

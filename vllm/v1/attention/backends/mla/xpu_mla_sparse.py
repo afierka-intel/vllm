@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import functools
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Optional
 
@@ -33,7 +32,6 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_convert_req_index_to_global_index,
 )
 from vllm.v1.attention.ops.xpu_mla_sparse import (
-    DS_MLA_ENTRY_BYTES,
     DS_MLA_NOPE_DIM,
     DS_MLA_PE_DIM,
     dequant_gather_ds_mla_rows,
@@ -48,29 +46,6 @@ logger = init_logger(__name__)
 # Rows of BF16 workspace (576 values each, ~1.1 KiB) one fp8_ds_mla attention
 # chunk may dequantize; a single request may exceed it (its whole context).
 FP8_DS_MLA_WORKSPACE_ROWS = 256 * 1024
-
-
-@functools.cache
-def xpu_supports_rope_free_fp8_ds_mla() -> bool:
-    """Whether the installed XPU kernels accept pe_dim == 0 for fp8_ds_mla
-    (rope-free models such as GLM-5.3-Flash); vllm_xpu_kernels 0.1.17 does
-    not."""
-    from vllm import _custom_ops as ops
-
-    kv_c = torch.zeros((1, DS_MLA_NOPE_DIM), dtype=torch.bfloat16, device="xpu")
-    kv_cache = torch.zeros((1, 1, DS_MLA_ENTRY_BYTES), dtype=torch.uint8, device="xpu")
-    try:
-        ops.concat_and_cache_mla(
-            kv_c,
-            kv_c[:, :0],
-            kv_cache,
-            torch.zeros(1, dtype=torch.int64, device="xpu"),
-            kv_cache_dtype="fp8_ds_mla",
-            scale=torch.ones(1, dtype=torch.float32, device="xpu"),
-        )
-    except RuntimeError:
-        return False
-    return True
 
 
 def build_fp8_ds_mla_chunks(
@@ -353,13 +328,6 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata], SharedTopkIndices
                 raise ValueError(
                     "fp8_ds_mla KV cache on XPU needs kv_lora_rank=512, got "
                     f"{self.kv_lora_rank}."
-                )
-            if self.rope_dim == 0 and not xpu_supports_rope_free_fp8_ds_mla():
-                raise ValueError(
-                    "fp8_ds_mla KV cache for a rope-free MLA model needs a "
-                    "vllm_xpu_kernels build whose concat_and_cache_mla accepts "
-                    "pe_dim=0 (not available in 0.1.17). Use "
-                    "--kv-cache-dtype auto."
                 )
         elif is_quantized_kv_cache(kv_cache_dtype):
             raise ValueError(

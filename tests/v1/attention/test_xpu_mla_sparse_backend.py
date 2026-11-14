@@ -138,10 +138,13 @@ def test_xpu_sparse_rejects_unsupported_kv_cache_dtype_at_selection(kv_cache_dty
         assert path.endswith("XPUMLASparseBackend")
 
 
+@pytest.mark.parametrize("portable", [False, True])
 @pytest.mark.parametrize("pe_dim", [64, 0])
 @pytest.mark.parametrize("max_rows", [None, 300])
 @torch.inference_mode()
-def test_xpu_sparse_fp8_ds_mla_forward(pe_dim: int, max_rows: int | None):
+def test_xpu_sparse_fp8_ds_mla_forward(
+    pe_dim: int, max_rows: int | None, portable: bool, monkeypatch
+):
     """forward_mqa over an fp8_ds_mla cache equals sparse attention over the
     dequantized cache, and stays close to the BF16 KV it was written from.
 
@@ -149,6 +152,8 @@ def test_xpu_sparse_fp8_ds_mla_forward(pe_dim: int, max_rows: int | None):
     dequantized) and a prefill-like one (its whole context is gathered with
     cp_gather_and_upconvert_fp8_kv_cache); max_rows=300 splits it into
     several runs. pe_dim=0 is a rope-free model (zero RoPE envelope).
+    portable=True writes and gathers the cache with the torch implementations
+    instead of the SYCL ops.
     """
     import numpy as np
 
@@ -164,7 +169,6 @@ def test_xpu_sparse_fp8_ds_mla_forward(pe_dim: int, max_rows: int | None):
         XPUMLASparseImpl,
         XPUMLASparseMetadata,
         build_fp8_ds_mla_chunks,
-        xpu_supports_rope_free_fp8_ds_mla,
     )
     from vllm.v1.attention.ops.xpu_mla_sparse import DS_MLA_ENTRY_BYTES
 
@@ -176,6 +180,19 @@ def test_xpu_sparse_fp8_ds_mla_forward(pe_dim: int, max_rows: int | None):
         )
 
     device = torch.device("xpu")
+    torch_calls: dict[str, int] = {}
+    if portable:
+        from vllm.v1.attention.ops import xpu_mla_sparse as xpu_ops
+
+        monkeypatch.setattr(xpu_ops, "_mla_kv_cache_backend", "triton")
+        for op in ("concat_and_cache_mla", "cp_gather_and_upconvert_fp8_kv_cache"):
+            impl_fn = getattr(xpu_ops, f"{op}_torch")
+
+            def counted(*args, _op=op, _fn=impl_fn, **kwargs):
+                torch_calls[_op] = torch_calls.get(_op, 0) + 1
+                return _fn(*args, **kwargs)
+
+            monkeypatch.setattr(xpu_ops, f"{op}_torch", counted)
     torch.random.manual_seed(0)
     num_heads, topk, block_size, num_blocks = 64, 128, 64, 32
     dim_qk = 512 + pe_dim
@@ -201,10 +218,6 @@ def test_xpu_sparse_fp8_ds_mla_forward(pe_dim: int, max_rows: int | None):
         kv_lora_rank=512,
         qk_rope_head_dim=pe_dim,
     )
-    if pe_dim == 0 and not xpu_supports_rope_free_fp8_ds_mla():
-        with pytest.raises(ValueError, match="pe_dim=0"):
-            XPUMLASparseImpl(kv_cache_dtype="fp8_ds_mla", **impl_kwargs)
-        return
     impl = XPUMLASparseImpl(kv_cache_dtype="fp8_ds_mla", **impl_kwargs)
 
     # Each request owns a disjoint, shuffled set of blocks.
@@ -299,3 +312,8 @@ def test_xpu_sparse_fp8_ds_mla_forward(pe_dim: int, max_rows: int | None):
     ref_bf16, _, _, _ = reference_mla_sparse_prefill(q, bf16_kv, indices, scale, 512)
     rel = (out.float() - ref_bf16.float()).norm() / ref_bf16.float().norm()
     assert rel < 0.05, f"fp8 KV vs BF16 KV relative L2 {rel:.4f}"
+    if portable:
+        assert set(torch_calls) == {
+            "concat_and_cache_mla",
+            "cp_gather_and_upconvert_fp8_kv_cache",
+        }
