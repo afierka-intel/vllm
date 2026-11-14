@@ -2900,3 +2900,197 @@ def test_xpu_mxfp4_moe_with_fp8_checkpoint_activations(
     w2_ref = dq_mxfp4_torch(w2.cpu(), w2_s.cpu(), torch.bfloat16).to(dev)
     ref = torch_experts(a, w13_ref, w2_ref, topk_weights, topk_ids)
     torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
+
+
+def _fp8_group_qdq_input(num_tokens: int, hidden: int, device) -> torch.Tensor:
+    """Activations whose 128-wide groups differ in magnitude by up to 2^12, so
+    per-tensor and per-token-group FP8 scales give clearly different results."""
+    a = torch.randn(num_tokens, hidden // 128, 128, device=device)
+    exponent = (4 * torch.arange(hidden // 128, device=device)).clamp(max=12)
+    return (a * 2.0 ** -exponent[:, None]).flatten(1).to(torch.bfloat16)
+
+
+@pytest.mark.parametrize("block_shape", [[128, 128], None])
+def test_emulated_fp8_activation_qdq_honours_group_shape(block_shape, monkeypatch):
+    """Emulated dynamic FP8 activations use per-token-group (block_shape[1])
+    or per-token scales, without the compiled `scaled_fp8_quant` op."""
+    import vllm.model_executor.layers.fused_moe.utils as moe_utils
+    from vllm.model_executor.kernels.linear.mxfp4.emulation import (
+        quant_dequant_fp8_dynamic,
+    )
+
+    def fail(*args, **kwargs):
+        raise AssertionError("scaled_fp8_quant must not be called")
+
+    monkeypatch.setattr(moe_utils.ops, "scaled_fp8_quant", fail)
+    a = _fp8_group_qdq_input(16, 512, "cpu")
+    out, scale = moe_kernel_quantize_input(
+        a,
+        None,
+        current_platform.fp8_dtype(),
+        per_act_token_quant=block_shape is None,
+        block_shape=block_shape,
+        quantization_emulation=True,
+    )
+    group_size = -1 if block_shape is None else block_shape[1]
+    assert scale is None
+    torch.testing.assert_close(
+        out, quant_dequant_fp8_dynamic(a, group_size), atol=0, rtol=0
+    )
+    if block_shape is not None:
+        # Each group is scaled to its own amax: the error stays within half an
+        # E4M3 ulp (3 mantissa bits) of that amax, also in the small groups.
+        err = (out.float() - a.float()).abs().unflatten(-1, (-1, 128))
+        group_amax = a.float().abs().unflatten(-1, (-1, 128)).amax(-1, keepdim=True)
+        assert (err <= group_amax * 2**-4).all()
+
+
+def test_mxfp4_w4a8_moe_quant_config_activation_shape():
+    from vllm.model_executor.layers.fused_moe.config import (
+        mxfp4_w4a8_moe_quant_config,
+    )
+
+    w_scale = torch.empty(0, dtype=torch.uint8)
+    per_tensor = mxfp4_w4a8_moe_quant_config(w_scale, w_scale)
+    assert per_tensor.block_shape is None and not per_tensor.per_act_token_quant
+    per_token = mxfp4_w4a8_moe_quant_config(w_scale, w_scale, per_act_token_quant=True)
+    assert per_token.block_shape is None and per_token.per_act_token_quant
+    group = mxfp4_w4a8_moe_quant_config(w_scale, w_scale, block_shape=[128, 128])
+    assert group.block_shape == [128, 128] and not group.per_act_token_quant
+    for config in (per_tensor, per_token, group):
+        assert config.ocp_mx_scheme == OCP_MX_Scheme.w_mxfp4_a_fp8
+
+
+def test_mxfp4_emulation_requires_amd_quark_only_for_mx_activations(monkeypatch):
+    import vllm.model_executor.layers.fused_moe.experts.ocp_mx_emulation_moe as emu
+    import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kFp8Dynamic128Sym,
+        kMxfp4Dynamic,
+        kMxfp4Static,
+    )
+
+    monkeypatch.setattr(emu, "has_quark", lambda: False)
+    # Isolate the amd-quark check from the device and config checks.
+    monkeypatch.setattr(
+        emu.TritonExperts, "is_supported_config", staticmethod(lambda **_: (True, None))
+    )
+
+    def supported(activation_key):
+        return emu.OCP_MXQuantizationEmulationTritonExperts.is_supported_config(
+            emu.OCP_MXQuantizationEmulationTritonExperts,
+            None,
+            kMxfp4Static,
+            activation_key,
+            mk.FusedMoEActivationFormat.Standard,
+        )[0]
+
+    assert supported(None)
+    assert supported(kFp8Dynamic128Sym)
+    assert not supported(kMxfp4Dynamic)
+
+
+@pytest.mark.skipif(
+    not (current_platform.is_cuda_alike() or current_platform.is_xpu()),
+    reason="Triton MoE kernels need a GPU",
+)
+@pytest.mark.parametrize("num_tokens", [1, 33])
+@torch.inference_mode()
+def test_mxfp4_emulation_moe_w4a8_group_fp8_without_amd_quark(
+    num_tokens, monkeypatch, default_vllm_config, workspace_init
+):
+    """Explicit `moe_backend="emulation"` for MXFP4 experts with dynamic
+    per-token-group-128 FP8 activations (compressed-tensors W4A8, e.g.
+    RedHatAI GLM-5.3-MXFP4xFP8) without amd-quark: MXFP4 weights dequantized
+    in PyTorch and activations fake-quantized with 128-wide group scales."""
+    import vllm.model_executor.layers.fused_moe.experts.ocp_mx_emulation_moe as emu
+    import vllm.model_executor.layers.fused_moe.utils as moe_utils
+    import vllm.model_executor.layers.quantization.utils.mxfp4_utils as mxfp4_utils
+    from tests.quantization.reference_mxfp4 import dq_mxfp4_torch
+    from vllm.model_executor.kernels.linear.mxfp4.emulation import (
+        quant_dequant_fp8_dynamic,
+    )
+    from vllm.model_executor.layers.activation import SiluAndMul
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
+        Mxfp4MoeBackend,
+        make_mxfp4_moe_kernel,
+    )
+    from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kFp8Dynamic128Sym,
+    )
+
+    def fail(*args, **kwargs):
+        raise AssertionError("scaled_fp8_quant must not be called")
+
+    monkeypatch.setattr(emu, "has_quark", lambda: False)
+    monkeypatch.setattr(emu, "dequant_mxfp4", mxfp4_utils.dequant_mxfp4_torch)
+    monkeypatch.setattr(moe_utils.ops, "scaled_fp8_quant", fail)
+
+    e, topk, hidden, inter, dev = 8, 2, 512, 256, current_platform.device_type
+    moe_config = replace(
+        make_dummy_moe_config(
+            num_experts=e,
+            experts_per_token=topk,
+            hidden_dim=hidden,
+            intermediate_size=inter,
+        ),
+        moe_backend="emulation",
+    )
+    method = Mxfp4MoEMethod(moe_config, activation_key=kFp8Dynamic128Sym)
+    assert method.mxfp4_backend == Mxfp4MoeBackend.EMULATION
+
+    torch.manual_seed(0)
+    w13, w2 = (
+        torch.randint(0, 256, (e, n, k // 2), dtype=torch.uint8, device=dev)
+        for n, k in ((2 * inter, hidden), (hidden, inter))
+    )
+    w13_s, w2_s = (
+        torch.randint(118, 124, (e, n, k // 32), dtype=torch.uint8, device=dev)
+        for n, k in ((2 * inter, hidden), (hidden, inter))
+    )
+    quant_config = method.get_fused_moe_quant_config(
+        types.SimpleNamespace(w13_weight_scale=w13_s, w2_weight_scale=w2_s)
+    )
+    assert quant_config is not None
+    assert quant_config.ocp_mx_scheme == OCP_MX_Scheme.w_mxfp4_a_fp8
+    assert quant_config.block_shape == [128, 128]
+    kernel = make_mxfp4_moe_kernel(
+        quant_config, moe_config, method.experts_cls, method.mxfp4_backend
+    )
+
+    a = _fp8_group_qdq_input(num_tokens, hidden, dev)
+    scores = torch.randn(num_tokens, e, device=dev)
+    topk_weights, topk_ids = scores.softmax(-1).topk(topk)
+    out = kernel.apply(
+        hidden_states=a,
+        w1=w13,
+        w2=w2,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids.to(torch.int32),
+        activation=MoEActivation.SILU,
+        global_num_experts=e,
+        expert_map=None,
+        apply_router_weight_on_input=False,
+    )
+
+    w13_ref = dq_mxfp4_torch(w13.cpu(), w13_s.cpu(), torch.bfloat16).to(dev)
+    w2_ref = dq_mxfp4_torch(w2.cpu(), w2_s.cpu(), torch.bfloat16).to(dev)
+
+    # Reference: BF16 experts on the dequantized weights, both GEMM inputs
+    # fake-quantized to FP8 with one scale per 128 elements of a row.
+    ref = torch.zeros_like(a, dtype=torch.float32)
+    a_q = quant_dequant_fp8_dynamic(a, 128)
+    for j in range(topk):
+        for expert in range(e):
+            rows = topk_ids[:, j] == expert
+            if not rows.any():
+                continue
+            h = SiluAndMul.forward_native(a_q[rows] @ w13_ref[expert].t())
+            y = quant_dequant_fp8_dynamic(h, 128) @ w2_ref[expert].t()
+            ref[rows] += topk_weights[rows, j, None] * y.float()
+
+    # BF16 GEMMs on both sides; the tolerance covers BF16 rounding of the
+    # outputs and rare one-ulp E4M3 flips of intermediate values.
+    torch.testing.assert_close(out, ref.to(torch.bfloat16), atol=2e-2, rtol=2e-2)
