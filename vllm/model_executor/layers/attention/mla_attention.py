@@ -574,6 +574,13 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         # Initialize KV cache quantization attributes
         self.kv_cache_dtype = kv_cache_dtype
         _init_kv_cache_quant(self, quant_config, prefix)
+        if current_platform.is_xpu():
+            # Probe the KV cache ops now, not under graph capture.
+            from vllm.v1.attention.ops.xpu_mla_sparse import (
+                prepare_xpu_mla_kv_cache_ops,
+            )
+
+            prepare_xpu_mla_kv_cache_ops(kv_cache_dtype, self.qk_rope_head_dim)
 
         if (
             cache_config is not None

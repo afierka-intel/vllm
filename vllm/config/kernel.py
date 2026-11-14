@@ -396,6 +396,10 @@ class KernelConfig:
     - "native": Always use the native kernels
     - "triton": Always use the Triton kernels
 
+    On XPU this also selects the MLA KV cache ops concat_and_cache_mla and
+    cp_gather_and_upconvert_fp8_kv_cache, whose portable implementation is
+    plain torch rather than Triton.
+
     Other platforms only accept "auto". Explicit values raise RuntimeError
     when their constraints are not met.
     """
