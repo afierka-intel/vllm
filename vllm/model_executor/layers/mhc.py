@@ -104,6 +104,82 @@ def _apply_mhc_norm(
     return ir.ops.rms_norm(layer_input, norm_weight, norm_eps)
 
 
+def _mhc_probe_inputs(num_tokens: int) -> dict[str, torch.Tensor]:
+    # Small-scale random inputs, generated on CPU so that probing does not
+    # advance the device RNG.
+    hc_mult, hidden_size = 4, 4096
+    mix_hc = (2 + hc_mult) * hc_mult
+    gen = torch.Generator().manual_seed(0)
+    shapes = {
+        "x": ((num_tokens, hidden_size), 1.0, torch.bfloat16),
+        "residual": ((num_tokens, hc_mult, hidden_size), 1.0, torch.bfloat16),
+        "post_layer_mix": ((num_tokens, hc_mult, 1), 1.0, torch.float32),
+        "comb_res_mix": ((num_tokens, hc_mult, hc_mult), 0.25, torch.float32),
+        "fn": ((mix_hc, hc_mult * hidden_size), 1e-4, torch.float32),
+        "hc_scale": ((3,), 0.1, torch.float32),
+        "hc_base": ((mix_hc,), 0.1, torch.float32),
+    }
+    return {
+        name: (torch.randn(shape, generator=gen) * scale).to(
+            device=current_platform.device_type, dtype=dtype
+        )
+        for name, (shape, scale, dtype) in shapes.items()
+    }
+
+
+def _mhc_probe_outputs(op_name: str, reference: bool) -> list[torch.Tensor]:
+    """Run the SYCL op `op_name` (or its torch reference) on probe inputs."""
+    # rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
+    hc_args = (1e-6, 1e-6, 1e-6, 2.0, 20)
+    outputs: list[torch.Tensor] = []
+    # Below 128 tokens the SYCL pre ops use a vector GEMV, from 128 tokens a
+    # split-K TF32 GEMM; probe both.
+    for num_tokens in (1, 128):
+        t = _mhc_probe_inputs(num_tokens)
+        pre_args = (t["fn"], t["hc_scale"], t["hc_base"], *hc_args)
+        post_args = (t["x"], t["residual"], t["post_layer_mix"], t["comb_res_mix"])
+        if op_name == "mhc_pre":
+            outputs += (
+                mhc_kernels.mhc_pre_torch(t["residual"], *pre_args)
+                if reference
+                else torch.ops._xpu_C.mhc_pre(t["residual"], *pre_args)
+            )
+        elif op_name == "mhc_post":
+            outputs.append(
+                mhc_kernels.mhc_post_torch(*post_args)
+                if reference
+                else torch.ops._xpu_C.mhc_post(*post_args)
+            )
+        elif reference:
+            residual = mhc_kernels.mhc_post_torch(*post_args)
+            outputs += [residual, *mhc_kernels.mhc_pre_torch(residual, *pre_args)]
+        else:
+            outputs += torch.ops._xpu_C.mhc_fused_post_pre(*post_args, *pre_args)
+    return outputs
+
+
+def _xpu_mhc_op_usable(op_name: str) -> bool:
+    """Whether the SYCL op `torch.ops._xpu_C.<op_name>` works on this device.
+
+    vllm-xpu-kernels can be built without the mHC kernels
+    (`MHC_KERNELS_ENABLED=OFF`), and the kernels may not support every XPU,
+    so the op is run once and compared with the torch reference. Callers fall
+    back to forward_native when this returns False.
+    """
+    from vllm.utils.kernel_probe import kernel_usable
+
+    # A broken kernel is off by O(1). The tolerance covers one bf16 ulp of
+    # layer_input / residual (2^-8 relative) and the TF32 gate projection
+    # (10-bit mantissa) of the split-K path.
+    return kernel_usable(
+        f"_xpu_C.{op_name}",
+        lambda: _mhc_probe_outputs(op_name, reference=False),
+        lambda: _mhc_probe_outputs(op_name, reference=True),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+
+
 # --8<-- [start:mhc_pre]
 @CustomOp.register("mhc_pre")
 class MHCPreOp(CustomOp):
@@ -118,6 +194,13 @@ class MHCPreOp(CustomOp):
     @classmethod
     def enabled(cls) -> bool:
         return True
+
+    def __init__(self) -> None:
+        super().__init__()
+        # Probe the SYCL op at model construction: probing is not allowed
+        # under torch.compile tracing or graph capture.
+        if self._forward_method == self.forward_xpu:
+            _xpu_mhc_op_usable("mhc_pre")
 
     def forward_cuda(
         self,
@@ -199,7 +282,7 @@ class MHCPreOp(CustomOp):
                 norm_eps,
             )
         else:
-            post_mix, comb_mix, layer_input = self.forward_native(
+            return self.forward_native(
                 residual,
                 fn,
                 hc_scale,
@@ -212,11 +295,6 @@ class MHCPreOp(CustomOp):
                 n_splits,
                 norm_weight,
                 norm_eps,
-            )
-            return (
-                post_mix,
-                comb_mix,
-                _apply_mhc_norm(layer_input, norm_weight, norm_eps),
             )
 
     def forward_native(
@@ -234,7 +312,7 @@ class MHCPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return mhc_kernels.mhc_pre_torch(
+        post_mix, comb_mix, layer_input = mhc_kernels.mhc_pre_torch(
             residual,
             fn,
             hc_scale,
@@ -245,6 +323,9 @@ class MHCPreOp(CustomOp):
             hc_post_mult_value,
             sinkhorn_repeat,
         )
+        # mhc_pre_torch returns the raw residual mix; the fused kernels return
+        # it normalized, so apply the layer RMSNorm here.
+        return post_mix, comb_mix, _apply_mhc_norm(layer_input, norm_weight, norm_eps)
 
     def forward_xpu(
         self,
@@ -261,6 +342,21 @@ class MHCPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if not _xpu_mhc_op_usable("mhc_pre"):
+            return self.forward_native(
+                residual,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
+                norm_weight,
+                norm_eps,
+            )
         post_mix, comb_mix, layer_input = torch.ops._xpu_C.mhc_pre(
             residual,
             fn,
@@ -577,6 +673,13 @@ class MHCPostOp(CustomOp):
     def enabled(cls) -> bool:
         return True
 
+    def __init__(self) -> None:
+        super().__init__()
+        # Probe the SYCL op at model construction: probing is not allowed
+        # under torch.compile tracing or graph capture.
+        if self._forward_method == self.forward_xpu:
+            _xpu_mhc_op_usable("mhc_post")
+
     def forward_cuda(
         self,
         x: torch.Tensor,
@@ -630,6 +733,8 @@ class MHCPostOp(CustomOp):
         post_layer_mix: torch.Tensor,
         comb_res_mix: torch.Tensor,
     ) -> torch.Tensor:
+        if not _xpu_mhc_op_usable("mhc_post"):
+            return self.forward_native(x, residual, post_layer_mix, comb_res_mix)
         return torch.ops._xpu_C.mhc_post(
             x,
             residual,
@@ -782,6 +887,13 @@ class MHCFusedPostPreOp(CustomOp):
     def enabled(cls) -> bool:
         return True
 
+    def __init__(self) -> None:
+        super().__init__()
+        # Probe the SYCL op at model construction: probing is not allowed
+        # under torch.compile tracing or graph capture.
+        if self._forward_method == self.forward_xpu:
+            _xpu_mhc_op_usable("mhc_fused_post_pre")
+
     def forward_cuda(
         self,
         x: torch.Tensor,
@@ -881,7 +993,7 @@ class MHCFusedPostPreOp(CustomOp):
                 norm_weight,
                 norm_eps,
             )
-        residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur = self.forward_native(
+        return self.forward_native(
             x,
             residual,
             post_layer_mix,
@@ -898,12 +1010,6 @@ class MHCFusedPostPreOp(CustomOp):
             tile_n,
             norm_weight,
             norm_eps,
-        )
-        return (
-            residual_cur,
-            post_mix_cur,
-            comb_mix_cur,
-            _apply_mhc_norm(layer_input_cur, norm_weight, norm_eps),
         )
 
     def forward_native(
@@ -940,7 +1046,13 @@ class MHCFusedPostPreOp(CustomOp):
             hc_post_mult_value,
             sinkhorn_repeat,
         )
-        return residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur
+        # Same normalization contract as MHCPreOp.forward_native.
+        return (
+            residual_cur,
+            post_mix_cur,
+            comb_mix_cur,
+            _apply_mhc_norm(layer_input_cur, norm_weight, norm_eps),
+        )
 
     def forward_xpu(
         self,
@@ -961,6 +1073,25 @@ class MHCFusedPostPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if not _xpu_mhc_op_usable("mhc_fused_post_pre"):
+            return self.forward_native(
+                x,
+                residual,
+                post_layer_mix,
+                comb_res_mix,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
+                tile_n,
+                norm_weight,
+                norm_eps,
+            )
         residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur = (
             torch.ops._xpu_C.mhc_fused_post_pre(
                 x,
