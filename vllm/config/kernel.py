@@ -536,6 +536,12 @@ class KernelConfig:
                 self.moe_backend, vllm_config.model_config.architectures
             )
         bind_passthrough_all2all_backend(self.moe_backend, vllm_config.parallel_config)
+        if self.sparse_indexer_backend != "auto" and not current_platform.is_xpu():
+            raise RuntimeError(
+                f"kernel_config.sparse_indexer_backend="
+                f"'{self.sparse_indexer_backend}' is only supported on XPU; "
+                "use 'auto' on this platform."
+            )
 
         platform_op_priority = current_platform.get_default_ir_op_priority(vllm_config)
         logger.debug(

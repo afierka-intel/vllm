@@ -1384,6 +1384,12 @@ class SparseAttnIndexer(CustomOp):
                 "Sparse Attention Indexer CUDA op requires DeepGEMM support in "
                 "the current vLLM environment."
             )
+        if current_platform.is_xpu():
+            from vllm._xpu_ops import configure_sparse_indexer_backend
+
+            configure_sparse_indexer_backend(
+                vllm_config.kernel_config.sparse_indexer_backend
+            )
 
         if vllm_config.kernel_config.enable_jit_warmup:
             from vllm.v1.attention.ops.common import (

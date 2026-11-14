@@ -12,6 +12,7 @@ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.kernel_probe import kernel_usable
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
@@ -366,6 +367,137 @@ def _xpu_fp8_bmm_fake(
     )
 
 
+# kernel_config.sparse_indexer_backend, set once by
+# configure_sparse_indexer_backend() while the indexer is built.
+_sparse_indexer_backend = "auto"
+
+
+def _mqa_logits_probe_inputs(paged: bool) -> tuple:
+    """Small FP8 MQA logits inputs whose result is exact in fp32 for any
+    summation order: integer q/k in [-2, 2] and power-of-two scales/weights."""
+    dev = torch.device("xpu", torch.xpu.current_device())
+    fp8 = current_platform.fp8_dtype()
+    heads, dim = 64, 128
+
+    def ints(n: int, mul: int) -> torch.Tensor:
+        return (torch.arange(n, device=dev) * mul % 5 - 2).to(torch.float32)
+
+    def pow2(n: int, period: int) -> torch.Tensor:
+        exp = torch.arange(n, device=dev) % period
+        return torch.pow(2.0, -exp.to(torch.float32))
+
+    if not paged:
+        m, n = 4, 96
+        q = ints(m * heads * dim, 1).view(m, heads, dim).to(fp8)
+        k = ints(n * dim, 7).view(n, dim).to(fp8)
+        weights = pow2(m * heads, 4).view(m, heads)
+        weights[:, ::2] *= -1
+        ks = torch.tensor([0, 0, 10, 40], dtype=torch.int32, device=dev)
+        ke = torch.tensor([1, 50, 96, 70], dtype=torch.int32, device=dev)
+        return q, k, pow2(n, 3), weights, ks, ke
+
+    batch, next_n, block_size, max_blocks = 2, 2, 64, 2
+    num_blocks = batch * max_blocks
+    q = ints(batch * next_n * heads * dim, 1).to(fp8)
+    q = q.view(batch, next_n, heads, dim)
+    values = ints(num_blocks * block_size * dim, 7).to(fp8).view(torch.uint8)
+    scales = pow2(num_blocks * block_size, 3).view(torch.uint8)
+    kv_cache = torch.cat(
+        [values.view(num_blocks, -1), scales.view(num_blocks, -1)], dim=1
+    ).view(num_blocks, block_size, 1, dim + 4)
+    weights = pow2(batch * next_n * heads, 4).view(batch * next_n, heads)
+    weights[:, ::2] *= -1
+    context_lens = torch.tensor([100, 64], dtype=torch.int32, device=dev)
+    block_tables = torch.tensor([[2, 0], [3, 1]], dtype=torch.int32, device=dev)
+    max_model_len = max_blocks * block_size
+    return q, kv_cache, weights, context_lens, block_tables, max_model_len
+
+
+def _mqa_logits_probe_ref() -> torch.Tensor:
+    q, k, k_scale, weights, ks, ke = _mqa_logits_probe_inputs(paged=False)
+    score = torch.einsum("mhd,nd->mhn", q.float(), k.float()) * k_scale
+    logits = (score.relu() * weights[..., None]).sum(dim=1)
+    cols = torch.arange(k.shape[0], device=q.device)
+    in_range = (cols >= ks[:, None]) & (cols < ke[:, None])
+    return logits.masked_fill(~in_range, float("-inf"))
+
+
+def _paged_mqa_logits_probe_ref() -> torch.Tensor:
+    q, kv_cache, weights, context_lens, block_tables, max_model_len = (
+        _mqa_logits_probe_inputs(paged=True)
+    )
+    batch, next_n, heads, dim = q.shape
+    num_blocks, block_size = kv_cache.shape[:2]
+    kv_flat = kv_cache.view(num_blocks, -1)
+    values = kv_flat[:, : block_size * dim].view(current_platform.fp8_dtype())
+    scales = kv_flat[:, block_size * dim :].contiguous().view(torch.float32)
+    k = values.float().view(num_blocks, block_size, dim)[block_tables]
+    k_scale = scales.view(num_blocks, block_size)[block_tables]
+    score = torch.einsum(
+        "bnhd,bkd->bnhk", q.float(), k.view(batch, -1, dim)
+    ) * k_scale.view(batch, 1, 1, -1)
+    logits = (score.relu() * weights.view(batch, next_n, heads, 1)).sum(dim=2)
+    # Row (b, n) sees the keys before context_lens[b] - next_n + n + 1.
+    limit = context_lens[:, None] - next_n + 1
+    limit = limit + torch.arange(next_n, device=q.device)
+    cols = torch.arange(max_model_len, device=q.device)
+    logits = logits.masked_fill(cols >= limit[..., None], float("-inf"))
+    return logits.view(batch * next_n, max_model_len)
+
+
+def _mqa_logits_probe_run() -> torch.Tensor:
+    return torch.ops._xpu_C.fp8_mqa_logits(*_mqa_logits_probe_inputs(paged=False))
+
+
+def _paged_mqa_logits_probe_run() -> torch.Tensor:
+    q, kv_cache, weights, context_lens, block_tables, max_model_len = (
+        _mqa_logits_probe_inputs(paged=True)
+    )
+    return torch.ops._xpu_C.fp8_paged_mqa_logits(
+        q, kv_cache, weights, context_lens, block_tables, None, max_model_len
+    )
+
+
+# "<lib>.<op>" -> (run the native op, reference) on the probe inputs.
+_SPARSE_INDEXER_PROBES: dict[str, tuple[Callable, Callable]] = {
+    "_xpu_C.fp8_mqa_logits": (_mqa_logits_probe_run, _mqa_logits_probe_ref),
+    "_xpu_C.fp8_paged_mqa_logits": (
+        _paged_mqa_logits_probe_run,
+        _paged_mqa_logits_probe_ref,
+    ),
+}
+
+
+def configure_sparse_indexer_backend(backend: str) -> None:
+    """Apply kernel_config.sparse_indexer_backend to the DSA indexer ops.
+
+    Call while the model is built: with "auto" this probes the native
+    kernels, which must not happen first under torch.compile or graph capture.
+    """
+    global _sparse_indexer_backend
+    _sparse_indexer_backend = backend
+    for name in _SPARSE_INDEXER_PROBES:
+        _use_native_indexer_op(name)
+
+
+def _use_native_indexer_op(name: str) -> bool:
+    """Whether the native op torch.ops.<name> ("<lib>.<op>") serves the DSA
+    indexer, else the Triton kernels do."""
+    if _sparse_indexer_backend == "triton":
+        return False
+    if _sparse_indexer_backend == "native":
+        lib, op = name.split(".")
+        if not hasattr(getattr(torch.ops, lib), op):
+            raise RuntimeError(
+                "kernel_config.sparse_indexer_backend='native' requires "
+                f"torch.ops.{name}, which this vllm-xpu-kernels build does "
+                "not provide."
+            )
+        return True
+    # A missing op makes the probe raise, which counts as unusable.
+    return kernel_usable(name, *_SPARSE_INDEXER_PROBES[name])
+
+
 def _xpu_fp8_mqa_logits_impl(
     q: torch.Tensor,
     k_quant: torch.Tensor,
@@ -374,13 +506,19 @@ def _xpu_fp8_mqa_logits_impl(
     cu_seqlen_ks: torch.Tensor,
     cu_seqlen_ke: torch.Tensor,
 ) -> torch.Tensor:
-    return torch.ops._xpu_C.fp8_mqa_logits(
-        q,
-        k_quant,
-        k_scale,
-        weights,
-        cu_seqlen_ks,
-        cu_seqlen_ke,
+    if _use_native_indexer_op("_xpu_C.fp8_mqa_logits"):
+        return torch.ops._xpu_C.fp8_mqa_logits(
+            q,
+            k_quant,
+            k_scale,
+            weights,
+            cu_seqlen_ks,
+            cu_seqlen_ke,
+        )
+    from vllm.v1.attention.ops import dsa_mqa_logits_triton
+
+    return dsa_mqa_logits_triton.fp8_mqa_logits_triton(
+        q, (k_quant, k_scale), weights, cu_seqlen_ks, cu_seqlen_ke
     )
 
 
@@ -408,14 +546,28 @@ def _xpu_fp8_paged_mqa_logits_impl(
     schedule_metadata: torch.Tensor,
     max_model_len: int,
 ) -> torch.Tensor:
-    return torch.ops._xpu_C.fp8_paged_mqa_logits(
-        q,
-        kv_cache,
-        weights,
-        context_lens,
-        block_tables,
-        schedule_metadata,
-        max_model_len,
+    if _use_native_indexer_op("_xpu_C.fp8_paged_mqa_logits"):
+        return torch.ops._xpu_C.fp8_paged_mqa_logits(
+            q,
+            kv_cache,
+            weights,
+            context_lens,
+            block_tables,
+            schedule_metadata,
+            max_model_len,
+        )
+    from vllm.v1.attention.ops import dsa_mqa_logits_triton
+
+    # Like the native op, return -inf past each row's context.
+    batch_size, next_n = q.shape[:2]
+    out = torch.full(
+        (batch_size * next_n, max_model_len),
+        float("-inf"),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    return dsa_mqa_logits_triton.fp8_paged_mqa_logits_triton(
+        q, kv_cache, weights, context_lens, block_tables, max_model_len, out=out
     )
 
 
