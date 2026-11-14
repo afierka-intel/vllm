@@ -3192,6 +3192,11 @@ def indexer_k_quant_and_cache(
     quant_block_size: int,
     kv_cache_dtype: str,
 ) -> None:
+    if current_platform.is_xpu():
+        from vllm._xpu_ops import indexer_k_quant_and_cache as xpu_impl
+
+        xpu_impl(k, kv_cache, slot_mapping, quant_block_size, kv_cache_dtype)
+        return
     torch.ops._C_cache_ops.indexer_k_quant_and_cache(
         k, kv_cache, slot_mapping, quant_block_size, kv_cache_dtype
     )
@@ -3248,6 +3253,11 @@ def cp_gather_indexer_k_quant_cache(
     block_table: torch.Tensor,
     cu_seq_lens: torch.Tensor,
 ) -> None:
+    if current_platform.is_xpu():
+        from vllm._xpu_ops import cp_gather_indexer_k_quant_cache as xpu_impl
+
+        xpu_impl(kv_cache, dst_k, dst_scale, block_table, cu_seq_lens)
+        return
     torch.ops._C_cache_ops.cp_gather_indexer_k_quant_cache(
         kv_cache, dst_k, dst_scale, block_table, cu_seq_lens
     )
