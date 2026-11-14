@@ -29,6 +29,7 @@ from vllm.model_executor.layers.mhc import (
     HAS_AITER_MHC_PRE_NORM,
     HAS_TILELANG_MHC,
     MHCFusedPostPreOp,
+    MHCPostOp,
     MHCPreDelayedOp,
     MHCPreOp,
 )
@@ -45,6 +46,7 @@ from vllm.models.deepseek_v41.nvidia.ops.mega_mhc import (
 )
 from vllm.models.deepseek_v41.nvidia.ops.mhc import hc_expand, mhc_boundary_weight
 from vllm.platforms import current_platform
+from vllm.utils.kernel_probe import set_kernel_usable
 from vllm.utils.torch_utils import set_random_seed
 
 DEVICE = current_platform.device_type
@@ -2288,3 +2290,138 @@ def test_hc_expand_preserves_bits_in_eager_and_graph(
     x.copy_(torch.randn_like(x))
     graph.replay()
     check(captured)
+
+
+# rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
+_HC_ARGS = (1e-6, 1e-6, 1e-6, 2.0, 20)
+_NORM_EPS = 1e-5
+
+
+def _mhc_op_inputs(num_tokens: int, hidden_size: int = 4096, hc_mult: int = 4):
+    mix_hc = (2 + hc_mult) * hc_mult
+    x = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=DEVICE)
+    residual = torch.randn(
+        num_tokens, hc_mult, hidden_size, dtype=torch.bfloat16, device=DEVICE
+    )
+    post_layer_mix = torch.rand(num_tokens, hc_mult, 1, device=DEVICE)
+    comb_res_mix = torch.rand(num_tokens, hc_mult, hc_mult, device=DEVICE)
+    fn = torch.randn(mix_hc, hc_mult * hidden_size, device=DEVICE) * 1e-4
+    hc_scale = torch.randn(3, device=DEVICE) * 0.1
+    hc_base = torch.randn(mix_hc, device=DEVICE) * 0.1
+    norm_weight = torch.empty(hidden_size, dtype=torch.bfloat16, device=DEVICE)
+    norm_weight.uniform_(0.5, 1.5)
+    post_args = (x, residual, post_layer_mix, comb_res_mix)
+    pre_args = (fn, hc_scale, hc_base, *_HC_ARGS)
+    return post_args, pre_args, norm_weight
+
+
+def _mhc_op_call(op_name: str, post_args, pre_args, norm_weight):
+    """(op class, positional args, keyword args) for one mHC op call."""
+    norm = {}
+    if norm_weight is not None:
+        norm = dict(norm_weight=norm_weight, norm_eps=_NORM_EPS)
+    if op_name == "mhc_pre":
+        return MHCPreOp, (post_args[1], *pre_args), norm
+    if op_name == "mhc_post":
+        return MHCPostOp, post_args, {}
+    return MHCFusedPostPreOp, (*post_args, *pre_args), norm
+
+
+@pytest.mark.parametrize("num_tokens", [1, 7, 128])
+@pytest.mark.parametrize("with_norm", [False, True])
+def test_mhc_pre_native_applies_norm(num_tokens, with_norm):
+    """forward_native returns layer_input RMS-normalized with norm_weight, as
+    the TileLang kernel does."""
+    set_random_seed(0)
+    post_args, pre_args, norm_weight = _mhc_op_inputs(num_tokens)
+    residual = post_args[1]
+    _, args, kwargs = _mhc_op_call(
+        "mhc_pre", post_args, pre_args, norm_weight if with_norm else None
+    )
+
+    out = object.__new__(MHCPreOp).forward_native(*args, **kwargs)
+
+    ref_post, ref_comb, ref_layer_input = mhc_pre_ref(residual, *pre_args)
+    if with_norm:
+        ref_layer_input = F.rms_norm(
+            ref_layer_input, (ref_layer_input.shape[-1],), norm_weight, _NORM_EPS
+        )
+    torch.testing.assert_close(out[0], ref_post)
+    torch.testing.assert_close(out[1], ref_comb)
+    # Default bf16 tolerance: forward_native rounds the normalized value to
+    # bf16 before the weight multiply (one extra bf16 rounding).
+    torch.testing.assert_close(out[2], ref_layer_input)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 7, 128])
+@pytest.mark.parametrize("with_norm", [False, True])
+def test_mhc_fused_post_pre_native_applies_norm(num_tokens, with_norm):
+    set_random_seed(0)
+    post_args, pre_args, norm_weight = _mhc_op_inputs(num_tokens)
+    _, args, kwargs = _mhc_op_call(
+        "mhc_fused_post_pre", post_args, pre_args, norm_weight if with_norm else None
+    )
+
+    out = object.__new__(MHCFusedPostPreOp).forward_native(*args, **kwargs)
+
+    ref_residual = mhc_post_ref(*post_args)
+    ref_post, ref_comb, ref_layer_input = mhc_pre_ref(ref_residual, *pre_args)
+    if with_norm:
+        ref_layer_input = F.rms_norm(
+            ref_layer_input, (ref_layer_input.shape[-1],), norm_weight, _NORM_EPS
+        )
+    torch.testing.assert_close(out[0], ref_residual)
+    torch.testing.assert_close(out[1], ref_post)
+    torch.testing.assert_close(out[2], ref_comb)
+    torch.testing.assert_close(out[3], ref_layer_input)
+
+
+@pytest.mark.parametrize("op_name", ["mhc_pre", "mhc_post", "mhc_fused_post_pre"])
+def test_mhc_xpu_falls_back_to_native(op_name, monkeypatch):
+    """forward_xpu runs forward_native when the SYCL op is unusable.
+
+    Never reaches torch.ops._xpu_C, so it runs on every platform.
+    """
+    set_random_seed(0)
+    post_args, pre_args, norm_weight = _mhc_op_inputs(7)
+    op_cls, args, kwargs = _mhc_op_call(op_name, post_args, pre_args, norm_weight)
+    native = op_cls.forward_native
+    calls = []
+
+    def spy(self, *a, **kw):
+        calls.append(1)
+        return native(self, *a, **kw)
+
+    monkeypatch.setattr(op_cls, "forward_native", spy)
+    set_kernel_usable(f"_xpu_C.{op_name}", False)
+    try:
+        out = object.__new__(op_cls).forward_xpu(*args, **kwargs)
+    finally:
+        set_kernel_usable(f"_xpu_C.{op_name}", None)
+
+    assert len(calls) == 1
+    expected = native(object.__new__(op_cls), *args, **kwargs)
+    torch.testing.assert_close(out, expected, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not current_platform.is_xpu(), reason="XPU required")
+@pytest.mark.parametrize("op_name", ["mhc_pre", "mhc_post", "mhc_fused_post_pre"])
+@pytest.mark.parametrize("num_tokens", [1, 7, 128])
+def test_mhc_xpu_sycl_matches_native(op_name, num_tokens):
+    """Where the SYCL op exists, the probe accepts it and it matches
+    forward_native, the fallback used where it does not."""
+    if not hasattr(torch.ops._xpu_C, op_name):
+        pytest.skip(f"vllm-xpu-kernels built without _xpu_C.{op_name}")
+    assert mhc_layers._xpu_mhc_op_usable(op_name)
+    set_random_seed(0)
+    post_args, pre_args, norm_weight = _mhc_op_inputs(num_tokens)
+    op_cls, args, kwargs = _mhc_op_call(op_name, post_args, pre_args, norm_weight)
+    op = object.__new__(op_cls)
+
+    out = op.forward_xpu(*args, **kwargs)
+    expected = op.forward_native(*args, **kwargs)
+
+    # One bf16 ulp of the bf16 outputs (2^-8 relative), and forward_native
+    # rounds the post-mix residual to bf16 before the pre step while the
+    # fused SYCL op keeps it in fp32; the probe uses the same tolerance.
+    torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
