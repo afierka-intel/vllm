@@ -3,164 +3,20 @@
   "entries": [
     {
       "config": {
-        "block_m": 16,
+        "block_m": 64,
         "grf_mode": null,
         "heads_per_program": "MAX",
-        "num_stages": 2,
+        "num_stages": 1,
         "num_warps": 4,
         "tile_size": 16
       },
       "key": {
-        "is_3d": true,
-        "kv_len_bucket": 1,
-        "num_segments": 16,
-        "num_seqs": 1,
-        "q_len_bucket": 0,
-        "query_work": 64
-      }
-    },
-    {
-      "config": {
-        "block_m": 16,
-        "grf_mode": null,
-        "heads_per_program": "MAX",
-        "num_stages": 2,
-        "num_warps": 4,
-        "tile_size": 16
-      },
-      "key": {
-        "is_3d": true,
-        "kv_len_bucket": 2,
-        "num_segments": 16,
-        "num_seqs": 1,
-        "q_len_bucket": 0,
-        "query_work": 64
-      }
-    },
-    {
-      "config": {
-        "block_m": 16,
-        "grf_mode": null,
-        "heads_per_program": "MAX",
-        "num_stages": 2,
-        "num_warps": 4,
-        "tile_size": 16
-      },
-      "key": {
-        "is_3d": true,
-        "kv_len_bucket": 4,
-        "num_segments": 16,
-        "num_seqs": 1,
-        "q_len_bucket": 0,
-        "query_work": 64
-      }
-    },
-    {
-      "config": {
-        "block_m": 16,
-        "grf_mode": null,
-        "heads_per_program": "MAX",
-        "num_stages": 2,
-        "num_warps": 2,
-        "tile_size": 16
-      },
-      "key": {
-        "is_3d": true,
-        "kv_len_bucket": 1,
-        "num_segments": 16,
+        "is_3d": false,
+        "kv_len_bucket": 0,
+        "num_segments": 1,
         "num_seqs": 4,
-        "q_len_bucket": 0,
-        "query_work": 256
-      }
-    },
-    {
-      "config": {
-        "block_m": 16,
-        "grf_mode": null,
-        "heads_per_program": "MAX",
-        "num_stages": 2,
-        "num_warps": 2,
-        "tile_size": 16
-      },
-      "key": {
-        "is_3d": true,
-        "kv_len_bucket": 2,
-        "num_segments": 16,
-        "num_seqs": 4,
-        "q_len_bucket": 0,
-        "query_work": 256
-      }
-    },
-    {
-      "config": {
-        "block_m": 16,
-        "grf_mode": null,
-        "heads_per_program": "MAX",
-        "num_stages": 2,
-        "num_warps": 2,
-        "tile_size": 16
-      },
-      "key": {
-        "is_3d": true,
-        "kv_len_bucket": 4,
-        "num_segments": 16,
-        "num_seqs": 4,
-        "q_len_bucket": 0,
-        "query_work": 256
-      }
-    },
-    {
-      "config": {
-        "block_m": 16,
-        "grf_mode": null,
-        "heads_per_program": "MAX",
-        "num_stages": 2,
-        "num_warps": 2,
-        "tile_size": 16
-      },
-      "key": {
-        "is_3d": true,
-        "kv_len_bucket": 1,
-        "num_segments": 16,
-        "num_seqs": 16,
-        "q_len_bucket": 0,
-        "query_work": 1024
-      }
-    },
-    {
-      "config": {
-        "block_m": 16,
-        "grf_mode": null,
-        "heads_per_program": "MAX",
-        "num_stages": 2,
-        "num_warps": 2,
-        "tile_size": 16
-      },
-      "key": {
-        "is_3d": true,
-        "kv_len_bucket": 2,
-        "num_segments": 16,
-        "num_seqs": 16,
-        "q_len_bucket": 0,
-        "query_work": 1024
-      }
-    },
-    {
-      "config": {
-        "block_m": 16,
-        "grf_mode": null,
-        "heads_per_program": "MAX",
-        "num_stages": 2,
-        "num_warps": 2,
-        "tile_size": 16
-      },
-      "key": {
-        "is_3d": true,
-        "kv_len_bucket": 4,
-        "num_segments": 16,
-        "num_seqs": 16,
-        "q_len_bucket": 0,
-        "query_work": 1024
+        "q_len_bucket": 2,
+        "query_work": 65536
       }
     },
     {
@@ -174,101 +30,11 @@
       },
       "key": {
         "is_3d": false,
-        "kv_len_bucket": 1,
+        "kv_len_bucket": 0,
         "num_segments": 1,
         "num_seqs": 64,
         "q_len_bucket": 0,
         "query_work": 4096
-      }
-    },
-    {
-      "config": {
-        "block_m": 16,
-        "grf_mode": null,
-        "heads_per_program": "MAX",
-        "num_stages": 2,
-        "num_warps": 2,
-        "tile_size": 16
-      },
-      "key": {
-        "is_3d": false,
-        "kv_len_bucket": 2,
-        "num_segments": 1,
-        "num_seqs": 64,
-        "q_len_bucket": 0,
-        "query_work": 4096
-      }
-    },
-    {
-      "config": {
-        "block_m": 16,
-        "grf_mode": null,
-        "heads_per_program": "MAX",
-        "num_stages": 2,
-        "num_warps": 2,
-        "tile_size": 16
-      },
-      "key": {
-        "is_3d": false,
-        "kv_len_bucket": 4,
-        "num_segments": 1,
-        "num_seqs": 64,
-        "q_len_bucket": 0,
-        "query_work": 4096
-      }
-    },
-    {
-      "config": {
-        "block_m": 16,
-        "grf_mode": null,
-        "heads_per_program": "MAX",
-        "num_stages": 2,
-        "num_warps": 2,
-        "tile_size": 16
-      },
-      "key": {
-        "is_3d": false,
-        "kv_len_bucket": 1,
-        "num_segments": 1,
-        "num_seqs": 256,
-        "q_len_bucket": 0,
-        "query_work": 16384
-      }
-    },
-    {
-      "config": {
-        "block_m": 16,
-        "grf_mode": null,
-        "heads_per_program": "MAX",
-        "num_stages": 2,
-        "num_warps": 2,
-        "tile_size": 16
-      },
-      "key": {
-        "is_3d": false,
-        "kv_len_bucket": 2,
-        "num_segments": 1,
-        "num_seqs": 256,
-        "q_len_bucket": 0,
-        "query_work": 16384
-      }
-    },
-    {
-      "config": {
-        "block_m": 16,
-        "grf_mode": null,
-        "heads_per_program": "MAX",
-        "num_stages": 2,
-        "num_warps": 2,
-        "tile_size": 16
-      },
-      "key": {
-        "is_3d": false,
-        "kv_len_bucket": 4,
-        "num_segments": 1,
-        "num_seqs": 256,
-        "q_len_bucket": 0,
-        "query_work": 16384
       }
     },
     {
@@ -302,6 +68,24 @@
         "is_3d": false,
         "kv_len_bucket": 1,
         "num_segments": 1,
+        "num_seqs": 1,
+        "q_len_bucket": 3,
+        "query_work": 65536
+      }
+    },
+    {
+      "config": {
+        "block_m": 64,
+        "grf_mode": null,
+        "heads_per_program": "MAX",
+        "num_stages": 2,
+        "num_warps": 4,
+        "tile_size": 16
+      },
+      "key": {
+        "is_3d": false,
+        "kv_len_bucket": 1,
+        "num_segments": 1,
         "num_seqs": 16,
         "q_len_bucket": 2,
         "query_work": 524288
@@ -309,20 +93,20 @@
     },
     {
       "config": {
-        "block_m": 64,
+        "block_m": 16,
         "grf_mode": null,
         "heads_per_program": "MAX",
         "num_stages": 2,
-        "num_warps": 4,
+        "num_warps": 2,
         "tile_size": 16
       },
       "key": {
         "is_3d": false,
-        "kv_len_bucket": 2,
+        "kv_len_bucket": 1,
         "num_segments": 1,
-        "num_seqs": 1,
-        "q_len_bucket": 3,
-        "query_work": 131072
+        "num_seqs": 256,
+        "q_len_bucket": 0,
+        "query_work": 16384
       }
     },
     {
@@ -336,83 +120,65 @@
       },
       "key": {
         "is_3d": false,
-        "kv_len_bucket": 2,
+        "kv_len_bucket": 1,
         "num_segments": 1,
         "num_seqs": 4,
         "q_len_bucket": 3,
-        "query_work": 524288
+        "query_work": 262144
       }
     },
     {
       "config": {
-        "block_m": 128,
+        "block_m": 16,
         "grf_mode": null,
         "heads_per_program": "MAX",
         "num_stages": 2,
-        "num_warps": 4,
+        "num_warps": 2,
         "tile_size": 16
       },
       "key": {
         "is_3d": false,
-        "kv_len_bucket": 3,
-        "num_segments": 1,
-        "num_seqs": 1,
-        "q_len_bucket": 3,
-        "query_work": 524288
-      }
-    },
-    {
-      "config": {
-        "block_m": 128,
-        "grf_mode": null,
-        "heads_per_program": "MAX",
-        "num_stages": 2,
-        "num_warps": 4,
-        "tile_size": 16
-      },
-      "key": {
-        "is_3d": false,
-        "kv_len_bucket": 3,
-        "num_segments": 1,
-        "num_seqs": 1,
-        "q_len_bucket": 3,
-        "query_work": 131072
-      }
-    },
-    {
-      "config": {
-        "block_m": 128,
-        "grf_mode": null,
-        "heads_per_program": "MAX",
-        "num_stages": 2,
-        "num_warps": 4,
-        "tile_size": 16
-      },
-      "key": {
-        "is_3d": false,
-        "kv_len_bucket": 3,
-        "num_segments": 1,
-        "num_seqs": 4,
-        "q_len_bucket": 3,
-        "query_work": 524288
-      }
-    },
-    {
-      "config": {
-        "block_m": 64,
-        "grf_mode": null,
-        "heads_per_program": "MAX",
-        "num_stages": 2,
-        "num_warps": 4,
-        "tile_size": 16
-      },
-      "key": {
-        "is_3d": false,
-        "kv_len_bucket": 2,
+        "kv_len_bucket": 1,
         "num_segments": 1,
         "num_seqs": 64,
+        "q_len_bucket": 0,
+        "query_work": 4096
+      }
+    },
+    {
+      "config": {
+        "block_m": 64,
+        "grf_mode": null,
+        "heads_per_program": "MAX",
+        "num_stages": 2,
+        "num_warps": 4,
+        "tile_size": 16
+      },
+      "key": {
+        "is_3d": false,
+        "kv_len_bucket": 2,
+        "num_segments": 1,
+        "num_seqs": 1,
         "q_len_bucket": 3,
-        "query_work": 135104
+        "query_work": 131072
+      }
+    },
+    {
+      "config": {
+        "block_m": 64,
+        "grf_mode": null,
+        "heads_per_program": "MAX",
+        "num_stages": 2,
+        "num_warps": 4,
+        "tile_size": 16
+      },
+      "key": {
+        "is_3d": false,
+        "kv_len_bucket": 2,
+        "num_segments": 1,
+        "num_seqs": 1,
+        "q_len_bucket": 3,
+        "query_work": 262144
       }
     },
     {
@@ -435,6 +201,348 @@
     },
     {
       "config": {
+        "block_m": 128,
+        "grf_mode": null,
+        "heads_per_program": "MAX",
+        "num_stages": 2,
+        "num_warps": 4,
+        "tile_size": 16
+      },
+      "key": {
+        "is_3d": false,
+        "kv_len_bucket": 2,
+        "num_segments": 1,
+        "num_seqs": 2,
+        "q_len_bucket": 3,
+        "query_work": 131072
+      }
+    },
+    {
+      "config": {
+        "block_m": 16,
+        "grf_mode": null,
+        "heads_per_program": "MAX",
+        "num_stages": 2,
+        "num_warps": 2,
+        "tile_size": 16
+      },
+      "key": {
+        "is_3d": false,
+        "kv_len_bucket": 2,
+        "num_segments": 1,
+        "num_seqs": 256,
+        "q_len_bucket": 0,
+        "query_work": 16384
+      }
+    },
+    {
+      "config": {
+        "block_m": 64,
+        "grf_mode": null,
+        "heads_per_program": "MAX",
+        "num_stages": 2,
+        "num_warps": 4,
+        "tile_size": 16
+      },
+      "key": {
+        "is_3d": false,
+        "kv_len_bucket": 2,
+        "num_segments": 1,
+        "num_seqs": 4,
+        "q_len_bucket": 3,
+        "query_work": 524288
+      }
+    },
+    {
+      "config": {
+        "block_m": 16,
+        "grf_mode": null,
+        "heads_per_program": "MAX",
+        "num_stages": 2,
+        "num_warps": 2,
+        "tile_size": 16
+      },
+      "key": {
+        "is_3d": false,
+        "kv_len_bucket": 2,
+        "num_segments": 1,
+        "num_seqs": 64,
+        "q_len_bucket": 0,
+        "query_work": 4096
+      }
+    },
+    {
+      "config": {
+        "block_m": 64,
+        "grf_mode": null,
+        "heads_per_program": "MAX",
+        "num_stages": 2,
+        "num_warps": 4,
+        "tile_size": 16
+      },
+      "key": {
+        "is_3d": false,
+        "kv_len_bucket": 2,
+        "num_segments": 1,
+        "num_seqs": 64,
+        "q_len_bucket": 3,
+        "query_work": 135104
+      }
+    },
+    {
+      "config": {
+        "block_m": 128,
+        "grf_mode": null,
+        "heads_per_program": "MAX",
+        "num_stages": 2,
+        "num_warps": 4,
+        "tile_size": 16
+      },
+      "key": {
+        "is_3d": false,
+        "kv_len_bucket": 3,
+        "num_segments": 1,
+        "num_seqs": 1,
+        "q_len_bucket": 3,
+        "query_work": 131072
+      }
+    },
+    {
+      "config": {
+        "block_m": 128,
+        "grf_mode": null,
+        "heads_per_program": "MAX",
+        "num_stages": 2,
+        "num_warps": 4,
+        "tile_size": 16
+      },
+      "key": {
+        "is_3d": false,
+        "kv_len_bucket": 3,
+        "num_segments": 1,
+        "num_seqs": 1,
+        "q_len_bucket": 3,
+        "query_work": 524288
+      }
+    },
+    {
+      "config": {
+        "block_m": 16,
+        "grf_mode": null,
+        "heads_per_program": "MAX",
+        "num_stages": 2,
+        "num_warps": 2,
+        "tile_size": 16
+      },
+      "key": {
+        "is_3d": false,
+        "kv_len_bucket": 3,
+        "num_segments": 1,
+        "num_seqs": 256,
+        "q_len_bucket": 0,
+        "query_work": 16384
+      }
+    },
+    {
+      "config": {
+        "block_m": 128,
+        "grf_mode": null,
+        "heads_per_program": "MAX",
+        "num_stages": 2,
+        "num_warps": 4,
+        "tile_size": 16
+      },
+      "key": {
+        "is_3d": false,
+        "kv_len_bucket": 3,
+        "num_segments": 1,
+        "num_seqs": 4,
+        "q_len_bucket": 3,
+        "query_work": 524288
+      }
+    },
+    {
+      "config": {
+        "block_m": 16,
+        "grf_mode": null,
+        "heads_per_program": "MAX",
+        "num_stages": 2,
+        "num_warps": 2,
+        "tile_size": 16
+      },
+      "key": {
+        "is_3d": false,
+        "kv_len_bucket": 3,
+        "num_segments": 1,
+        "num_seqs": 64,
+        "q_len_bucket": 0,
+        "query_work": 4096
+      }
+    },
+    {
+      "config": {
+        "block_m": 16,
+        "grf_mode": null,
+        "heads_per_program": "MAX",
+        "num_stages": 2,
+        "num_warps": 2,
+        "tile_size": 16
+      },
+      "key": {
+        "is_3d": false,
+        "kv_len_bucket": 4,
+        "num_segments": 1,
+        "num_seqs": 256,
+        "q_len_bucket": 0,
+        "query_work": 16384
+      }
+    },
+    {
+      "config": {
+        "block_m": 16,
+        "grf_mode": null,
+        "heads_per_program": "MAX",
+        "num_stages": 2,
+        "num_warps": 2,
+        "tile_size": 16
+      },
+      "key": {
+        "is_3d": false,
+        "kv_len_bucket": 4,
+        "num_segments": 1,
+        "num_seqs": 64,
+        "q_len_bucket": 0,
+        "query_work": 4096
+      }
+    },
+    {
+      "config": {
+        "block_m": 16,
+        "grf_mode": null,
+        "heads_per_program": "MAX",
+        "num_stages": 2,
+        "num_warps": 4,
+        "tile_size": 16
+      },
+      "key": {
+        "is_3d": true,
+        "kv_len_bucket": 0,
+        "num_segments": 16,
+        "num_seqs": 1,
+        "q_len_bucket": 0,
+        "query_work": 64
+      }
+    },
+    {
+      "config": {
+        "block_m": 16,
+        "grf_mode": null,
+        "heads_per_program": "MAX",
+        "num_stages": 2,
+        "num_warps": 4,
+        "tile_size": 16
+      },
+      "key": {
+        "is_3d": true,
+        "kv_len_bucket": 1,
+        "num_segments": 16,
+        "num_seqs": 1,
+        "q_len_bucket": 0,
+        "query_work": 64
+      }
+    },
+    {
+      "config": {
+        "block_m": 16,
+        "grf_mode": null,
+        "heads_per_program": "MAX",
+        "num_stages": 2,
+        "num_warps": 2,
+        "tile_size": 16
+      },
+      "key": {
+        "is_3d": true,
+        "kv_len_bucket": 1,
+        "num_segments": 16,
+        "num_seqs": 16,
+        "q_len_bucket": 0,
+        "query_work": 1024
+      }
+    },
+    {
+      "config": {
+        "block_m": 16,
+        "grf_mode": null,
+        "heads_per_program": "MAX",
+        "num_stages": 2,
+        "num_warps": 2,
+        "tile_size": 16
+      },
+      "key": {
+        "is_3d": true,
+        "kv_len_bucket": 1,
+        "num_segments": 16,
+        "num_seqs": 4,
+        "q_len_bucket": 0,
+        "query_work": 256
+      }
+    },
+    {
+      "config": {
+        "block_m": 16,
+        "grf_mode": null,
+        "heads_per_program": "MAX",
+        "num_stages": 2,
+        "num_warps": 4,
+        "tile_size": 16
+      },
+      "key": {
+        "is_3d": true,
+        "kv_len_bucket": 2,
+        "num_segments": 16,
+        "num_seqs": 1,
+        "q_len_bucket": 0,
+        "query_work": 64
+      }
+    },
+    {
+      "config": {
+        "block_m": 16,
+        "grf_mode": null,
+        "heads_per_program": "MAX",
+        "num_stages": 2,
+        "num_warps": 2,
+        "tile_size": 16
+      },
+      "key": {
+        "is_3d": true,
+        "kv_len_bucket": 2,
+        "num_segments": 16,
+        "num_seqs": 16,
+        "q_len_bucket": 0,
+        "query_work": 1024
+      }
+    },
+    {
+      "config": {
+        "block_m": 16,
+        "grf_mode": null,
+        "heads_per_program": "MAX",
+        "num_stages": 2,
+        "num_warps": 2,
+        "tile_size": 16
+      },
+      "key": {
+        "is_3d": true,
+        "kv_len_bucket": 2,
+        "num_segments": 16,
+        "num_seqs": 4,
+        "q_len_bucket": 0,
+        "query_work": 256
+      }
+    },
+    {
+      "config": {
         "block_m": 16,
         "grf_mode": null,
         "heads_per_program": "MAX",
@@ -449,6 +557,24 @@
         "num_seqs": 1,
         "q_len_bucket": 0,
         "query_work": 64
+      }
+    },
+    {
+      "config": {
+        "block_m": 16,
+        "grf_mode": null,
+        "heads_per_program": "MAX",
+        "num_stages": 2,
+        "num_warps": 2,
+        "tile_size": 16
+      },
+      "key": {
+        "is_3d": true,
+        "kv_len_bucket": 3,
+        "num_segments": 16,
+        "num_seqs": 16,
+        "q_len_bucket": 0,
+        "query_work": 1024
       }
     },
     {
@@ -482,45 +608,9 @@
         "is_3d": true,
         "kv_len_bucket": 3,
         "num_segments": 16,
-        "num_seqs": 16,
+        "num_seqs": 8,
         "q_len_bucket": 0,
-        "query_work": 1024
-      }
-    },
-    {
-      "config": {
-        "block_m": 16,
-        "grf_mode": null,
-        "heads_per_program": "MAX",
-        "num_stages": 2,
-        "num_warps": 2,
-        "tile_size": 16
-      },
-      "key": {
-        "is_3d": false,
-        "kv_len_bucket": 3,
-        "num_segments": 1,
-        "num_seqs": 64,
-        "q_len_bucket": 0,
-        "query_work": 4096
-      }
-    },
-    {
-      "config": {
-        "block_m": 16,
-        "grf_mode": null,
-        "heads_per_program": "MAX",
-        "num_stages": 2,
-        "num_warps": 2,
-        "tile_size": 16
-      },
-      "key": {
-        "is_3d": false,
-        "kv_len_bucket": 3,
-        "num_segments": 1,
-        "num_seqs": 256,
-        "q_len_bucket": 0,
-        "query_work": 16384
+        "query_work": 512
       }
     },
     {
@@ -534,7 +624,7 @@
       },
       "key": {
         "is_3d": true,
-        "kv_len_bucket": 0,
+        "kv_len_bucket": 4,
         "num_segments": 16,
         "num_seqs": 1,
         "q_len_bucket": 0,
@@ -551,84 +641,30 @@
         "tile_size": 16
       },
       "key": {
-        "is_3d": false,
-        "kv_len_bucket": 0,
-        "num_segments": 1,
-        "num_seqs": 64,
+        "is_3d": true,
+        "kv_len_bucket": 4,
+        "num_segments": 16,
+        "num_seqs": 16,
         "q_len_bucket": 0,
-        "query_work": 4096
+        "query_work": 1024
       }
     },
     {
       "config": {
-        "block_m": 64,
+        "block_m": 16,
         "grf_mode": null,
         "heads_per_program": "MAX",
-        "num_stages": 1,
-        "num_warps": 4,
+        "num_stages": 2,
+        "num_warps": 2,
         "tile_size": 16
       },
       "key": {
-        "is_3d": false,
-        "kv_len_bucket": 0,
-        "num_segments": 1,
+        "is_3d": true,
+        "kv_len_bucket": 4,
+        "num_segments": 16,
         "num_seqs": 4,
-        "q_len_bucket": 2,
-        "query_work": 65536
-      }
-    },
-    {
-      "config": {
-        "block_m": 64,
-        "grf_mode": null,
-        "heads_per_program": "MAX",
-        "num_stages": 2,
-        "num_warps": 4,
-        "tile_size": 16
-      },
-      "key": {
-        "is_3d": false,
-        "kv_len_bucket": 1,
-        "num_segments": 1,
-        "num_seqs": 1,
-        "q_len_bucket": 3,
-        "query_work": 65536
-      }
-    },
-    {
-      "config": {
-        "block_m": 64,
-        "grf_mode": null,
-        "heads_per_program": "MAX",
-        "num_stages": 2,
-        "num_warps": 4,
-        "tile_size": 16
-      },
-      "key": {
-        "is_3d": false,
-        "kv_len_bucket": 1,
-        "num_segments": 1,
-        "num_seqs": 4,
-        "q_len_bucket": 3,
-        "query_work": 262144
-      }
-    },
-    {
-      "config": {
-        "block_m": 128,
-        "grf_mode": null,
-        "heads_per_program": "MAX",
-        "num_stages": 2,
-        "num_warps": 4,
-        "tile_size": 16
-      },
-      "key": {
-        "is_3d": false,
-        "kv_len_bucket": 2,
-        "num_segments": 1,
-        "num_seqs": 2,
-        "q_len_bucket": 3,
-        "query_work": 131072
+        "q_len_bucket": 0,
+        "query_work": 256
       }
     }
   ],
