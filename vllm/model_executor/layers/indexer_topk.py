@@ -383,7 +383,8 @@ class SparseIndexerTopk(torch.nn.Module):
     ) -> str:
         """flashinfer_gvr2 for chunks of at least GVR2_PREFILL_MIN_ROWS
         row-relative rows (row_starts is None) when it was requested
-        explicitly, otherwise per_row (top_k_per_row_prefill).
+        explicitly, torch when it was requested, otherwise per_row
+        (top_k_per_row_prefill).
 
         gvr_2 reads every row from column 0. Unmet gvr_2 constraints fall
         back instead of raising, since the same backend setting also drives
@@ -397,6 +398,8 @@ class SparseIndexerTopk(torch.nn.Module):
             and not self._gvr2_constraints(logits, topk_tokens)
         ):
             return "flashinfer_gvr2"
+        if self._backend == "torch":
+            return "torch"
         return "per_row"
 
     def forward_prefill(
@@ -432,6 +435,10 @@ class SparseIndexerTopk(torch.nn.Module):
             )
             if not direct:
                 topk_indices.copy_(out)
+            return
+        if backend == "torch":
+            logger.info_once("Sparse indexer prefill top-k backend: torch")
+            self._torch_topk(logits, row_starts, row_ends, topk_indices, topk_tokens)
             return
         ops.top_k_per_row_prefill(
             logits,
@@ -495,6 +502,36 @@ class SparseIndexerTopk(torch.nn.Module):
             )
         assert row_ends.dtype == torch.int32
         return row_ends
+
+    @staticmethod
+    def _torch_topk(
+        logits: torch.Tensor,
+        row_starts: torch.Tensor | None,
+        row_ends: torch.Tensor,
+        topk_indices: torch.Tensor,
+        topk_tokens: int,
+    ) -> None:
+        """Debug reference: mask each row outside [row_starts, row_ends)
+        (row_starts None means 0), then topk. Writes int32 indices relative
+        to the row start in no guaranteed order, -1 past the row length."""
+        cols = torch.arange(logits.shape[1], device=logits.device).unsqueeze(0)
+        outside = cols >= row_ends.unsqueeze(1)
+        lens = row_ends
+        if row_starts is not None:
+            outside |= cols < row_starts.unsqueeze(1)
+            lens = row_ends - row_starts
+        masked = logits.masked_fill(outside, float("-inf"))
+        # Prefill logits can be narrower than topk_tokens (short chunks).
+        k = min(topk_tokens, logits.shape[1])
+        indices = masked.topk(k, dim=-1).indices
+        if row_starts is not None:
+            indices -= row_starts.unsqueeze(1)
+        if k < topk_tokens:
+            indices = torch.nn.functional.pad(indices, (0, topk_tokens - k), value=-1)
+        in_range = torch.arange(topk_tokens, device=logits.device).unsqueeze(
+            0
+        ) < lens.unsqueeze(1)
+        topk_indices.copy_(torch.where(in_range, indices, -1))
 
     def forward(
         self,
@@ -586,18 +623,8 @@ class SparseIndexerTopk(torch.nn.Module):
             if not direct:
                 topk_indices.copy_(out)
         elif backend == "torch":
-            # Debug reference: mask everything past each row's end, then topk.
             row_ends = self._row_ends(seq_lens, next_n, logits.shape[0])
-            cols = torch.arange(logits.shape[1], device=logits.device)
-            masked = logits.masked_fill(
-                cols.unsqueeze(0) >= row_ends.unsqueeze(1), float("-inf")
-            )
-            indices = masked.topk(topk_tokens, dim=-1).indices
-            in_range = torch.arange(topk_tokens, device=logits.device).unsqueeze(
-                0
-            ) < row_ends.unsqueeze(1)
-            indices = torch.where(in_range, indices, -1)
-            topk_indices.copy_(indices)
+            self._torch_topk(logits, None, row_ends, topk_indices, topk_tokens)
         elif backend == "aiter":
             from vllm._aiter_ops import rocm_aiter_ops
 
