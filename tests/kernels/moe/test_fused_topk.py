@@ -329,3 +329,134 @@ def test_fused_topk_bias_nan_inf_clamp(
             f"Row {row} has non-finite weights {topk_weights[row].tolist()} "
             f"(bad_value={bad_value}, scoring_func={scoring_func})"
         )
+
+
+def _sort_by_expert(
+    topk_weights: torch.Tensor, topk_ids: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    topk_ids, order = topk_ids.long().sort(dim=-1)
+    return topk_weights.gather(1, order), topk_ids
+
+
+@pytest.fixture
+def unusable_fused_topk_sigmoid(monkeypatch):
+    """Run as XPU (also when simulated on another device) with
+    `_moe_C.topk_sigmoid` marked unusable; calling the fused op fails."""
+    from vllm.model_executor.layers.fused_moe.router import (
+        fused_topk_bias_router as router_mod,
+    )
+    from vllm.utils.kernel_probe import set_kernel_usable
+
+    def fail(*args, **kwargs):
+        raise AssertionError("the fused topk_sigmoid op must not be called")
+
+    monkeypatch.setattr(current_platform, "is_xpu", lambda: True)
+    monkeypatch.setattr(router_mod.ops, "topk_sigmoid", fail)
+    set_kernel_usable("_moe_C.topk_sigmoid", False)
+    yield
+    set_kernel_usable("_moe_C.topk_sigmoid", None)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 33])
+@pytest.mark.parametrize("num_experts", [16, 256])
+@pytest.mark.parametrize("topk", [4, 8])
+@pytest.mark.parametrize("renormalize", [True, False])
+def test_fused_topk_bias_sigmoid_torch_fallback(
+    num_tokens: int,
+    num_experts: int,
+    topk: int,
+    renormalize: bool,
+    unusable_fused_topk_sigmoid,
+):
+    """Sigmoid routing without the fused op runs the torch implementation."""
+    device = "xpu" if torch.xpu.is_available() else "cpu"
+    torch.manual_seed(0)
+    hidden_states = torch.randn((num_tokens, 128), device=device)
+    gating_output = torch.randn((num_tokens, num_experts), device=device)
+    bias = torch.randn((num_experts,), device=device)
+
+    weights_ref, ids_ref = torch_topk(
+        gating_output, topk, renormalize, bias, scoring_func="sigmoid"
+    )
+    weights, ids = fused_topk_bias(
+        hidden_states=hidden_states,
+        gating_output=gating_output,
+        scoring_func="sigmoid",
+        e_score_correction_bias=bias,
+        topk=topk,
+        renormalize=renormalize,
+        routed_scaling_factor=2.5,
+    )
+
+    assert ids.dtype == torch.int32 and weights.dtype == torch.float32
+    # Same fp32 arithmetic; only the order of the selected experts may differ.
+    weights, ids = _sort_by_expert(weights, ids)
+    weights_ref, ids_ref = _sort_by_expert(weights_ref, ids_ref)
+    torch.testing.assert_close(ids, ids_ref, atol=0, rtol=0)
+    torch.testing.assert_close(weights, 2.5 * weights_ref, atol=1e-6, rtol=1e-6)
+
+
+def test_fused_topk_bias_router_padding_with_torch_sigmoid(
+    unusable_fused_topk_sigmoid,
+):
+    """The torch implementation does not mask padding rows, so the router must
+    not claim to."""
+    from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
+        FusedTopKBiasRouter,
+    )
+
+    def make_router(scoring_func: str) -> FusedTopKBiasRouter:
+        return FusedTopKBiasRouter(
+            top_k=2,
+            global_num_experts=8,
+            e_score_correction_bias=torch.zeros(8),
+            scoring_func=scoring_func,
+        )
+
+    assert not make_router("sigmoid").masks_padding
+    assert make_router("softmax").masks_padding
+
+
+@pytest.mark.skipif(not current_platform.is_xpu(), reason="XPU-only fallback")
+@pytest.mark.parametrize("num_tokens", [1, 33, 256])
+@pytest.mark.parametrize("num_experts", [16, 256])
+@pytest.mark.parametrize("topk", [4, 8])
+def test_fused_topk_bias_sigmoid_torch_matches_native_xpu(
+    num_tokens: int, num_experts: int, topk: int
+):
+    from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
+        _fused_topk_sigmoid_usable,
+    )
+    from vllm.utils.kernel_probe import set_kernel_usable
+
+    if not _fused_topk_sigmoid_usable():
+        pytest.skip("_moe_C.topk_sigmoid is not usable on this device")
+    torch.manual_seed(0)
+    hidden_states = torch.randn((num_tokens, 128), device="xpu")
+    # fp32 logits, as the DeepSeek-style gates produce: both versions then
+    # compute the sigmoid in fp32 and select the same experts.
+    gating_output = torch.randn((num_tokens, num_experts), device="xpu")
+    bias = torch.randn((num_experts,), device="xpu")
+
+    def route() -> tuple[torch.Tensor, torch.Tensor]:
+        weights, ids = fused_topk_bias(
+            hidden_states=hidden_states,
+            gating_output=gating_output,
+            scoring_func="sigmoid",
+            e_score_correction_bias=bias,
+            topk=topk,
+            renormalize=True,
+            routed_scaling_factor=2.5,
+        )
+        return _sort_by_expert(weights, ids)
+
+    native = route()
+    set_kernel_usable("_moe_C.topk_sigmoid", False)
+    try:
+        portable = route()
+    finally:
+        set_kernel_usable("_moe_C.topk_sigmoid", None)
+
+    torch.testing.assert_close(portable[1], native[1], atol=0, rtol=0)
+    # The sigmoid differs only in the rounding of exp() between the versions.
+    torch.testing.assert_close(portable[0], native[0], atol=1e-6, rtol=1e-5)

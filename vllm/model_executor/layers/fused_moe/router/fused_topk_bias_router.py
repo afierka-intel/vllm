@@ -23,6 +23,8 @@ from vllm.model_executor.layers.fused_moe.router.dsv4_topk import (
 from vllm.model_executor.layers.fused_moe.router.fused_topk_router import (
     _aiter_topk_gating_supported,
 )
+from vllm.platforms import current_platform
+from vllm.utils.kernel_probe import kernel_usable
 
 # AITER instantiates biased_grouped_topk only for these NUM_GRP values, with at
 # most this many experts per group.
@@ -72,6 +74,43 @@ def vllm_topk_sigmoid(
     )
 
     return topk_weights, topk_indices
+
+
+def _fused_topk_sigmoid_usable() -> bool:
+    """Whether `_moe_C.topk_sigmoid` works here; it is only probed on XPU,
+    where `fused_topk_bias` otherwise uses its torch implementation."""
+    if not current_platform.is_xpu():
+        return True
+
+    def make_inputs() -> tuple[torch.Tensor, torch.Tensor]:
+        # Well-separated scores, so the top-k is the same in both versions.
+        device = current_platform.device_type
+        logits = torch.linspace(-3.0, 3.0, 16, device=device).view(2, 8)
+        bias = torch.linspace(0.5, -0.5, 8, device=device)
+        return logits, bias
+
+    def by_expert(weights: torch.Tensor, ids: torch.Tensor) -> list[torch.Tensor]:
+        ids, order = ids.long().sort(dim=-1)
+        return [weights.gather(1, order), ids]
+
+    def run() -> list[torch.Tensor]:
+        logits, bias = make_inputs()
+        weights = logits.new_empty(2, 3)
+        ids = torch.empty(2, 3, dtype=torch.int32, device=logits.device)
+        token_expert_indices = torch.empty_like(ids)
+        ops.topk_sigmoid(weights, ids, token_expert_indices, logits, True, bias, 2.0)
+        return by_expert(weights, ids)
+
+    def ref() -> list[torch.Tensor]:
+        logits, bias = make_inputs()
+        scores = logits.sigmoid()
+        ids = (scores + bias).topk(3, dim=-1).indices
+        weights = scores.gather(1, ids)
+        weights = 2.0 * weights / weights.sum(dim=-1, keepdim=True)
+        return by_expert(weights, ids)
+
+    # fp32 on both sides; the weights differ only in the rounding of exp().
+    return kernel_usable("_moe_C.topk_sigmoid", run, ref, atol=1e-6, rtol=1e-5)
 
 
 def vllm_topk_softplus_sqrt(
@@ -226,16 +265,18 @@ def fused_topk_bias(
                 topk_weights *= routed_scaling_factor
             return topk_weights, topk_ids
         elif scoring_func == "sigmoid":
-            topk_weights, topk_ids = vllm_topk_sigmoid(
-                topk_weights,
-                topk_ids,
-                token_expert_indices,
-                gating_output,
-                renormalize,
-                e_score_correction_bias,
-                routed_scaling_factor,
-            )
-            return topk_weights, topk_ids
+            # Without a usable fused op, use the torch implementation below.
+            if _fused_topk_sigmoid_usable():
+                topk_weights, topk_ids = vllm_topk_sigmoid(
+                    topk_weights,
+                    topk_ids,
+                    token_expert_indices,
+                    gating_output,
+                    renormalize,
+                    e_score_correction_bias,
+                    routed_scaling_factor,
+                )
+                return topk_weights, topk_ids
         elif scoring_func == "sqrtsoftplus":
             return vllm_topk_softplus_sqrt(
                 topk_weights,
@@ -451,7 +492,10 @@ class FusedTopKBiasRouter(BaseRouter):
 
     @property
     def masks_padding(self) -> bool:
-        return not rocm_aiter_ops.is_fused_moe_enabled()
+        if rocm_aiter_ops.is_fused_moe_enabled():
+            return False
+        # The torch implementation does not mask padding rows.
+        return self.scoring_func != "sigmoid" or _fused_topk_sigmoid_usable()
 
     @property
     def routing_method_type(self) -> RoutingMethodType:
