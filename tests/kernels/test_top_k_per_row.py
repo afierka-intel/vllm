@@ -317,6 +317,49 @@ def test_top_k_per_row(
     ), "CUDA top_k_per_row_prefill results don't match torch.topk"
 
 
+@pytest.mark.parametrize("contiguous", [True, False])
+@pytest.mark.parametrize("top_k", [64, 512])
+@pytest.mark.skipif(
+    not (current_platform.is_cuda_alike() or current_platform.is_xpu()),
+    reason="This test requires CUDA, ROCm or XPU",
+)
+@torch.inference_mode()
+def test_top_k_per_row_prefill_row_starts(contiguous: bool, top_k: int) -> None:
+    """Rows whose window [row_start, row_end) starts past column 0 (several
+    requests sharing one logits buffer, as the sparse indexers pass them):
+    indices must be relative to row_start on every platform, for contiguous
+    and strided logits and for rows shorter than top_k."""
+    device = current_platform.device_type
+    set_random_seed(0)
+    width = 3000
+    row_starts = torch.tensor([0, 700, 700, 2900, 1200], dtype=torch.int32)
+    row_ends = torch.tensor([600, 2700, 760, 3000, 2900], dtype=torch.int32)
+    num_rows = row_starts.numel()
+    if contiguous:
+        logits = torch.randn(num_rows, width, device=device)
+    else:
+        logits = torch.randn(num_rows, 2 * width, device=device)[:, ::2]
+    assert logits.stride(1) == (1 if contiguous else 2)
+    indices = torch.full((num_rows, top_k), -2, dtype=torch.int32, device=device)
+    torch.ops._C.top_k_per_row_prefill(
+        logits,
+        row_starts.to(device),
+        row_ends.to(device),
+        indices,
+        num_rows,
+        logits.stride(0),
+        logits.stride(1),
+        top_k,
+    )
+    for r in range(num_rows):
+        s, e = int(row_starts[r]), int(row_ends[r])
+        k = min(top_k, e - s)
+        expected = set(logits[r, s:e].topk(k).indices.tolist())
+        got = indices[r].tolist()
+        assert set(got[:k]) == expected, f"row {r}"
+        assert all(i == -1 for i in got[k:]), f"row {r}"
+
+
 def _run_top_k_per_row_decode_test(
     top_k: int,
     batch_size: int,
@@ -2596,7 +2639,8 @@ SPARSE_INDEXER_EXPLICIT_BACKENDS = [
     pytest.param(
         "per_row",
         marks=pytest.mark.skipif(
-            not current_platform.is_cuda_alike(), reason="requires CUDA or ROCm"
+            not (current_platform.is_cuda_alike() or current_platform.is_xpu()),
+            reason="requires CUDA, ROCm or XPU",
         ),
     ),
     "torch",
@@ -2624,7 +2668,7 @@ SPARSE_INDEXER_EXPLICIT_BACKENDS = [
 ]
 
 
-@pytest.mark.parametrize("next_n", [1, 4])
+@pytest.mark.parametrize("next_n", [1, 2, 4])
 @pytest.mark.parametrize("backend", SPARSE_INDEXER_EXPLICIT_BACKENDS)
 @torch.inference_mode()
 def test_sparse_indexer_decode_topk_explicit_backends(
@@ -2637,27 +2681,28 @@ def test_sparse_indexer_decode_topk_explicit_backends(
     from vllm.model_executor.layers.indexer_topk import SparseIndexerTopk
 
     set_random_seed(0)
-    torch.set_default_device("cuda:0")
+    device = current_platform.device_type
+    torch.set_default_device(device)
 
     top_k = 2048
     batch_size = 4
     num_rows = batch_size * next_n
 
     # Per-row effective lens in the (B, next_n) "native spec decode" form.
-    row_ends = torch.randint(4000, 16000, (num_rows,), dtype=torch.int32, device="cuda")
+    row_ends = torch.randint(4000, 16000, (num_rows,), dtype=torch.int32, device=device)
     seq_lens = row_ends.reshape(batch_size, next_n)
     max_seq_len = int(row_ends.max())
     # Pad the stride: multiple of 4 for cooperative_topk (TMA) and
     # 1024B-aligned (256 fp32) for DeepSelect.
     stride = (max_seq_len + 255) // 256 * 256
 
-    row_starts = torch.zeros(num_rows, dtype=torch.int32, device="cuda")
+    row_starts = torch.zeros(num_rows, dtype=torch.int32, device=device)
 
-    logits = torch.randn(num_rows, stride, dtype=torch.float32, device="cuda")
-    col_idx = torch.arange(stride, device="cuda")
+    logits = torch.randn(num_rows, stride, dtype=torch.float32, device=device)
+    col_idx = torch.arange(stride, device=device)
     logits[col_idx[None, :] >= row_ends[:, None]] = 1e30  # dirty tail
 
-    indices = torch.full((num_rows, top_k), -2, dtype=torch.int32, device="cuda")
+    indices = torch.full((num_rows, top_k), -2, dtype=torch.int32, device=device)
     cfg = VllmConfig(kernel_config={"sparse_indexer_topk_backend": backend})
     with set_current_vllm_config(cfg):
         SparseIndexerTopk()(logits, seq_lens, next_n, indices, top_k, max_seq_len)
@@ -2665,7 +2710,7 @@ def test_sparse_indexer_decode_topk_explicit_backends(
 
     # k_i == top_k for every row here (row_ends >= 3997 > top_k).
     assert torch.all(indices >= 0)
-    torch_indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
+    torch_indices = torch.empty((num_rows, top_k), dtype=torch.int32, device=device)
     for i in range(num_rows):
         row_end = int(row_ends[i])
         torch_indices[i] = logits[i, :row_end].topk(top_k, dim=-1)[1]
@@ -2689,15 +2734,16 @@ def test_sparse_indexer_decode_topk_short_seq_lens(
     from vllm.model_executor.layers.indexer_topk import SparseIndexerTopk
 
     set_random_seed(0)
+    device = current_platform.device_type
     next_n = 4
     top_k = 512
     vocab = 8192  # 1024B-aligned rows for DeepSelect
     # 1D (B,) seq_lens: rows of a request share its len and each kernel
     # derives per-row ends (with clamping) itself.
-    seq_lens = torch.tensor([2, 6], dtype=torch.int32, device="cuda")
+    seq_lens = torch.tensor([2, 6], dtype=torch.int32, device=device)
     num_rows = 2 * next_n
-    logits = torch.randn(num_rows, vocab, dtype=torch.float32, device="cuda")
-    indices = torch.full((num_rows, top_k), -2, dtype=torch.int32, device="cuda")
+    logits = torch.randn(num_rows, vocab, dtype=torch.float32, device=device)
+    indices = torch.full((num_rows, top_k), -2, dtype=torch.int32, device=device)
 
     cfg = VllmConfig(kernel_config={"sparse_indexer_topk_backend": backend})
     with set_current_vllm_config(cfg):

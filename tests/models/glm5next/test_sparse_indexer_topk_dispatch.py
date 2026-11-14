@@ -256,3 +256,176 @@ def test_kpool_profiling_reserves_decode_logits_workspace(
         assert out is topk_buf
     finally:
         reset_workspace_manager()
+
+
+@pytest.mark.skipif(not current_platform.is_xpu(), reason="XPU-only dispatch")
+@pytest.mark.parametrize("backend", ["auto", "per_row", "torch"])
+def test_kpool_indexer_dispatches_through_shared_topk_backend_xpu(
+    backend: str,
+) -> None:
+    """The XPU kpool indexer goes through the shared dispatcher too."""
+    from vllm.models.glm5next.sparse_indexer import SparseAttnIndexerKpool
+    from vllm.models.glm5next.xpu.sparse_indexer import (
+        SparseAttnIndexerKpool as XpuSparseAttnIndexerKpool,
+    )
+
+    assert SparseAttnIndexerKpool is XpuSparseAttnIndexerKpool
+    cfg = VllmConfig(kernel_config={"sparse_indexer_topk_backend": backend})
+    with set_current_vllm_config(cfg):
+        indexer = XpuSparseAttnIndexerKpool(
+            k_cache=None,
+            quant_block_size=128,
+            scale_fmt="ue8m0",
+            topk_tokens=2048,
+            head_dim=128,
+            max_pool_len=4096,
+            max_total_seq_len=8192,
+            topk_indices_buffer=torch.empty(8, 2176, dtype=torch.int32, device="xpu"),
+        )
+    assert indexer.topk_backend == backend
+
+
+@pytest.mark.skipif(not current_platform.is_xpu(), reason="XPU import isolation")
+def test_glm5next_imports_no_vendor_modules_on_xpu() -> None:
+    """On XPU the GLM-5.3-Flash model, MTP and indexer entry points must not
+    import the nvidia/ or amd/ implementations."""
+    import subprocess
+    import sys
+
+    code = (
+        "import sys\n"
+        "import vllm.models.glm5next\n"
+        "import vllm.models.glm5next.sparse_indexer\n"
+        "from vllm.model_executor.models.registry import ModelRegistry\n"
+        "for arch in ('Glm5NextForConditionalGeneration', 'Glm5NextMTPModel'):\n"
+        "    ModelRegistry._try_load_model_cls(arch)\n"
+        "bad = sorted(m for m in sys.modules if m.startswith(\n"
+        "    ('vllm.models.glm5next.nvidia', 'vllm.models.glm5next.amd')))\n"
+        "assert not bad, bad\n"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)
+
+
+def _ref_mqa_logits(q, k, k_scale, weights):
+    """sum_h w[h] * relu(q[h] . k * k_scale), the MQA-logits definition."""
+    s = torch.einsum("rhd,nd->rhn", q.float(), k.float())
+    return (torch.relu(s * k_scale[None, None, :]) * weights[:, :, None]).sum(1)
+
+
+@pytest.mark.skipif(not current_platform.is_xpu(), reason="XPU kpool indexer")
+@pytest.mark.parametrize("next_n", [1, 2])
+@torch.inference_mode()
+def test_xpu_kpool_indexer_decode_matches_reference(next_n: int, workspace_init):
+    """Decode through the XPU kpool indexer with (B, next_n) per-row pool
+    lengths: every row's selected tokens must be the top pools of its own
+    context (by reference logits), expanded to tokens plus its tail pool.
+    With MTP (next_n=2) consecutive rows of a request see different numbers
+    of complete pools, and requests have different lengths."""
+    from vllm import _custom_ops as ops
+    from vllm.config import CacheConfig
+    from vllm.forward_context import set_forward_context
+    from vllm.models.glm5next.common.attention import Glm5NextIndexerCache
+    from vllm.models.glm5next.common.ops import kpool_compress as kpool_ops
+    from vllm.models.glm5next.xpu.sparse_indexer import SparseAttnIndexerKpool
+    from vllm.v1.attention.backends.mla.indexer import (
+        DeepSeekV32IndexerDecodeMetadata,
+        DeepseekV32IndexerMetadata,
+    )
+
+    torch.manual_seed(0)
+    device = torch.device("xpu")
+    kpool, page, head_dim, n_heads, topk_tokens = 4, 64, 128, 32, 64
+    select_k = topk_tokens // kpool
+    # Token positions of each request's last next_n tokens; pools complete at
+    # pos % kpool == kpool - 1, so pool counts differ between rows.
+    last_pos = [523, 290, 1001]
+    positions = torch.tensor(
+        [p - next_n + 1 + j for p in last_pos for j in range(next_n)],
+        dtype=torch.int64,
+        device=device,
+    )
+    batch, rows = len(last_pos), len(last_pos) * next_n
+    row_pools = ((positions + 1) // kpool).to(torch.int32)
+
+    max_pools = int(row_pools.max())
+    n_pages = (max_pools + page - 1) // page
+    kv = torch.zeros(batch * n_pages + 2, page, head_dim + 4, dtype=torch.uint8)
+    kv = kv.to(device)
+    block_table = torch.randperm(kv.shape[0], device=device)[: batch * n_pages]
+    block_table = block_table.view(batch, n_pages).to(torch.int32)
+    pool_k = []
+    for b in range(batch):
+        k = torch.randn(n_pages * page, head_dim, dtype=torch.bfloat16, device=device)
+        idx = torch.arange(n_pages * page, device=device)
+        slots = block_table[b, idx // page].long() * page + idx % page
+        ops.indexer_k_quant_and_cache(k, kv, slots, head_dim, "ue8m0")
+        pool_k.append(k)
+
+    prefix = "model.layers.3.self_attn.indexer.k_cache"
+    cfg = VllmConfig(
+        cache_config=CacheConfig(block_size=kpool * page),
+        kernel_config={"sparse_indexer_topk_backend": "per_row"},
+    )
+    width = topk_tokens + kpool - 1
+    out_buf = torch.empty((rows, width), dtype=torch.int32, device=device)
+    with set_current_vllm_config(cfg):
+        k_cache = Glm5NextIndexerCache(
+            head_dim=head_dim + 4,
+            dtype=torch.uint8,
+            prefix=prefix,
+            cache_config=cfg.cache_config,
+            index_kpool=kpool,
+        )
+        k_cache.kv_cache = kv
+        indexer = SparseAttnIndexerKpool(
+            k_cache=k_cache,
+            quant_block_size=head_dim,
+            scale_fmt="ue8m0",
+            topk_tokens=topk_tokens,
+            head_dim=head_dim,
+            max_pool_len=n_pages * page,
+            max_total_seq_len=n_pages * page,
+            topk_indices_buffer=out_buf,
+            skip_k_cache_insert=True,
+        )
+    q = torch.randn(rows, n_heads, head_dim, device=device).to(torch.float8_e4m3fn)
+    weights = torch.rand(rows, n_heads, device=device)
+    meta = DeepseekV32IndexerMetadata(
+        seq_lens=row_pools.view(batch, next_n)[:, -1].contiguous(),
+        max_seq_len=int(positions.max()) + 1,
+        slot_mapping=torch.full((rows,), -1, dtype=torch.int64, device=device),
+        num_decodes=batch,
+        num_decode_tokens=rows,
+        num_prefills=0,
+        num_prefill_tokens=0,
+        decode=DeepSeekV32IndexerDecodeMetadata(
+            block_table=block_table,
+            seq_lens=row_pools.view(batch, next_n).contiguous(),
+            decode_lens=torch.full((batch,), next_n, dtype=torch.int32, device=device),
+            requires_padding=False,
+            schedule_metadata=torch.empty(0, dtype=torch.int32, device=device),
+        ),
+    )
+    hidden = torch.zeros(rows, 8, dtype=torch.bfloat16, device=device)
+    k_new = torch.zeros(rows, head_dim, dtype=torch.bfloat16, device=device)
+    with set_current_vllm_config(cfg), set_forward_context({prefix: meta}, cfg):
+        out = indexer(hidden, q, k_new, weights, index_kpool=kpool, positions=positions)
+
+    for r in range(rows):
+        b, n = r // next_n, int(row_pools[r])
+        k_ref = pool_k[b][:n].float()
+        amax = k_ref.abs().amax(-1, keepdim=True).clamp(min=1e-4)
+        scale = torch.exp2(torch.ceil(torch.log2(amax / 448.0)))
+        k_fp8 = (k_ref / scale).to(torch.float8_e4m3fn)
+        ref = _ref_mqa_logits(
+            q[r : r + 1], k_fp8, scale.squeeze(-1), weights[r : r + 1]
+        )
+        ref_pools = ref[0].topk(min(select_k, n)).indices.to(torch.int32)
+        ref_pools = torch.cat(
+            [ref_pools, ref_pools.new_full((select_k - ref_pools.numel(),), -1)]
+        )
+        expected = kpool_ops.expand_pools_and_append_tail(
+            ref_pools[None], positions[r : r + 1], kpool, seq_offset=1
+        )[0]
+        got = set(out[r].tolist()) - {-1}
+        assert got == set(expected.tolist()) - {-1}, f"row {r} (request {b})"

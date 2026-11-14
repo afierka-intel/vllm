@@ -14,17 +14,20 @@ KPOOL = 4
 
 
 @pytest.mark.parametrize(
-    "rocm,sm120,expected",
+    "rocm,sm120,xpu,expected",
     [
-        (False, False, [KPOOL * 32, KPOOL * 64]),
+        (False, False, False, [KPOOL * 32, KPOOL * 64]),
         # SM120 DeepGEMM takes only 64-entry pages for the fp8 cache.
-        (False, True, [KPOOL * 64]),
+        (False, True, False, [KPOOL * 64]),
         # ROCm's AITER paged-MQA logits take the same pool pages.
-        (True, False, [KPOOL * 32, KPOOL * 64]),
+        (True, False, False, [KPOOL * 32, KPOOL * 64]),
+        # The XPU paged-MQA logits kernel takes only 64-entry pages.
+        (False, False, True, [KPOOL * 64]),
     ],
 )
-def test_glm5next_indexer_kernel_block_sizes(monkeypatch, rocm, sm120, expected):
+def test_glm5next_indexer_kernel_block_sizes(monkeypatch, rocm, sm120, xpu, expected):
     monkeypatch.setattr(current_platform, "is_rocm", lambda: rocm)
+    monkeypatch.setattr(current_platform, "is_xpu", lambda: xpu)
     monkeypatch.setattr(
         current_platform,
         "is_device_capability_family",
