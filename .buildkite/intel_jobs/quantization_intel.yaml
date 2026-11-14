@@ -14,7 +14,11 @@ steps:
   source_file_dependencies:
   - csrc/
   - vllm/model_executor/layers/quantization
+  - vllm/model_executor/kernels/linear/mxfp4
+  - vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
   - tests/quantization
+  - tests/kernels/quantization/test_mxfp4_kernel_selection.py
+  - tests/kernels/moe/test_ocp_mx_moe.py
   commands:
   # - VLLM_TEST_FORCE_LOAD_FORMAT=auto pytest -v -s quantization/ --ignore quantization/test_blackwell_moe.py
   - >-
@@ -26,4 +30,9 @@ steps:
     VLLM_TEST_FORCE_LOAD_FORMAT=auto pytest -v -s
     tests/models/quantization/test_fp8_per_channel.py
     --deselect="tests/models/quantization/test_fp8_per_channel.py::test_fp8_per_channel_logprobs[moe]"
+  - pytest -v -s tests/kernels/quantization/test_mxfp4_kernel_selection.py
+  - >-
+    pytest -v -s tests/quantization/test_compressed_tensors.py
+    -k "mxfp4_linear_with_fp8_inputs or mxfp4_w4a8_emulation"
+  - pytest -v -s tests/kernels/moe/test_ocp_mx_moe.py -k xpu_mxfp4_moe
 
