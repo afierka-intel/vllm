@@ -176,7 +176,6 @@ def test_reduce_segments_ignores_empty_softmax_states(empty_state: str) -> None:
         32,
         torch.tensor([0, 1], dtype=torch.int32, device=DEVICE_TYPE),
         16,
-        16,
         False,
     )
     torch.testing.assert_close(
@@ -230,7 +229,6 @@ def test_reduce_segments_leaves_graph_padding_untouched(query_lens, seq_lens) ->
         32,
         32,
         query_starts,
-        16,
         16,
         False,
     )
@@ -771,6 +769,7 @@ def test_triton_unified_attn(
         softmax_segm_max=softmax_segm_max,
         softmax_segm_expsum=softmax_segm_expsum,
         kv_quant_mode=kv_quant_mode,
+        use_td=current_platform.is_xpu(),
     )
 
     ref_output = ref_paged_attn(
@@ -894,6 +893,7 @@ def test_triton_unified_attn_bf16_query_fp8_kv(
         softmax_segm_max=softmax_segm_max,
         softmax_segm_expsum=softmax_segm_expsum,
         kv_quant_mode=KVQuantMode.FP8_PER_TENSOR,
+        use_td=current_platform.is_xpu(),
     )
 
     ref_output = ref_paged_attn(
@@ -1013,6 +1013,7 @@ def test_triton_unified_attn_fp16_input_fp8_output(
         softmax_segm_output=softmax_segm_output,
         softmax_segm_max=softmax_segm_max,
         softmax_segm_expsum=softmax_segm_expsum,
+        use_td=current_platform.is_xpu(),
     )
 
     ref_output = ref_paged_attn(

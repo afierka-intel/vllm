@@ -1629,6 +1629,7 @@ package_data = {
         # the wheel and forces fallback to default launch configs.
         "model_executor/layers/mamba/ops/configs/selective_state_update/*.json",
         "kernels/helion/configs/*/*.json",
+        "v1/attention/ops/configs/unified_attention/*.json",
         "model_executor/layers/quantization/utils/configs/*.json",
         "entrypoints/serve/instrumentator/static/*.js",
         "entrypoints/serve/instrumentator/static/*.css",
