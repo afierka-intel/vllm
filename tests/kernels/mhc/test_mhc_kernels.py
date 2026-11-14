@@ -15,13 +15,10 @@ from vllm.model_executor.kernels.mhc.tilelang import (
     mhc_post_tilelang,
     mhc_pre_delayed_tilelang,
 )
-from vllm.model_executor.kernels.mhc.tilelang_kernels import (
-    _HC_PRENORM_GEMM_TILELANG_KERNEL,
-    mhc_fused_post_pre_split_config,
-)
 from vllm.model_executor.kernels.mhc.torch import (
     mhc_post_torch,
     mhc_pre_delayed_torch,
+    mhc_pre_torch,
 )
 from vllm.model_executor.kernels.mhc.triton import hc_collapse_triton
 from vllm.model_executor.layers.mhc import (
@@ -409,6 +406,10 @@ def mhc_fused_post_pre_delayed_ref(
 @pytest.mark.parametrize("carried", [False, True])
 def test_deepseek_v41_mhc_fused_post_pre_delayed(num_tokens, hidden_size, carried):
     """Fold the post block into the delayed pre without changing its outputs."""
+    from vllm.model_executor.kernels.mhc.tilelang_kernels import (
+        mhc_fused_post_pre_split_config,
+    )
+
     set_random_seed(0)
     hc_mult = 4
     mix_size = hc_mult * (hc_mult + 2)
@@ -1077,6 +1078,10 @@ def _torch_hc_prenorm_gemm(
     ],
 )
 def test_hc_prenorm_gemm_tilelang(num_tokens, hidden_size):
+    from vllm.model_executor.kernels.mhc.tilelang_kernels import (
+        _HC_PRENORM_GEMM_TILELANG_KERNEL,
+    )
+
     torch.set_default_device(DEVICE)
     set_random_seed(0)
 
@@ -1242,6 +1247,10 @@ def _mhc_fused_post_pre_inputs(
 def test_mhc_fused_post_pre_reuse_residual_is_exact(num_tokens, hidden_size):
     """Writing the next residual into the dead input residual changes no
     output, and the unfused path then allocates no new residual."""
+    from vllm.model_executor.kernels.mhc.tilelang_kernels import (
+        mhc_fused_post_pre_split_config,
+    )
+
     torch.set_default_device(DEVICE)
     set_random_seed(0)
     x, residual, mixes, norm_weight = _mhc_fused_post_pre_inputs(
@@ -1371,6 +1380,96 @@ def test_mhc_fused_rocm_fallback_applies_norm(monkeypatch):
     torch.testing.assert_close(out[1], pre_ref[0])
     torch.testing.assert_close(out[2], pre_ref[1])
     torch.testing.assert_close(out[3], expected_layer_input)
+
+
+# The SYCL mhc_pre / mhc_fused_post_pre ops have no norm argument, so
+# forward_xpu applies norm_weight on the returned layer input, like the ROCm
+# fallback. GLM-5.3-Flash runs its input and post-attention RMSNorms only
+# through these ops; DeepSeek-V4 passes no norm_weight.
+_XPU_HIDDEN_SIZE = 4096  # GLM-5.3-Flash
+_XPU_HC_MULT = 4
+# rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
+_XPU_HC_ARGS = (1e-6, 1e-6, 1e-6, 2.0, 20)
+_XPU_NORM_EPS = 1e-5
+
+
+def _xpu_mhc_inputs(num_tokens: int):
+    residual = torch.randn(
+        num_tokens, _XPU_HC_MULT, _XPU_HIDDEN_SIZE, dtype=torch.bfloat16, device=DEVICE
+    )
+    mix_hc = (2 + _XPU_HC_MULT) * _XPU_HC_MULT
+    fn = torch.randn(mix_hc, _XPU_HC_MULT * _XPU_HIDDEN_SIZE, device=DEVICE) * 1e-4
+    hc_scale = torch.randn(3, device=DEVICE) * 0.1
+    hc_base = torch.randn(mix_hc, device=DEVICE) * 0.1
+    norm_weight = torch.empty(_XPU_HIDDEN_SIZE, dtype=torch.bfloat16, device=DEVICE)
+    norm_weight.uniform_(0.5, 1.5)
+    return residual, fn, hc_scale, hc_base, norm_weight
+
+
+def _xpu_expected_layer_input(layer_input, norm_weight, with_norm):
+    if not with_norm:
+        return layer_input
+    return F.rms_norm(layer_input, (_XPU_HIDDEN_SIZE,), norm_weight, _XPU_NORM_EPS)
+
+
+@pytest.mark.skipif(not current_platform.is_xpu(), reason="XPU required")
+@pytest.mark.parametrize("num_tokens", [1, 7, 128])
+@pytest.mark.parametrize("with_norm", [False, True])
+def test_mhc_pre_xpu_applies_norm(num_tokens, with_norm):
+    set_random_seed(0)
+    residual, fn, hc_scale, hc_base, norm_weight = _xpu_mhc_inputs(num_tokens)
+    args = (residual, fn, hc_scale, hc_base, *_XPU_HC_ARGS)
+    norm = dict(norm_weight=norm_weight, norm_eps=_XPU_NORM_EPS) if with_norm else {}
+
+    out = object.__new__(MHCPreOp).forward_xpu(*args, **norm)
+
+    ref_post, ref_comb, ref_layer_input = mhc_pre_torch(*args)
+    torch.testing.assert_close(out[0], ref_post)
+    torch.testing.assert_close(out[1], ref_comb)
+    torch.testing.assert_close(
+        out[2], _xpu_expected_layer_input(ref_layer_input, norm_weight, with_norm)
+    )
+
+
+@pytest.mark.skipif(not current_platform.is_xpu(), reason="XPU required")
+@pytest.mark.parametrize("num_tokens", [1, 7, 128])
+@pytest.mark.parametrize("with_norm", [False, True])
+def test_mhc_fused_post_pre_xpu_applies_norm(num_tokens, with_norm):
+    set_random_seed(0)
+    residual, fn, hc_scale, hc_base, norm_weight = _xpu_mhc_inputs(num_tokens)
+    x = torch.randn(num_tokens, _XPU_HIDDEN_SIZE, dtype=torch.bfloat16, device=DEVICE)
+    post_layer_mix = torch.rand(num_tokens, _XPU_HC_MULT, 1, device=DEVICE)
+    comb_res_mix = torch.rand(num_tokens, _XPU_HC_MULT, _XPU_HC_MULT, device=DEVICE)
+    norm = dict(norm_weight=norm_weight, norm_eps=_XPU_NORM_EPS) if with_norm else {}
+
+    out = object.__new__(MHCFusedPostPreOp).forward_xpu(
+        x,
+        residual,
+        post_layer_mix,
+        comb_res_mix,
+        fn,
+        hc_scale,
+        hc_base,
+        *_XPU_HC_ARGS,
+        **norm,
+    )
+
+    torch.testing.assert_close(
+        out[0], mhc_post_torch(x, residual, post_layer_mix, comb_res_mix)
+    )
+    # The op rounds the post-mix residual to bf16 and runs the pre step on
+    # that buffer. Where the fp32 sum sits near a bf16 rounding midpoint the
+    # op and mhc_post_torch may round it differently (one ulp, within the
+    # bf16 tolerance above), so the pre step is checked on the op's own
+    # residual, as test_deepseek_v41_mhc_fused_post_pre_delayed does.
+    ref_post, ref_comb, ref_layer_input = mhc_pre_torch(
+        out[0], fn, hc_scale, hc_base, *_XPU_HC_ARGS
+    )
+    torch.testing.assert_close(out[1], ref_post)
+    torch.testing.assert_close(out[2], ref_comb)
+    torch.testing.assert_close(
+        out[3], _xpu_expected_layer_input(ref_layer_input, norm_weight, with_norm)
+    )
 
 
 @pytest.mark.skipif(
