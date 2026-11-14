@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -138,6 +138,9 @@ def test_replay_kv_publishes_all_pcp_owners(pcp_size, monkeypatch):
         rotary_emb=rotary,
         indexer_rotary_emb=rotary,
         kv_mxfp8=False,
+    )
+    layer._kv_rope_insert = MethodType(
+        attention_module.DeepseekV4Attention._kv_rope_insert, layer
     )
     context = ForwardContext(
         no_compile_layers={}, attn_metadata={"swa": metadata}, slot_mapping={}

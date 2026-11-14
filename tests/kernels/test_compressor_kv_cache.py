@@ -12,7 +12,7 @@ These tests cover:
 """
 
 import math
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -245,6 +245,9 @@ def test_v41_pcp_swa_cache_matches_non_pcp_writer(kv_mxfp8, monkeypatch):
         padded_heads=num_heads,
         eps=1e-20,
         head_dim=512,
+    )
+    attention._kv_rope_insert = MethodType(
+        DeepseekV4Attention._kv_rope_insert, attention
     )
     # metadata is a SimpleNamespace stub of the attention metadata.
     DeepseekV4Attention._fused_qnorm_rope_kv_insert(
