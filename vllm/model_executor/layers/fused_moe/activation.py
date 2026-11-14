@@ -311,6 +311,29 @@ def silu_and_mul_with_clamp(
         torch.ops._C.silu_and_mul_with_clamp(output, input, clamp_limit, 1.0, 0.0)
 
 
+def _silu_and_mul_usable() -> bool:
+    from vllm.model_executor.layers.activation import SiluAndMul
+    from vllm.utils.kernel_probe import kernel_usable
+
+    def make_input() -> torch.Tensor:
+        return torch.linspace(-4.0, 4.0, 2 * 32, device=current_platform.device_type)
+
+    def run() -> torch.Tensor:
+        x = make_input().view(2, 32)
+        out = x.new_empty(2, 16)
+        torch.ops._C.silu_and_mul(out, x)
+        return out
+
+    # fp32 on both sides; they differ only in the rounding of exp().
+    return kernel_usable(
+        "_C.silu_and_mul",
+        run,
+        lambda: SiluAndMul.forward_native(make_input().view(2, 32)),
+        atol=1e-6,
+        rtol=1e-5,
+    )
+
+
 def apply_moe_activation(
     activation: MoEActivation,
     output: torch.Tensor,
@@ -352,6 +375,10 @@ def apply_moe_activation(
             silu_and_mul_with_clamp(
                 output, input, config.clamp_limit, topk_ids, expert_map
             )
+        elif current_platform.is_xpu() and not _silu_and_mul_usable():
+            from vllm.model_executor.layers.activation import SiluAndMul
+
+            output.copy_(SiluAndMul.forward_native(input))
         else:
             torch.ops._C.silu_and_mul(output, input)
     elif activation == MoEActivation.GELU:

@@ -2254,6 +2254,165 @@ def test_moe_sum_pad_aware(topk: int, dtype: torch.dtype, topk_ids_dtype: torch.
     opcheck(torch.ops._moe_C.moe_sum, (input, actual, topk_ids, expert_map))
 
 
+def _moe_sum_inputs(
+    m: int, topk: int, k: int, dtype: torch.dtype, device: str
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    input = torch.randn((m, topk, k), device=device, dtype=dtype)
+    topk_ids = torch.randint(0, 4, (m, topk), device=device, dtype=torch.int32)
+    topk_ids[0, :] = -1
+    topk_ids[1, 0] = -1
+    expert_map = torch.tensor([0, -1, 1, -1], device=device, dtype=torch.int32)
+    return input, topk_ids, expert_map
+
+
+@pytest.mark.parametrize("pad_aware", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_moe_sum_torch(pad_aware: bool, dtype: torch.dtype):
+    """The torch implementation of `_moe_C.moe_sum` against its definition."""
+    from vllm._custom_ops import _moe_sum_torch
+
+    input, topk_ids, expert_map = _moe_sum_inputs(17, 4, 128, dtype, "cpu")
+    # Multiples of 1/8 below 8 in magnitude: every partial sum is exact, so
+    # the result does not depend on the summation order.
+    input = input.clamp(-1.9, 1.9).mul(8).round().div(8)
+    routed = torch.ones_like(topk_ids, dtype=torch.bool)
+    if pad_aware:
+        routed = (topk_ids >= 0) & (expert_map[topk_ids.clamp(min=0).long()] >= 0)
+    else:
+        topk_ids = expert_map = None
+    # NaN in skipped slots must not leak into the sum.
+    input[~routed] = float("nan")
+    expected = torch.zeros((17, 128), dtype=torch.float32)
+    for j in range(4):
+        expected += torch.where(routed[:, j, None], input[:, j].float(), 0.0)
+
+    actual = torch.empty((17, 128), dtype=dtype)
+    _moe_sum_torch(input, actual, topk_ids, expert_map)
+    torch.testing.assert_close(actual, expected.to(dtype), atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not current_platform.is_xpu(), reason="XPU-only fallback")
+@pytest.mark.parametrize("pad_aware", [False, True])
+@pytest.mark.parametrize("topk", [2, 8])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_moe_sum_torch_matches_native_xpu(
+    pad_aware: bool, topk: int, dtype: torch.dtype
+):
+    from vllm import _custom_ops as ops
+
+    if not ops._moe_sum_usable():
+        pytest.skip("_moe_C.moe_sum is not usable on this device")
+    input, topk_ids, expert_map = _moe_sum_inputs(33, topk, 1024, dtype, "xpu")
+    routing = (topk_ids, expert_map) if pad_aware else (None, None)
+    native = torch.empty((33, 1024), device="xpu", dtype=dtype)
+    portable = torch.empty_like(native)
+    torch.ops._moe_C.moe_sum(input, native, *routing)
+    ops._moe_sum_torch(input, portable, *routing)
+    # Both accumulate in fp32; only the summation order differs, which can
+    # flip the final rounding by one ulp of the output dtype.
+    rtol = 2**-7 if dtype == torch.bfloat16 else 1e-6
+    torch.testing.assert_close(portable, native, atol=1e-5, rtol=rtol)
+
+
+_PORTABLE_MOE_KERNELS = (
+    "_moe_C.moe_align_block_size",
+    "_moe_C.moe_sum",
+    "_C.silu_and_mul",
+)
+
+
+@pytest.mark.skipif(not current_platform.is_xpu(), reason="XPU-only fallback")
+@pytest.mark.parametrize("m,n,k", [(33, 128, 128), (222, 2048, 511)])
+@pytest.mark.parametrize("ep_size", EP_SIZE)
+def test_triton_experts_portable_fallbacks_xpu(
+    m: int, n: int, k: int, ep_size: int, monkeypatch, workspace_init
+):
+    """TritonExperts with the compiled MoE and activation ops marked unusable."""
+    from vllm import _custom_ops as ops
+    from vllm.model_executor.layers.activation import SiluAndMul
+    from vllm.utils.kernel_probe import set_kernel_usable
+
+    set_random_seed(7)
+    e, topk, dtype = 64, 6, torch.bfloat16
+    a = torch.randn((m, k), device=DEVICE_TYPE, dtype=dtype) / 10
+    w1 = torch.randn((e, 2 * n, k), device=DEVICE_TYPE, dtype=dtype) / 10
+    w2 = torch.randn((e, k, n), device=DEVICE_TYPE, dtype=dtype) / 10
+    score = torch.randn((m, e), device=DEVICE_TYPE, dtype=dtype)
+    e_map = None
+    if ep_size > 1:
+        local_e = e // ep_size
+        e_ids = torch.randperm(e, device=DEVICE_TYPE)[:local_e]
+        e_map = torch.full((e,), -1, device=DEVICE_TYPE, dtype=torch.int32)
+        e_map[e_ids] = torch.arange(local_e, device=DEVICE_TYPE, dtype=torch.int32)
+        w1 = w1[e_ids]
+        w2 = w2[e_ids]
+
+    m_fused_moe_fn = modular_triton_fused_moe(
+        make_dummy_moe_config(), FUSED_MOE_UNQUANTIZED_CONFIG
+    )
+
+    def m_fused_moe(a, w1, w2, score, topk, global_num_experts=-1, expert_map=None):
+        topk_weights, topk_ids, _ = fused_topk(a, score, topk, False)
+        return m_fused_moe_fn.apply(
+            a,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            activation=MoEActivation.SILU,
+            global_num_experts=global_num_experts,
+            expert_map=expert_map,
+            apply_router_weight_on_input=False,
+        )
+
+    with set_current_vllm_config(vllm_config):
+        baseline = torch_moe(
+            a, w1, w2, score, topk, global_num_experts=e, expert_map=e_map
+        )
+
+    calls: dict[str, int] = {}
+
+    def counting(name: str, fn: Callable) -> Callable:
+        def wrapper(*args, **kwargs):
+            calls[name] = calls.get(name, 0) + 1
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    monkeypatch.setattr(
+        ops,
+        "_moe_align_block_size_torch",
+        counting("align", ops._moe_align_block_size_torch),
+    )
+    monkeypatch.setattr(ops, "_moe_sum_torch", counting("sum", ops._moe_sum_torch))
+    monkeypatch.setattr(
+        SiluAndMul,
+        "forward_native",
+        staticmethod(counting("silu_and_mul", SiluAndMul.forward_native)),
+    )
+
+    for name in _PORTABLE_MOE_KERNELS:
+        set_kernel_usable(name, False)
+    try:
+        with set_current_vllm_config(vllm_config):
+            run_moe_test(
+                baseline,
+                m_fused_moe,
+                a=a,
+                w1=w1,
+                w2=w2,
+                score=score,
+                topk=topk,
+                global_num_experts=e,
+                expert_map=e_map,
+            )
+    finally:
+        for name in _PORTABLE_MOE_KERNELS:
+            set_kernel_usable(name, None)
+
+    assert calls.keys() == {"align", "sum", "silu_and_mul"}, calls
+
+
 @pytest.mark.parametrize(
     ("quant_dtype", "scale_max"),
     [(torch.float8_e4m3fn, 448.0), (torch.int8, 127.0)],
