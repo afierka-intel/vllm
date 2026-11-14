@@ -227,9 +227,15 @@ def model_workloads(args):
             for batch, q, kv in product(batch_sizes, args.query_len, args.kv_len)
             if q <= kv
         ]
-    for (query_lens, kv_lens), window in product(batches, windows):
+    for (query_lens, kv_lens), window, num_blocks in product(
+        batches, windows, args.num_blocks or [None]
+    ):
+        case = {}
+        if num_blocks is not None:
+            case["num_blocks"] = num_blocks
         cases.append(
-            {
+            case
+            | {
                 "id": f"model-{len(cases):04d}",
                 "batch": len(query_lens),
                 "query_lens": list(query_lens),
@@ -653,6 +659,12 @@ def parse_args(argv=None):
         ),
     )
     parser.add_argument("--block-size", type=int, default=32)
+    parser.add_argument(
+        "--num-blocks",
+        type=int,
+        nargs="+",
+        help="KV-cache pool sizes in blocks (default: just enough for each batch)",
+    )
     parser.add_argument(
         "--sliding-window",
         type=int,
