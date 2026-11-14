@@ -68,7 +68,7 @@ def _update_inputs(requests, tokens, seed, padded) -> _Inputs:
 def test_kpool_update_matches_stock(requests, tokens, padded):
     """Tail stashes, completed pools (FP8 values and UE8M0 scales) and the
     in-order read of a request's earlier stashes match bit for bit."""
-    from vllm.models.glm5next.nvidia.ops.kpool_compress import (
+    from vllm.models.glm5next.common.ops.kpool_compress import (
         kpool_decode_update_and_maybe_write_cache_batched as stock,
     )
     from vllm.models.glm5next.nvidia.specialized_decode.kpool import kpool_update
@@ -110,7 +110,7 @@ def _pool_ids(rows, seq, seed):
 
 @pytest.mark.parametrize("rows", [1, 64])
 def test_expand_matches_stock(rows):
-    from vllm.models.glm5next.nvidia.ops.kpool_compress import (
+    from vllm.models.glm5next.common.ops.kpool_compress import (
         expand_pools_and_append_tail,
     )
     from vllm.models.glm5next.nvidia.specialized_decode.kpool import expand_pools
@@ -128,7 +128,7 @@ def test_expand_matches_stock(rows):
 def test_expand_and_remap_matches_stock(rows, padding, stride_rows, max_blocks):
     """Expansion plus the compacting remap equals the stock pair, including
     pools past the block table (dropped) and padded rows (all -1)."""
-    from vllm.models.glm5next.nvidia.ops.kpool_compress import (
+    from vllm.models.glm5next.common.ops.kpool_compress import (
         expand_pools_and_append_tail,
     )
     from vllm.models.glm5next.nvidia.specialized_decode.kpool import expand_and_remap

@@ -28,7 +28,7 @@ from vllm.model_executor.models.utils import (
     get_fused_shared_expert_layers,
     maybe_prefix,
 )
-from vllm.models.glm5next.nvidia.ops.fused_eh_norm import fused_eh_norm
+from vllm.models.glm5next.common.ops.fused_eh_norm import fused_eh_norm
 from vllm.models.glm5next.nvidia.specialized_decode.runtime import (
     specialized_decode_config,
 )

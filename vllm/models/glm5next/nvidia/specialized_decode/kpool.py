@@ -22,7 +22,7 @@ from cutlass import Float32, Int32, Int64, Uint32
 
 from vllm.forward_context import in_piecewise_cudagraph
 from vllm.model_executor.layers.sparse_attn_indexer import as_fp32_logits
-from vllm.models.glm5next.nvidia.ops.kpool_compress import (
+from vllm.models.glm5next.common.ops.kpool_compress import (
     expand_pools_and_append_tail,
     kpool_decode_update_and_maybe_write_cache_batched,
 )

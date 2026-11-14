@@ -38,7 +38,7 @@ if current_platform.is_rocm():
         kpool_seed_tail_cache,
     )
 else:
-    from vllm.models.glm5next.nvidia.ops.kpool_compress import (
+    from vllm.models.glm5next.common.ops.kpool_compress import (
         kpool_compress_and_write_cache,
         kpool_decode_update_and_maybe_write_cache_batched,
         kpool_seed_tail_cache,
