@@ -4937,3 +4937,34 @@ def test_layer_range_with_prefill_context_parallel(monkeypatch):
         for rank in range(8)
     ]
     assert ranges == [(0, 5)] * 4 + [(5, 12)] * 4
+
+
+@pytest.mark.parametrize("quantization", [None, "fp8", "compressed-tensors"])
+def test_xpu_portable_kernels_defaults(quantization):
+    """The preset fills only options left at their defaults."""
+    from vllm.config.kernel import KernelConfig
+
+    kc = KernelConfig(
+        xpu_portable_kernels=True,
+        sparse_indexer_topk_backend="per_row",
+        linear_backend_per_quant={"mxfp4": "xpu"},
+        ir_op_priority={"fused_add_rms_norm": ["vllm_c"]},
+    )
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(quantization=quantization),
+        compilation_config=CompilationConfig(custom_ops=["+rotary_embedding"]),
+    )
+    kc._apply_xpu_portable_defaults(config)
+    kc._apply_xpu_portable_defaults(config)  # idempotent
+
+    assert kc.sparse_indexer_topk_backend == "per_row"
+    assert kc.sparse_indexer_backend == "triton"
+    expected_moe = "auto" if quantization == "compressed-tensors" else "triton"
+    assert kc.moe_backend == expected_moe
+    assert kc.linear_backend_per_quant == {"mxfp4": "xpu", "fp8_block_w8a8": "triton"}
+    assert kc.ir_op_priority.rms_norm == ["native"]
+    assert kc.ir_op_priority.fused_add_rms_norm == ["vllm_c"]
+    assert config.compilation_config.custom_ops == [
+        "+rotary_embedding",
+        "-silu_and_mul",
+    ]

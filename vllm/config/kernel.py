@@ -181,6 +181,8 @@ SparseIndexerTopkBackend = Literal[
     "aiter",
 ]
 
+SparseIndexerBackend = Literal["auto", "native", "triton"]
+
 FlashInferSparseMLAKernel = Literal["auto", "trtllm", "prims_ts"]
 
 # DeepGEMM consumes the DeepSeek-V4 MXFP4 checkpoint recipe. CuTeDSL is
@@ -385,6 +387,29 @@ class KernelConfig:
     kernel, avoiding a full FP32 logits copy.
     """
 
+    sparse_indexer_backend: SparseIndexerBackend = "auto"
+    """Implementation of the DSA sparse indexer operators other than top-k
+    (FP8 MQA logits and the indexer K cache ops) on XPU. Available options:
+
+    - "auto": Use the native kernels from vllm-xpu-kernels when a one-time
+      probe shows they work on the device, else the Triton kernels
+    - "native": Always use the native kernels
+    - "triton": Always use the Triton kernels
+
+    Other platforms only accept "auto". Explicit values raise RuntimeError
+    when their constraints are not met.
+    """
+
+    xpu_portable_kernels: bool = False
+    """On XPU, default every kernel choice that has a Triton or torch
+    implementation to it instead of the vllm-xpu-kernels op: block FP8 and
+    MXFP4 linear layers, MoE (unquantized and FP8), RMSNorm, SiLU-and-mul,
+    the DeepSeek scaling RoPE, and the DSA sparse indexer (logits, K cache,
+    top-k). Explicitly set options keep their values. Meant for
+    vllm-xpu-kernels builds without some kernel families and for parity
+    tests against the native kernels. Ignored on other platforms.
+    """
+
     flashinfer_sparse_mla_kernel: FlashInferSparseMLAKernel = "auto"
     """Kernel of the SM100 FLASHINFER_MLA_SPARSE backend for D576 sparse MLA.
     Available options:
@@ -469,6 +494,13 @@ class KernelConfig:
             return value.lower().replace("-", "_")
         return value
 
+    @field_validator("sparse_indexer_backend", mode="before")
+    @classmethod
+    def _normalize_sparse_indexer_backend(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.lower().replace("-", "_")
+        return value
+
     @field_validator("rdna_hybrid_w4a16_prefill_dequant", mode="before")
     @classmethod
     def _normalize_rdna_hybrid_w4a16_prefill_dequant(cls, value: Any) -> Any:
@@ -505,9 +537,57 @@ class KernelConfig:
             return value
         return handler(value)
 
+    def _apply_xpu_portable_defaults(self, vllm_config: "VllmConfig") -> None:
+        """Default kernel options to Triton/torch implementations (see
+        `xpu_portable_kernels`). Options the user set keep their values. Runs
+        before the platform IR op priorities are appended."""
+        import vllm.envs as envs
+
+        changed: list[str] = []
+
+        def default(name: str, value: Any) -> None:
+            if getattr(self, name) == "auto":
+                setattr(self, name, value)
+                changed.append(f"{name}={value!r}")
+
+        default("sparse_indexer_topk_backend", "torch")
+        default("sparse_indexer_backend", "triton")
+        model_config = vllm_config.model_config
+        if model_config is None or model_config.quantization in (None, "fp8"):
+            default("moe_backend", "triton")
+        per_quant: dict[str, LinearBackend] = dict(self.linear_backend_per_quant or {})
+        portable_linear: tuple[tuple[str, LinearBackend], ...] = (
+            ("fp8_block_w8a8", "triton"),
+            ("mxfp4", "emulation"),
+        )
+        for quant, backend in portable_linear:
+            if quant not in per_quant:
+                per_quant[quant] = backend
+                changed.append(f"linear_backend_per_quant[{quant!r}]={backend!r}")
+        self.linear_backend_per_quant = per_quant
+        for op_name in ("rms_norm", "fused_add_rms_norm"):
+            if not getattr(self.ir_op_priority, op_name):
+                setattr(self.ir_op_priority, op_name, ["native"])
+                changed.append(f"ir_op_priority.{op_name}=['native']")
+        custom_ops = vllm_config.compilation_config.custom_ops
+        for op_name in ("silu_and_mul", "rotary_embedding"):
+            if f"+{op_name}" not in custom_ops and f"-{op_name}" not in custom_ops:
+                custom_ops.append(f"-{op_name}")
+                changed.append(f"custom_ops+=['-{op_name}']")
+        if changed:
+            logger.info("xpu_portable_kernels: defaulted %s.", ", ".join(changed))
+        if envs.VLLM_XPU_USE_SAMPLER_KERNEL:
+            logger.info_once(
+                "xpu_portable_kernels: the fused XPU sampler stays enabled; set "
+                "VLLM_XPU_USE_SAMPLER_KERNEL=0 to use the torch sampler."
+            )
+
     def set_platform_defaults(self, vllm_config: "VllmConfig") -> None:
         """Set platform-specific defaults for the kernel config."""
         from vllm.platforms import current_platform
+
+        if self.xpu_portable_kernels and current_platform.is_xpu():
+            self._apply_xpu_portable_defaults(vllm_config)
 
         if vllm_config.model_config is not None:
             validate_flashinfer_moe_ep_model(
