@@ -397,8 +397,20 @@ def _mxfp4_quantize(
 
 def _fp8_quantize_dequantize(
     A: torch.Tensor,
-    A_scale: torch.Tensor,
+    A_scale: torch.Tensor | None,
+    per_act_token_quant: bool = False,
+    block_shape: list[int] | None = None,
 ):
+    if A_scale is None and (per_act_token_quant or block_shape is not None):
+        # Dynamic per-token or per-token-group (block_shape[1]) scales, as the
+        # non-emulated `_fp8_quantize` uses them.
+        from vllm.model_executor.kernels.linear.mxfp4.emulation import (
+            quant_dequant_fp8_dynamic,
+        )
+
+        group_size = -1 if block_shape is None else block_shape[1]
+        return quant_dequant_fp8_dynamic(A, group_size), None
+
     qA, qA_scale = ops.scaled_fp8_quant(A, A_scale, use_per_token_if_dynamic=False)
     A = per_tensor_dequantize(qA, qA_scale).to(A.dtype)
 
@@ -606,7 +618,9 @@ def moe_kernel_quantize_input(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     if quant_dtype == current_platform.fp8_dtype():
         if quantization_emulation:
-            return _fp8_quantize_dequantize(A, A_scale)
+            return _fp8_quantize_dequantize(
+                A, A_scale, per_act_token_quant, block_shape
+            )
         else:
             return _fp8_quantize(
                 A, A_scale, per_act_token_quant, block_shape, is_scale_transposed

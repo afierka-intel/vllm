@@ -800,11 +800,22 @@ def mxfp4_w4a8_moe_quant_config(
     w2_bias: torch.Tensor | None = None,
     block_shape: list[int] | None = None,
     gemm1_clamp_limit: float | None = None,
+    per_act_token_quant: bool = False,
 ) -> FusedMoEQuantConfig:
-    """Construct a quant config for fp8 activations and mxfp4 weights."""
+    """Construct a quant config for fp8 activations and mxfp4 weights.
+
+    Activations are per-tensor unless `per_act_token_quant` or `block_shape`
+    (per-token-group, `block_shape[1]` elements) is given.
+    """
+    assert not (per_act_token_quant and block_shape is not None)
+    a_shape: GroupShape | None = None
+    if block_shape is not None:
+        a_shape = GroupShape(row=block_shape[0], col=block_shape[1])
+    elif per_act_token_quant:
+        a_shape = GroupShape.PER_TOKEN
     return FusedMoEQuantConfig(
-        _a1=FusedMoEQuantDesc("fp8", None, a1_scale, None, None, None),
-        _a2=FusedMoEQuantDesc("fp8", None, a2_scale, None, None, None),
+        _a1=FusedMoEQuantDesc("fp8", a_shape, a1_scale, None, None, None),
+        _a2=FusedMoEQuantDesc("fp8", a_shape, a2_scale, None, None, None),
         _w1=FusedMoEQuantDesc("mxfp4", None, w1_scale, None, None, w1_bias),
         _w2=FusedMoEQuantDesc("mxfp4", None, w2_scale, None, None, w2_bias),
         gemm1_clamp_limit=gemm1_clamp_limit,
