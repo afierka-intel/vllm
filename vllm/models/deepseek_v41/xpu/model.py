@@ -30,15 +30,16 @@ import typing
 import torch
 import torch.nn as nn
 
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.kernel import MEGA_MOE_BACKENDS
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.mhc import MHCPostOp, MHCPreDelayedOp, hc_expand
 from vllm.models.deepseek_v41.attention import DeepseekV4Attention
+from vllm.models.deepseek_v41.xpu.engram import XPUChunkedEngramEmbedding
 from vllm.models.deepseek_v41.xpu.xpu_sparse import DeepseekV41XPUAttention
 
-from ..common.engram import Engram, EngramLayout
+from ..common.engram import Engram, EngramLayout, ParallelEngramEmbedding
 from ..common.model_base import (
     DeepseekV4DecoderLayerBase,
     DeepseekV4ModelBase,
@@ -131,6 +132,24 @@ class XPUEngram(Engram):
     The CUDA layer prefetches offloaded rows on a side stream; on XPU the
     lookup runs where the rows are staged, like the GPU-resident tables.
     """
+
+    def _create_embedding(
+        self, layout: EngramLayout, layer_hash_index: int
+    ) -> ParallelEngramEmbedding:
+        # `Engram._create_embedding` with pinned-chunk host storage; peer groups
+        # and THP are rejected on XPU by `_check_engram_config`.
+        engram_config = get_current_vllm_config().engram_config
+        assert engram_config is not None
+        return XPUChunkedEngramEmbedding(
+            layout.num_embeddings[layer_hash_index],
+            layout.head_dim,
+            tuple(size for order in layout.primes[layer_hash_index] for size in order),
+            cpu_offload=engram_config.cpu_offload,
+            dp_shared_memory=False,
+            use_thp=False,
+            packed_fp4=layout.packed_fp4,
+            peer_group=None,
+        )
 
     def _init_staging(self, max_tokens: int, head_dim: int) -> None:
         # `Engram._init_staging` minus the prefetch stream and event: with
