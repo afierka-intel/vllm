@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import functools
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Optional
 
@@ -31,12 +32,95 @@ from vllm.v1.attention.backends.mla.sparse_utils import (
     flat_kv_row_view,
     triton_convert_req_index_to_global_index,
 )
-from vllm.v1.attention.ops.xpu_mla_sparse import triton_bf16_mla_sparse_interface
+from vllm.v1.attention.ops.xpu_mla_sparse import (
+    DS_MLA_ENTRY_BYTES,
+    DS_MLA_NOPE_DIM,
+    DS_MLA_PE_DIM,
+    dequant_gather_ds_mla_rows,
+    triton_bf16_mla_sparse_interface,
+)
 from vllm.v1.kv_cache_interface import AttentionSpec, is_quantized_kv_cache
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.deepseek_v2 import Indexer
 logger = init_logger(__name__)
+
+# Rows of BF16 workspace (576 values each, ~1.1 KiB) one fp8_ds_mla attention
+# chunk may dequantize; a single request may exceed it (its whole context).
+FP8_DS_MLA_WORKSPACE_ROWS = 256 * 1024
+
+
+@functools.cache
+def xpu_supports_rope_free_fp8_ds_mla() -> bool:
+    """Whether the installed XPU kernels accept pe_dim == 0 for fp8_ds_mla
+    (rope-free models such as GLM-5.3-Flash); vllm_xpu_kernels 0.1.17 does
+    not."""
+    from vllm import _custom_ops as ops
+
+    kv_c = torch.zeros((1, DS_MLA_NOPE_DIM), dtype=torch.bfloat16, device="xpu")
+    kv_cache = torch.zeros((1, 1, DS_MLA_ENTRY_BYTES), dtype=torch.uint8, device="xpu")
+    try:
+        ops.concat_and_cache_mla(
+            kv_c,
+            kv_c[:, :0],
+            kv_cache,
+            torch.zeros(1, dtype=torch.int64, device="xpu"),
+            kv_cache_dtype="fp8_ds_mla",
+            scale=torch.ones(1, dtype=torch.float32, device="xpu"),
+        )
+    except RuntimeError:
+        return False
+    return True
+
+
+def build_fp8_ds_mla_chunks(
+    query_start_loc: np.ndarray,
+    seq_lens: np.ndarray,
+    topk: int,
+    max_rows: int = FP8_DS_MLA_WORKSPACE_ROWS,
+) -> tuple[list[tuple[int, int, int, int, int]], np.ndarray]:
+    """Split a batch into runs of consecutive requests for the fp8_ds_mla path.
+
+    A request whose context is smaller than query_len * topk dequantizes its
+    whole context (prefill-like), otherwise only its queries' top-k rows
+    (decode-like); a run holds requests of one kind and at most max_rows
+    workspace rows (one request alone may exceed it). Returns the runs as
+    (token_start, token_end, req_start, req_end, context_rows) and each
+    request's start in its run's context workspace.
+    """
+    chunks: list[tuple[int, int, int, int, int]] = []
+    context_starts = np.zeros(seq_lens.shape[0], dtype=np.int32)
+    cur: list[int] | None = None  # [t0, t1, r0, r1, context_rows, cost]
+    for r in range(seq_lens.shape[0]):
+        q_len = int(query_start_loc[r + 1] - query_start_loc[r])
+        ctx = int(seq_lens[r])
+        use_context = ctx < q_len * topk
+        cost = ctx if use_context else q_len * topk
+        if (
+            cur is not None
+            and (cur[4] > 0) == use_context
+            and cur[5] + cost <= max_rows
+        ):
+            cur[1] = int(query_start_loc[r + 1])
+            cur[3] = r + 1
+            cur[5] += cost
+        else:
+            if cur is not None:
+                chunks.append((cur[0], cur[1], cur[2], cur[3], cur[4]))
+            cur = [
+                int(query_start_loc[r]),
+                int(query_start_loc[r + 1]),
+                r,
+                r + 1,
+                0,
+                cost,
+            ]
+        if use_context:
+            context_starts[r] = cur[4]
+            cur[4] += ctx
+    if cur is not None:
+        chunks.append((cur[0], cur[1], cur[2], cur[3], cur[4]))
+    return chunks, context_starts
 
 
 class XPUMLASparseBackend(AttentionBackend):
@@ -45,6 +129,9 @@ class XPUMLASparseBackend(AttentionBackend):
         "auto",
         "float16",
         "bfloat16",
+        "fp8_ds_mla",
+        "fp8",  # alias for fp8_ds_mla
+        "fp8_e4m3",  # alias for fp8_ds_mla
     ]
 
     @staticmethod
@@ -115,6 +202,16 @@ class XPUMLASparseMetadata(AttentionMetadata):
     num_prefills: int = 0
     num_decode_tokens: int = 0
 
+    # fp8_ds_mla only: runs of consecutive requests attended together, as
+    # (token_start, token_end, req_start, req_end, context_rows). A run with
+    # context_rows > 0 dequantizes the requests' whole contexts (prefill-like
+    # rows, where the context is smaller than query_len * top-k); otherwise
+    # only each query's top-k rows are dequantized (decode-like rows).
+    fp8_chunks: list[tuple[int, int, int, int, int]] | None = None
+    # fp8_ds_mla only: per-request start of its context in the workspace of
+    # its context-gather run (int32 [num_reqs]).
+    fp8_context_starts: torch.Tensor | None = None
+
 
 @dataclass
 class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]):
@@ -152,6 +249,9 @@ class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]
             dtype=torch.int32,
             device=device,
         )
+        self.use_fp8_ds_mla = (
+            getattr(kv_cache_spec, "cache_dtype_str", None) == "fp8_ds_mla"
+        )
 
     def build(
         self,
@@ -173,6 +273,23 @@ class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]
 
         req_id_per_token = self.req_id_per_token_buffer[:num_tokens]
 
+        fp8_chunks = None
+        fp8_context_starts = None
+        if self.use_fp8_ds_mla:
+            seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
+            if seq_lens_cpu is None:
+                seq_lens_cpu = common_attn_metadata.seq_lens.cpu()
+            # An upper bound only over-sizes a context gather: rows past a
+            # request's real length are gathered but never selected by top-k.
+            fp8_chunks, context_starts = build_fp8_ds_mla_chunks(
+                starts,
+                np.asarray(seq_lens_cpu[: seg_lengths.shape[0]]),
+                self.topk_tokens,
+            )
+            fp8_context_starts = np_to_pinned_tensor(context_starts).to(
+                self.device, non_blocking=True
+            )
+
         metadata = XPUMLASparseMetadata(
             num_reqs=common_attn_metadata.num_reqs,
             max_query_len=common_attn_metadata.max_query_len,
@@ -189,6 +306,8 @@ class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]
             num_decodes=common_attn_metadata.num_reqs,
             num_prefills=0,
             num_decode_tokens=common_attn_metadata.num_actual_tokens,
+            fp8_chunks=fp8_chunks,
+            fp8_context_starts=fp8_context_starts,
         )
         return metadata
 
@@ -228,6 +347,25 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata], SharedTopkIndices
             )
         self.softmax_scale = scale
         self.init_topk_indices_buffer(indexer, topk_indices_buffer)
+        if kv_cache_dtype == "fp8_ds_mla":
+            # The RoPE dim (0 or 64) is checked above.
+            if self.kv_lora_rank != DS_MLA_NOPE_DIM:
+                raise ValueError(
+                    "fp8_ds_mla KV cache on XPU needs kv_lora_rank=512, got "
+                    f"{self.kv_lora_rank}."
+                )
+            if self.rope_dim == 0 and not xpu_supports_rope_free_fp8_ds_mla():
+                raise ValueError(
+                    "fp8_ds_mla KV cache for a rope-free MLA model needs a "
+                    "vllm_xpu_kernels build whose concat_and_cache_mla accepts "
+                    "pe_dim=0 (not available in 0.1.17). Use "
+                    "--kv-cache-dtype auto."
+                )
+        elif is_quantized_kv_cache(kv_cache_dtype):
+            raise ValueError(
+                f"XPU MLA Sparse supports fp8 KV only as fp8_ds_mla, got "
+                f"kv_cache_dtype={kv_cache_dtype}."
+            )
 
     def record_logical_topk_ready(self) -> None:
         # Called unconditionally by MLAAttention.forward for sparse layers. This
@@ -269,9 +407,6 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata], SharedTopkIndices
         # NOTE(lucas): for the sparse FlashMLA kernels the kernels want to use
         # MQA 576/512 approach for both prefill and decode
 
-        if is_quantized_kv_cache(self.kv_cache_dtype):
-            raise NotImplementedError("FP8 kv is not supported with XPU MLA Sparse yet")
-
         # Concatenate q if it's a tuple (ql_nope, q_pe)
         if isinstance(q, tuple):
             q = torch.cat(q, dim=-1)
@@ -284,6 +419,11 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata], SharedTopkIndices
         # kpool tail (GLM-5.3-Flash) append it after the index_topk entries.
         # Other DSA models allocate the buffer with index_topk columns.
         num_topk_tokens = topk_indices.shape[-1]
+
+        if self.kv_cache_dtype == "fp8_ds_mla":
+            return self._forward_fp8_ds_mla(
+                q, kv_c_and_k_pe_cache, topk_indices, attn_metadata
+            ), None
 
         kv_rows, block_stride_rows = flat_kv_row_view(
             kv_c_and_k_pe_cache, attn_metadata.block_size
@@ -300,3 +440,83 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata], SharedTopkIndices
         attn_out = self._forward_bf16_kv(q, kv_rows, topk_indices_global, attn_metadata)
 
         return attn_out, None
+
+    def _forward_fp8_ds_mla(
+        self,
+        q: torch.Tensor,  # [sq, heads, kv_lora_rank + qk_rope_head_dim]
+        kv_cache: torch.Tensor,  # uint8 [blocks, block_size, 656]
+        topk_indices: torch.Tensor,  # request-local token ids, [sq, width]
+        attn_metadata: XPUMLASparseMetadata,
+    ) -> torch.Tensor:
+        """Sparse MLA over an fp8_ds_mla cache: dequantize the rows a run of
+        requests needs into BF16 and use the BF16 kernel on them.
+
+        Prefill-like runs gather whole contexts with
+        cp_gather_and_upconvert_fp8_kv_cache and offset the request-local
+        top-k into that workspace; decode-like runs dequantize only the top-k
+        rows of each query. Both read the same bytes with the same math.
+        """
+        assert attn_metadata.fp8_chunks is not None
+        assert attn_metadata.fp8_context_starts is not None
+        from vllm import _custom_ops as ops
+
+        # Every column of the shared top-k buffer, as in the BF16 path.
+        topk = topk_indices.shape[-1]
+        dim_qk = q.shape[-1]
+        kv_rows, block_stride_rows = flat_kv_row_view(
+            kv_cache, attn_metadata.block_size
+        )
+        out = q.new_zeros((q.shape[0], self.num_heads, self.kv_lora_rank))
+        for t0, t1, r0, r1, context_rows in attn_metadata.fp8_chunks:
+            if t1 == t0:
+                continue
+            req_ids = attn_metadata.req_id_per_token[t0:t1]
+            if context_rows > 0:
+                workspace = torch.empty(
+                    (context_rows, DS_MLA_NOPE_DIM + DS_MLA_PE_DIM),
+                    dtype=torch.bfloat16,
+                    device=q.device,
+                )
+                context_starts = attn_metadata.fp8_context_starts[r0:r1]
+                ops.cp_gather_and_upconvert_fp8_kv_cache(
+                    src_cache=kv_cache,
+                    dst=workspace,
+                    block_table=attn_metadata.block_table[r0:r1],
+                    workspace_starts=context_starts,
+                    batch_size=r1 - r0,
+                )
+                local = topk_indices[t0:t1]
+                indices = torch.where(
+                    local >= 0,
+                    local + context_starts[(req_ids - r0).long()].unsqueeze(-1),
+                    -1,
+                ).to(torch.int32)
+            else:
+                rows = triton_convert_req_index_to_global_index(
+                    req_ids,
+                    attn_metadata.block_table,
+                    topk_indices[t0:t1],
+                    BLOCK_SIZE=attn_metadata.block_size,
+                    BLOCK_STRIDE_ROWS=block_stride_rows,
+                    NUM_TOPK_TOKENS=topk,
+                )
+                assert isinstance(rows, torch.Tensor)
+                workspace = dequant_gather_ds_mla_rows(kv_rows, rows)
+                indices = torch.where(
+                    rows >= 0,
+                    torch.arange(
+                        rows.numel(), dtype=torch.int32, device=q.device
+                    ).view_as(rows),
+                    -1,
+                ).to(torch.int32)
+            if workspace.dtype != q.dtype:
+                workspace = workspace.to(q.dtype)
+            chunk_out, _, _ = triton_bf16_mla_sparse_interface(
+                q[t0:t1],
+                workspace.view(-1, 1, DS_MLA_NOPE_DIM + DS_MLA_PE_DIM)[..., :dim_qk],
+                indices.view(t1 - t0, 1, topk),
+                sm_scale=self.softmax_scale,
+                block_dpe=dim_qk - DS_MLA_NOPE_DIM,
+            )
+            out[t0:t1] = chunk_out[:, : self.num_heads, :]
+        return out

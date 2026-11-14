@@ -386,6 +386,9 @@ def _canonicalize_sparse_mla_kv_cache_dtype(
         "fp8_e4m3",
     ):
         return "fp8_ds_mla"
+    if backend_name == "XPU_MLA_SPARSE" and kv_cache_dtype in ("fp8", "fp8_e4m3"):
+        # The XPU kernels store fp8 sparse-MLA KV in the fp8_ds_mla format.
+        return "fp8_ds_mla"
     return kv_cache_dtype
 
 
