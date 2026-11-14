@@ -181,6 +181,8 @@ SparseIndexerTopkBackend = Literal[
     "aiter",
 ]
 
+SparseIndexerBackend = Literal["auto", "native", "triton"]
+
 FlashInferSparseMLAKernel = Literal["auto", "trtllm", "prims_ts"]
 
 # DeepGEMM consumes the DeepSeek-V4 MXFP4 checkpoint recipe. CuTeDSL is
@@ -385,6 +387,19 @@ class KernelConfig:
     kernel, avoiding a full FP32 logits copy.
     """
 
+    sparse_indexer_backend: SparseIndexerBackend = "auto"
+    """Implementation of the DSA sparse indexer operators other than top-k
+    (FP8 MQA logits and the indexer K cache ops) on XPU. Available options:
+
+    - "auto": Use the native kernels from vllm-xpu-kernels when a one-time
+      probe shows they work on the device, else the Triton kernels
+    - "native": Always use the native kernels
+    - "triton": Always use the Triton kernels
+
+    Other platforms only accept "auto". Explicit values raise RuntimeError
+    when their constraints are not met.
+    """
+
     flashinfer_sparse_mla_kernel: FlashInferSparseMLAKernel = "auto"
     """Kernel of the SM100 FLASHINFER_MLA_SPARSE backend for D576 sparse MLA.
     Available options:
@@ -469,6 +484,13 @@ class KernelConfig:
             return value.lower().replace("-", "_")
         return value
 
+    @field_validator("sparse_indexer_backend", mode="before")
+    @classmethod
+    def _normalize_sparse_indexer_backend(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.lower().replace("-", "_")
+        return value
+
     @field_validator("rdna_hybrid_w4a16_prefill_dequant", mode="before")
     @classmethod
     def _normalize_rdna_hybrid_w4a16_prefill_dequant(cls, value: Any) -> Any:
@@ -514,6 +536,12 @@ class KernelConfig:
                 self.moe_backend, vllm_config.model_config.architectures
             )
         bind_passthrough_all2all_backend(self.moe_backend, vllm_config.parallel_config)
+        if self.sparse_indexer_backend != "auto" and not current_platform.is_xpu():
+            raise RuntimeError(
+                f"kernel_config.sparse_indexer_backend="
+                f"'{self.sparse_indexer_backend}' is only supported on XPU; "
+                "use 'auto' on this platform."
+            )
 
         platform_op_priority = current_platform.get_default_ir_op_priority(vllm_config)
         logger.debug(

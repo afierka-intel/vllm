@@ -168,3 +168,227 @@ def test_bf16_triton_sparse_mla_masked_chunks(device_str, dtype):
     # lse/max_logits are large-negative finite rather than the reference's
     # +inf/-inf placeholders, so only the output is compared here.
     assert torch.allclose(out[2], torch.zeros_like(out[2]))
+
+
+# DSA sparse indexer FP8 MQA logits: native (vllm-xpu-kernels) vs Triton.
+requires_xpu = pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU required")
+
+_HEADS, _DIM, _BLOCK_SIZE = 64, 128, 64
+
+
+def _native_usable(name: str) -> bool:
+    import vllm._xpu_ops as xpu_ops_mod
+
+    return xpu_ops_mod.kernel_usable(name, *xpu_ops_mod._SPARSE_INDEXER_PROBES[name])
+
+
+@pytest.fixture
+def indexer_backend(monkeypatch):
+    import vllm._xpu_ops as xpu_ops_mod
+
+    def set_backend(backend: str) -> None:
+        monkeypatch.setattr(xpu_ops_mod, "_sparse_indexer_backend", backend)
+
+    return set_backend
+
+
+def _mqa_inputs(num_rows: int, num_keys: int):
+    """Random FP8 q/k with power-of-two K scales and ragged [ks, ke) rows;
+    with several rows, the first is empty and the last spans all keys."""
+    dev = "xpu"
+    fp8 = torch.float8_e4m3fn
+    q = torch.randn(num_rows, _HEADS, _DIM, device=dev).to(fp8)
+    k = torch.randn(num_keys, _DIM, device=dev).to(fp8)
+    k_scale = torch.pow(2.0, -torch.randint(0, 4, (num_keys,), device=dev).float())
+    weights = torch.randn(num_rows, _HEADS, device=dev)
+    ks = torch.randint(0, num_keys, (num_rows,), device=dev)
+    ke = (ks + torch.randint(1, num_keys, (num_rows,), device=dev)).clamp(max=num_keys)
+    if num_rows > 1:
+        ks[0], ke[0] = 5, 5
+        ks[-1], ke[-1] = 0, num_keys
+    return q, k, k_scale, weights, ks.int(), ke.int()
+
+
+def _logits_bound(q, k, k_scale, weights, unit: float) -> torch.Tensor:
+    """Elementwise error bound for sum_h relu(q_h . k * s) * w_h.
+
+    FP8 products are exact in fp32, so an fp32 implementation only adds
+    rounding over D + H + 2 operations per term (gamma_n, Higham); `unit` adds
+    one more relative rounding per head term (e.g. a bf16-rounded q . k).
+    q [M, H, D], k [N, D] or per row [M, N, D], k_scale [N] or [M, N],
+    weights [M, H].
+    """
+    eq = "mhd,nd->mhn" if k.dim() == 2 else "mhd,mnd->mhn"
+    dot = torch.einsum(eq, q.cpu().double(), k.cpu().double())
+    terms = dot.abs() * k_scale.cpu().double()[..., None, :]
+    terms = terms * weights.cpu().double().abs()[..., None]
+    gamma = (q.shape[-1] + q.shape[1] + 2) * 2.0**-24
+    return (gamma + unit) * terms.sum(dim=1)
+
+
+def _assert_logits_close(got, ref, bound) -> None:
+    got, ref = got.cpu(), ref.cpu()
+    assert got.dtype == torch.float32 and got.shape == ref.shape
+    masked = ref == float("-inf")
+    assert torch.equal(got == float("-inf"), masked)
+    err = (got.double() - ref.double()).abs()[~masked]
+    assert (err <= bound[~masked]).all(), f"max err {err.max().item():.3e}"
+
+
+def _assert_same_topk(got, ref, k: int = 64) -> None:
+    k = min(k, ref.shape[1])
+    got_vals, got_idx = got.topk(k, dim=-1)
+    ref_vals, ref_idx = ref.topk(k, dim=-1)
+    for row in range(ref.shape[0]):
+        got_set = set(got_idx[row][got_vals[row].isfinite()].tolist())
+        assert got_set == set(ref_idx[row][ref_vals[row].isfinite()].tolist())
+
+
+@requires_xpu
+@pytest.mark.parametrize("num_rows,num_keys", [(1, 64), (40, 300), (96, 1100)])
+def test_fp8_mqa_logits_triton_matches_torch_ref(num_rows, num_keys):
+    from vllm.v1.attention.ops.dsa_mqa_logits_triton import fp8_mqa_logits_triton
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import fp8_mqa_logits_torch
+
+    torch.manual_seed(0)
+    q, k, k_scale, weights, ks, ke = _mqa_inputs(num_rows, num_keys)
+    got = fp8_mqa_logits_triton(q, (k, k_scale), weights, ks, ke)
+    ref = fp8_mqa_logits_torch(q, (k, k_scale), weights, ks, ke)
+    # The reference rounds each q . k to bf16 (unit roundoff 2^-8).
+    bound = _logits_bound(q, k, k_scale, weights, unit=2.0**-8)
+    _assert_logits_close(got, ref, bound)
+
+
+@requires_xpu
+@pytest.mark.parametrize("num_rows,num_keys", [(1, 64), (40, 300), (96, 1100)])
+def test_fp8_mqa_logits_native_vs_triton(indexer_backend, num_rows, num_keys):
+    from vllm._xpu_ops import _xpu_fp8_mqa_logits_impl
+
+    if not _native_usable("_xpu_C.fp8_mqa_logits"):
+        pytest.skip("native fp8_mqa_logits is not usable")
+    torch.manual_seed(0)
+    inputs = _mqa_inputs(num_rows, num_keys)
+    indexer_backend("native")
+    native = _xpu_fp8_mqa_logits_impl(*inputs)
+    indexer_backend("triton")
+    triton_out = _xpu_fp8_mqa_logits_impl(*inputs)
+    q, k, k_scale, weights, _, _ = inputs
+    _assert_logits_close(triton_out, native, _logits_bound(q, k, k_scale, weights, 0.0))
+    _assert_same_topk(triton_out, native)
+
+
+def _paged_inputs(next_n: int):
+    """Block-flat FP8 indexer K cache ([values | fp32 scales] per block) with
+    shuffled pages, ragged context lengths and power-of-two K scales."""
+    dev = "xpu"
+    fp8 = torch.float8_e4m3fn
+    context_lens = torch.tensor([next_n, 150, 257], dtype=torch.int32, device=dev)
+    batch, max_blocks = context_lens.numel(), 5
+    num_blocks = batch * max_blocks
+    q = torch.randn(batch, next_n, _HEADS, _DIM, device=dev).to(fp8)
+    values = torch.randn(num_blocks, _BLOCK_SIZE * _DIM, device=dev).to(fp8)
+    scales = torch.pow(
+        2.0, -torch.randint(0, 4, (num_blocks, _BLOCK_SIZE), device=dev).float()
+    )
+    kv_cache = torch.cat(
+        [values.view(torch.uint8), scales.view(torch.uint8)], dim=1
+    ).view(num_blocks, _BLOCK_SIZE, 1, _DIM + 4)
+    weights = torch.randn(batch * next_n, _HEADS, device=dev)
+    block_tables = torch.randperm(num_blocks, device=dev).int().view(batch, -1)
+    max_model_len = max_blocks * _BLOCK_SIZE
+    paged = (q, kv_cache, weights, context_lens, block_tables, max_model_len)
+    # Error bound over each row's dense K: [B * next_n, max_model_len, D].
+    pages = block_tables.cpu().repeat_interleave(next_n, dim=0)
+    k = values.cpu().float().view(num_blocks, _BLOCK_SIZE, _DIM)[pages]
+    bound = _logits_bound(
+        q.view(batch * next_n, _HEADS, _DIM),
+        k.view(batch * next_n, max_model_len, _DIM),
+        scales.cpu()[pages].view(batch * next_n, max_model_len),
+        weights,
+        unit=0.0,
+    )
+    return paged, bound
+
+
+@requires_xpu
+@pytest.mark.parametrize("next_n", [1, 2, 4])
+def test_fp8_paged_mqa_logits_triton_matches_torch_ref(indexer_backend, next_n):
+    from vllm._xpu_ops import _xpu_fp8_paged_mqa_logits_impl
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        fp8_paged_mqa_logits_torch,
+    )
+
+    torch.manual_seed(0)
+    (q, kv_cache, weights, ctx, block_tables, max_len), bound = _paged_inputs(next_n)
+    indexer_backend("triton")
+    got = _xpu_fp8_paged_mqa_logits_impl(
+        q, kv_cache, weights, ctx, block_tables, None, max_len
+    )
+    ref = fp8_paged_mqa_logits_torch(q, kv_cache, weights, ctx, block_tables, max_len)
+    _assert_logits_close(got, ref, bound)
+
+
+@requires_xpu
+@pytest.mark.parametrize("next_n", [1, 2, 4])
+def test_fp8_paged_mqa_logits_native_vs_triton(indexer_backend, next_n):
+    from vllm._xpu_ops import _xpu_fp8_paged_mqa_logits_impl
+
+    if not _native_usable("_xpu_C.fp8_paged_mqa_logits"):
+        pytest.skip("native fp8_paged_mqa_logits is not usable")
+    torch.manual_seed(0)
+    (q, kv_cache, weights, ctx, block_tables, max_len), bound = _paged_inputs(next_n)
+    args = (q, kv_cache, weights, ctx, block_tables, None, max_len)
+    indexer_backend("native")
+    native = _xpu_fp8_paged_mqa_logits_impl(*args)
+    indexer_backend("triton")
+    triton_out = _xpu_fp8_paged_mqa_logits_impl(*args)
+    _assert_logits_close(triton_out, native, bound)
+    _assert_same_topk(triton_out, native)
+
+
+@requires_xpu
+def test_sparse_indexer_auto_falls_back_to_triton(indexer_backend, monkeypatch):
+    """With "auto" and the native kernels marked unusable, the custom ops run
+    the Triton kernels."""
+    import vllm._xpu_ops  # noqa: F401 registers torch.ops.vllm.xpu_*mqa_logits
+    from vllm.utils.kernel_probe import set_kernel_usable
+    from vllm.v1.attention.ops import dsa_mqa_logits_triton as mod
+
+    calls: list[str] = []
+
+    def counted(name: str):
+        fn = getattr(mod, name)
+
+        def wrapper(*args, **kwargs):
+            calls.append(name)
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    for name in ("fp8_mqa_logits_triton", "fp8_paged_mqa_logits_triton"):
+        monkeypatch.setattr(mod, name, counted(name))
+    indexer_backend("auto")
+    torch.manual_seed(0)
+    try:
+        for name in ("_xpu_C.fp8_mqa_logits", "_xpu_C.fp8_paged_mqa_logits"):
+            set_kernel_usable(name, False)
+        torch.ops.vllm.xpu_fp8_mqa_logits(*_mqa_inputs(8, 128))
+        (q, kv_cache, weights, ctx, block_tables, max_len), _ = _paged_inputs(2)
+        torch.ops.vllm.xpu_fp8_paged_mqa_logits(
+            q, kv_cache, weights, ctx, block_tables, None, max_len
+        )
+    finally:
+        for name in ("_xpu_C.fp8_mqa_logits", "_xpu_C.fp8_paged_mqa_logits"):
+            set_kernel_usable(name, None)
+    assert calls == ["fp8_mqa_logits_triton", "fp8_paged_mqa_logits_triton"]
+
+
+@requires_xpu
+def test_sparse_indexer_explicit_backends(indexer_backend):
+    from vllm._xpu_ops import _use_native_indexer_op
+
+    indexer_backend("triton")
+    assert not _use_native_indexer_op("_xpu_C.fp8_mqa_logits")
+    indexer_backend("native")
+    with pytest.raises(RuntimeError, match="sparse_indexer_backend='native'"):
+        _use_native_indexer_op("_xpu_C.op_missing_from_this_build")

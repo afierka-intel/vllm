@@ -21,6 +21,12 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import LayerNameType, direct_register_custom_op
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
+from vllm.v1.attention.ops.dsa_mqa_logits_triton import (
+    _decode_logits_workspace,
+)
+from vllm.v1.attention.ops.dsa_mqa_logits_triton import (
+    fp8_paged_mqa_logits_triton as rocm_fp8_paged_mqa_logits_triton,
+)
 from vllm.v1.attention.ops.mxfp4_mla.read import load_mxfp4_rows
 from vllm.v1.attention.ops.pcp import maybe_gather_indexer_k
 from vllm.v1.worker.workspace import current_workspace_manager
@@ -46,18 +52,6 @@ else:
 logger = init_logger(__name__)
 
 FP8_DTYPE = current_platform.fp8_dtype()
-
-
-def _decode_logits_workspace(num_rows: int, max_model_len: int) -> torch.Tensor:
-    from vllm.model_executor.layers.indexer_topk import RADIX_TOPK_WORKSPACE_SIZE
-
-    # GLM-5-next's kpool indexer runs SparseIndexerTopk on these logits, which
-    # takes its top-k workspace from the start of the same buffer.
-    _, logits = current_workspace_manager().get_simultaneous(
-        ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
-        ((num_rows, max_model_len), torch.float32),
-    )
-    return logits
 
 
 @functools.cache
@@ -616,156 +610,6 @@ def fp8_paged_mqa_logits_torch(
                 block_rk * block_size : (block_rk + 1) * block_size,
             ] = torch.where(k_offsets[None, :] <= q_offsets[:, None], s, float("-inf"))
     return logits
-
-
-@triton.jit
-def _fp8_paged_mqa_logits_decode_kernel(
-    q_ptr,  # fp8 [B, NEXT_N, H, D]
-    kv_val_ptr,  # fp8, block-flat: [num_blocks, block_size*(D+4)]
-    kv_scale_ptr,  # fp32, block-flat: [num_blocks, block_size*(D+4)//4]
-    weights_ptr,  # fp32 [B*NEXT_N, H]
-    ctx_lens_ptr,  # int32 [B*NEXT_N] if CTX_PER_ROW else [B]
-    block_tables_ptr,  # int32 [B, max_blocks]
-    logits_ptr,  # fp32 [B*NEXT_N, max_model_len]
-    stride_q_b,
-    stride_q_n,
-    stride_q_h,
-    stride_w_row,
-    stride_kvblk_fp8,
-    stride_kvblk_f32,
-    scale_region_off,  # block_size*D // 4 (fp32 offset of scale region within a block)
-    stride_bt_b,
-    stride_logits_row,
-    max_blocks,  # block_tables width; guards the block-table gather
-    max_model_len,
-    NUM_HEADS: tl.constexpr,
-    HEAD_SIZE: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,  # paged-cache page size
-    BLOCK_KV: tl.constexpr,  # positions per tile; must divide BLOCK_SIZE
-    N_SPLITS: tl.constexpr,  # KV-tile parallelism factor (grid dim 1)
-    NEXT_N: tl.constexpr,  # query positions per batch (1 = decode; >1 = MTP verify)
-    CTX_PER_ROW: tl.constexpr,  # ctx_lens is already per-(b, n)
-):
-    # scale_region_off = block_size*D//4 needs D % 4 == 0 (D=128).
-    tl.static_assert(HEAD_SIZE % 4 == 0)
-    # Grid (B*NEXT_N, N_SPLITS): disjoint KV tiles per program, no host sync.
-    row = tl.program_id(0)
-    split = tl.program_id(1)
-    b = row // NEXT_N
-    n = row % NEXT_N
-    if CTX_PER_ROW:
-        seq_len = tl.load(ctx_lens_ptr + row)
-    else:
-        seq_len = tl.load(ctx_lens_ptr + b) - NEXT_N + n + 1
-    seq_len = tl.minimum(tl.maximum(seq_len, 0), max_model_len)
-
-    h = tl.arange(0, NUM_HEADS)
-    d = tl.arange(0, HEAD_SIZE)
-    # keep q/kv fp8 -> fp8 MFMA (f32 accum), not the slow f32 path
-    q = tl.load(
-        q_ptr + b * stride_q_b + n * stride_q_n + h[:, None] * stride_q_h + d[None, :]
-    )
-    w = tl.load(weights_ptr + row * stride_w_row + h).to(tl.float32)  # [H]
-
-    kv_col = tl.arange(0, BLOCK_KV)
-    for kv_start in tl.range(split * BLOCK_KV, seq_len, N_SPLITS * BLOCK_KV):
-        pos = kv_start + kv_col
-        # Tiles are page-aligned (BLOCK_KV | BLOCK_SIZE), so a tile is one page.
-        logical_blk = kv_start // BLOCK_SIZE
-        blk_ok = logical_blk < max_blocks  # guard against a wild page -> fault
-        mask_pos = (pos < seq_len) & blk_ok
-        page = tl.load(
-            block_tables_ptr + b * stride_bt_b + logical_blk, mask=blk_ok, other=0
-        ).to(tl.int64)
-        pos_in_blk = pos - logical_blk * BLOCK_SIZE  # [BLOCK_KV] == pos % BLOCK_SIZE
-
-        # block-flat layout: values region, then scales region.
-        val_off = page * stride_kvblk_fp8 + pos_in_blk[:, None] * HEAD_SIZE + d[None, :]
-        kv = tl.load(
-            kv_val_ptr + val_off, mask=mask_pos[:, None], other=0.0
-        )  # [BLOCK_KV, D] fp8
-        sc = tl.load(
-            kv_scale_ptr + page * stride_kvblk_f32 + scale_region_off + pos_in_blk,
-            mask=mask_pos,
-            other=0.0,
-        )  # [BLOCK_KV]
-
-        # fp8 upcasts exactly; bit-identical on gfx942, ~1e-5 rel on gfx950
-        # (accum order), top-k unchanged.
-        s = tl.dot(kv, tl.trans(q))  # [BLOCK_KV, H]
-        s = tl.maximum(s, 0.0)
-        s = s * w[None, :]
-        s = tl.sum(s, axis=1)  # [BLOCK_KV]
-        s = s * sc
-        tl.store(logits_ptr + row * stride_logits_row + pos, s, mask=mask_pos)
-
-
-def rocm_fp8_paged_mqa_logits_triton(
-    q_fp8: torch.Tensor,
-    kv_cache_fp8: torch.Tensor,
-    weights: torch.Tensor,
-    context_lens: torch.Tensor,
-    block_tables: torch.Tensor,
-    max_model_len: int,
-) -> torch.Tensor:
-    """Triton paged MQA-logits for decode and MTP; matches the torch ref but
-    has no host sync, so it is safe to capture under a full CUDA graph."""
-    batch_size, next_n, num_heads, head_size = q_fp8.shape
-    block_size = kv_cache_fp8.shape[1]
-    BLOCK_KV = 64
-    assert block_size % BLOCK_KV == 0
-
-    fp8_dtype = current_platform.fp8_dtype()
-    num_blocks = kv_cache_fp8.shape[0]
-    kv_flat = kv_cache_fp8.reshape(
-        num_blocks, -1
-    )  # uint8 [num_blocks, block_size*(D+4)]
-    kv_val = kv_flat.view(fp8_dtype)  # [num_blocks, block_size*(D+4)] fp8
-    kv_scale = kv_flat.view(torch.float32)  # [num_blocks, block_size*(D+4)//4] fp32
-
-    cl = context_lens.reshape(-1)
-    ctx_per_row = not (next_n > 1 and cl.numel() == batch_size)
-
-    max_blocks = block_tables.shape[1]
-    out_logits = _decode_logits_workspace(batch_size * next_n, max_model_len)
-
-    # Memory-bound over the KV range: split each row's keys across programs so
-    # few-row / long-context launches still fill the GPU. Cap splits at the
-    # device CU count (304 on gfx942, 256 on gfx950) rather than a gfx950-sized
-    # constant. All terms are static at launch, so the grid stays CUDA-graph-safe.
-    rows = batch_size * next_n
-    tiles_cap = (max_model_len + BLOCK_KV - 1) // BLOCK_KV
-    N_SPLITS = max(1, min(max(1, _decode_cu_count()), tiles_cap, 1024 // rows))
-    _fp8_paged_mqa_logits_decode_kernel[(rows, N_SPLITS)](
-        q_fp8,
-        kv_val,
-        kv_scale,
-        weights,
-        cl,
-        block_tables,
-        out_logits,
-        q_fp8.stride(0),
-        q_fp8.stride(1),
-        q_fp8.stride(2),
-        weights.stride(0),
-        kv_val.stride(0),
-        kv_scale.stride(0),
-        (block_size * head_size) // 4,
-        block_tables.stride(0),
-        out_logits.stride(0),
-        max_blocks,
-        max_model_len,
-        NUM_HEADS=num_heads,
-        HEAD_SIZE=head_size,
-        BLOCK_SIZE=block_size,
-        BLOCK_KV=BLOCK_KV,
-        N_SPLITS=N_SPLITS,
-        NEXT_N=next_n,
-        CTX_PER_ROW=ctx_per_row,
-        num_warps=4,
-        num_stages=2,
-    )
-    return out_logits
 
 
 @functools.lru_cache
