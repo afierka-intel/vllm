@@ -17,6 +17,7 @@ from vllm.model_executor.layers.fused_moe import (
 )
 from vllm.model_executor.layers.fused_moe import modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.config import (
+    mxfp4_w4a8_moe_quant_config,
     mxfp4_w4a16_moe_quant_config,
 )
 from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
@@ -1081,6 +1082,23 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w2_scale = layer.w2_weight_scale
 
         if self.mxfp4_backend == Mxfp4MoeBackend.EMULATION:
+            from vllm.model_executor.kernels.linear.mxfp4.emulation import (
+                _fp8_dynamic_group_size,
+            )
+
+            group_size = _fp8_dynamic_group_size(self.activation_key)
+            if group_size is not None:
+                # Checkpoints with dynamic FP8 activations (W4A8): fake-quantize
+                # them with the declared per-token or per-token-group scales.
+                return mxfp4_w4a8_moe_quant_config(
+                    w1_scale=w1_scale,
+                    w2_scale=w2_scale,
+                    w1_bias=w1_bias,
+                    w2_bias=w2_bias,
+                    block_shape=None if group_size == -1 else [group_size] * 2,
+                    per_act_token_quant=group_size == -1,
+                    gemm1_clamp_limit=swiglu_limit,
+                )
             # Canonical ``mxfp4`` checkpoints are weight-only W4A16. The
             # generic EMULATION config is W4A4, so preserve BF16 activations
             # while the fallback dequantizes only the weights.

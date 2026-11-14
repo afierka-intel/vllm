@@ -27,11 +27,26 @@ from vllm.model_executor.layers.quantization.utils.ocp_mx_utils import (
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
+    kMxfp4Dynamic,
+    kMxfp6E2M3Dynamic,
+    kMxfp6E2M3Static,
+    kMxfp6E3M2Dynamic,
+    kMxfp6E3M2Static,
 )
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_quark
 
 logger = init_logger(__name__)
+
+# Formats whose dequant or quant-dequant only amd-quark implements. MXFP4
+# weight dequant and FP8 activation quant-dequant are plain PyTorch.
+_AMD_QUARK_KEYS = (
+    kMxfp6E3M2Static,
+    kMxfp6E2M3Static,
+    kMxfp4Dynamic,
+    kMxfp6E3M2Dynamic,
+    kMxfp6E2M3Dynamic,
+)
 
 
 def activation_quant_dtype(
@@ -118,6 +133,16 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
         self.quantization_emulation = True
 
         self._quant_dtype = activation_quant_dtype(self.ocp_mx_scheme)
+        # MX activation dtypes are strings; FP8 is a torch dtype.
+        if (
+            self.ocp_mx_scheme.startswith("w_mxfp6")
+            or isinstance(self._quant_dtype, str)
+        ) and not has_quark():
+            raise ImportError(
+                f"OCP MX scheme {self.ocp_mx_scheme} needs the amd-quark package "
+                "for MXFP6 weights or MX activations. Install it with "
+                "`pip install amd-quark`."
+            )
 
     @staticmethod
     def is_supported_config(
@@ -127,8 +152,10 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
         activation_key: QuantKey | None,
         activation_format: mk.FusedMoEActivationFormat,
     ) -> tuple[bool, str | None]:
-        if not has_quark():
-            return False, "kernel requires amd-quark package"
+        if (
+            weight_key in _AMD_QUARK_KEYS or activation_key in _AMD_QUARK_KEYS
+        ) and not has_quark():
+            return False, "MXFP6 weights and MX activations require amd-quark"
 
         return TritonExperts.is_supported_config(
             cls=cls,
