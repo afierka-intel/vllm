@@ -652,3 +652,300 @@ def test_dequant_gather_ds_mla_rows_matches_upconvert():
     valid = rows.flatten() >= 0
     rel = (got[valid].float() - ref[valid].float()).norm() / ref[valid].float().norm()
     assert rel < 0.05
+
+
+def _mla_cache_case(device, kv_cache_dtype, pe_dim, num_blocks=4, block_size=16):
+    """Inputs for an MLA KV cache write: kv_c / k_pe have two more (padding)
+    rows than slot_mapping, slot_mapping has padded (-1) tokens, and the cache
+    starts as 0xFF bytes so that untouched rows are visible."""
+    from vllm.v1.attention.ops.xpu_mla_sparse import DS_MLA_ENTRY_BYTES
+
+    num_slots = num_blocks * block_size
+    slots = torch.randperm(num_slots)[:20]
+    slots[[3, 11, 19]] = -1
+    kv_c = torch.randn(22, 512, dtype=torch.bfloat16) * 4
+    kv_c[5] = 0  # all-zero tiles
+    kv_c[6, :128] *= 1e-3  # one small tile
+    k_pe = torch.randn(22, pe_dim, dtype=torch.bfloat16)
+    if kv_cache_dtype == "fp8_ds_mla":
+        cache = torch.full(
+            (num_blocks, block_size, DS_MLA_ENTRY_BYTES), 0xFF, dtype=torch.uint8
+        )
+    else:
+        cache = torch.full((num_blocks, block_size, 512 + pe_dim), float("nan"))
+        cache = cache.to(torch.bfloat16)
+    return [t.to(device) for t in (kv_c, k_pe, cache, slots)]
+
+
+@pytest.mark.parametrize("pe_dim", [64, 0])
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8_ds_mla"])
+@torch.inference_mode()
+def test_concat_and_cache_mla_torch_reference(kv_cache_dtype, pe_dim):
+    """Layout of the torch MLA KV cache writer, on any device: unquantized rows
+    are [kv_c, k_pe]; fp8_ds_mla rows hold e4m3 NoPE with fp32 tile scales
+    amax / 448 and the BF16 RoPE (zeros when rope-free). Padded tokens and
+    padding rows of kv_c write nothing."""
+    from vllm.platforms import current_platform
+    from vllm.v1.attention.ops.xpu_mla_sparse import (
+        concat_and_cache_mla_torch,
+        ds_mla_dequant_torch,
+    )
+
+    device = current_platform.device_type
+    torch.random.manual_seed(0)
+    kv_c, k_pe, cache, slots = _mla_cache_case(device, kv_cache_dtype, pe_dim)
+    before = cache.clone()
+    concat_and_cache_mla_torch(kv_c, k_pe, cache, slots, kv_cache_dtype)
+
+    entry = cache.shape[-1]
+    rows = cache.view(-1, entry)
+    valid = slots >= 0
+    written = slots[valid]
+    untouched = torch.ones(rows.shape[0], dtype=torch.bool, device=device)
+    untouched[written] = False
+    assert torch.equal(
+        rows[untouched].view(torch.uint8),
+        before.view(-1, entry)[untouched].view(torch.uint8),
+    )
+    x, pe = kv_c[: slots.shape[0]][valid], k_pe[: slots.shape[0]][valid]
+    got = rows[written]
+    if kv_cache_dtype == "auto":
+        assert torch.equal(got, torch.cat([x, pe], dim=-1))
+        return
+
+    tiles = x.float().view(-1, 4, 128)
+    expected_scales = (tiles.abs().amax(-1) / 448.0).clamp(
+        min=torch.finfo(torch.float32).tiny
+    )
+    assert torch.equal(got[:, 512:528].view(torch.float32), expected_scales)
+    expected_pe = pe if pe_dim else torch.zeros_like(x[:, :64])
+    assert torch.equal(got[:, 528:].view(torch.bfloat16), expected_pe)
+    # Round-to-nearest e4m3 (3 mantissa bits): at most half an ulp, i.e.
+    # 2^-4 relative for normal values and 2^-10 * scale for subnormal ones.
+    deq = ds_mla_dequant_torch(got).float()[:, :512].view(-1, 4, 128)
+    bound = (tiles.abs() * 2**-4).maximum(expected_scales.unsqueeze(-1) * 2**-10)
+    # The dequantized value is rounded to BF16 (2^-8 relative) on top.
+    assert ((deq - tiles).abs() <= bound + deq.abs() * 2**-8).all()
+
+
+@pytest.mark.parametrize("with_seq_starts", [False, True])
+@torch.inference_mode()
+def test_cp_gather_and_upconvert_fp8_kv_cache_torch_reference(with_seq_starts):
+    """The torch fp8_ds_mla gather reads each request's context rows through
+    its block table into its workspace range, on any device."""
+    from vllm.platforms import current_platform
+    from vllm.v1.attention.ops.xpu_mla_sparse import (
+        cp_gather_and_upconvert_fp8_kv_cache_torch,
+        ds_mla_dequant_torch,
+    )
+
+    device = current_platform.device_type
+    torch.random.manual_seed(0)
+    cache = _full_ds_mla_cache(device)
+    num_blocks, block_size = cache.shape[:2]
+    block_table, starts, seq_starts, lens = _gather_case(
+        num_blocks, block_size, with_seq_starts
+    )
+    total = int(sum(lens))
+    dst = torch.full((total, 576), float("nan"), dtype=torch.bfloat16)
+    dst = dst.to(device)
+    cp_gather_and_upconvert_fp8_kv_cache_torch(
+        cache,
+        dst,
+        block_table.to(device),
+        starts.to(device),
+        len(lens),
+        None if seq_starts is None else seq_starts.to(device),
+    )
+
+    entries = cache.view(-1, cache.shape[-1])
+    for r, n in enumerate(lens):
+        first = 0 if seq_starts is None else int(seq_starts[r])
+        for i in range(n):
+            token = first + i
+            slot = int(block_table[r, token // block_size]) * block_size
+            slot += token % block_size
+            expected = ds_mla_dequant_torch(entries[slot : slot + 1])[0]
+            assert torch.equal(dst[int(starts[r]) + i], expected)
+
+
+def _full_ds_mla_cache(device, num_blocks=4, block_size=16):
+    """An fp8_ds_mla cache with every slot written by the torch writer."""
+    from vllm.v1.attention.ops.xpu_mla_sparse import (
+        DS_MLA_ENTRY_BYTES,
+        concat_and_cache_mla_torch,
+    )
+
+    num_slots = num_blocks * block_size
+    kv_c = (torch.randn(num_slots, 512, dtype=torch.bfloat16) * 4).to(device)
+    k_pe = torch.randn(num_slots, 64, dtype=torch.bfloat16).to(device)
+    cache = torch.zeros(
+        num_blocks, block_size, DS_MLA_ENTRY_BYTES, dtype=torch.uint8, device=device
+    )
+    slots = torch.arange(num_slots, device=device)
+    concat_and_cache_mla_torch(kv_c, k_pe, cache, slots, "fp8_ds_mla")
+    return cache
+
+
+def _gather_case(num_blocks, block_size, with_seq_starts):
+    """Three requests over shuffled blocks: block_table, workspace_starts,
+    seq_starts (or None) and the number of rows gathered per request."""
+    block_table = torch.randperm(num_blocks).to(torch.int32).view(2, 2)
+    block_table = torch.cat([block_table, block_table.flip(0)[:1]])
+    lens = [2 * block_size - 3, 5, block_size + 1]
+    seq_starts = None
+    if with_seq_starts:
+        seq_starts = torch.tensor([0, block_size - 2, 3], dtype=torch.int32)
+    starts = torch.tensor([0, lens[0], lens[0] + lens[1]], dtype=torch.int32)
+    return block_table, starts, seq_starts, lens
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required")
+@pytest.mark.parametrize("pe_dim", [64, 0])
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8_ds_mla"])
+@torch.inference_mode()
+def test_concat_and_cache_mla_torch_matches_sycl(kv_cache_dtype, pe_dim):
+    """The torch MLA KV cache writer is byte-identical to the SYCL op."""
+    from vllm.v1.attention.ops.xpu_mla_sparse import concat_and_cache_mla_torch
+
+    torch.random.manual_seed(0)
+    kv_c, k_pe, cache, slots = _mla_cache_case("xpu", kv_cache_dtype, pe_dim)
+    expected = cache.clone()
+    try:
+        torch.ops._C_cache_ops.concat_and_cache_mla(
+            kv_c,
+            k_pe,
+            expected,
+            slots,
+            kv_cache_dtype,
+            torch.ones(1, dtype=torch.float32, device="xpu"),
+            False,
+        )
+    except RuntimeError as e:
+        if kv_cache_dtype == "fp8_ds_mla" and pe_dim == 0:
+            pytest.skip(f"SYCL concat_and_cache_mla rejects pe_dim=0: {e}")
+        raise
+    concat_and_cache_mla_torch(kv_c, k_pe, cache, slots, kv_cache_dtype)
+    assert torch.equal(cache.view(torch.uint8), expected.view(torch.uint8))
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required")
+@pytest.mark.parametrize("with_seq_starts", [False, True])
+@torch.inference_mode()
+def test_cp_gather_and_upconvert_fp8_kv_cache_torch_matches_sycl(with_seq_starts):
+    """The torch fp8_ds_mla gather is byte-identical to the SYCL op."""
+    from vllm.v1.attention.ops.xpu_mla_sparse import (
+        cp_gather_and_upconvert_fp8_kv_cache_torch,
+    )
+
+    torch.random.manual_seed(0)
+    cache = _full_ds_mla_cache("xpu")
+    num_blocks, block_size = cache.shape[:2]
+    block_table, starts, seq_starts, lens = _gather_case(
+        num_blocks, block_size, with_seq_starts
+    )
+    args = (
+        cache,
+        block_table.to("xpu"),
+        starts.to("xpu"),
+        len(lens),
+        None if seq_starts is None else seq_starts.to("xpu"),
+    )
+    expected = torch.empty(sum(lens), 576, dtype=torch.bfloat16, device="xpu")
+    got = torch.empty_like(expected)
+    torch.ops._C_cache_ops.cp_gather_and_upconvert_fp8_kv_cache(
+        args[0], expected, *args[1:], None, None, None
+    )
+    cp_gather_and_upconvert_fp8_kv_cache_torch(args[0], got, *args[1:])
+    assert torch.equal(got.view(torch.int16), expected.view(torch.int16))
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU is required")
+@pytest.mark.parametrize(
+    "op", ["concat_and_cache_mla", "cp_gather_and_upconvert_fp8_kv_cache"]
+)
+@torch.inference_mode()
+def test_xpu_mla_kv_cache_forced_fallback(op, monkeypatch):
+    """With the SYCL op marked unusable, the _custom_ops wrapper runs the
+    torch implementation."""
+    from vllm import _custom_ops as ops
+    from vllm.utils.kernel_probe import set_kernel_usable
+    from vllm.v1.attention.ops import xpu_mla_sparse
+
+    torch.random.manual_seed(0)
+    kv_c, k_pe, cache, slots = _mla_cache_case("xpu", "fp8_ds_mla", 64)
+    torch_impl = getattr(xpu_mla_sparse, f"{op}_torch")
+    calls = []
+
+    def spy(*args, **kwargs):
+        calls.append(1)
+        return torch_impl(*args, **kwargs)
+
+    monkeypatch.setattr(xpu_mla_sparse, f"{op}_torch", spy)
+    name = (
+        "_C.concat_and_cache_mla[fp8_ds_mla]"
+        if op == "concat_and_cache_mla"
+        else f"_C.{op}"
+    )
+    set_kernel_usable(name, False)
+    try:
+        if op == "concat_and_cache_mla":
+            expected = cache.clone()
+            torch_impl(kv_c, k_pe, expected, slots, "fp8_ds_mla")
+            ops.concat_and_cache_mla(
+                kv_c, k_pe, cache, slots, "fp8_ds_mla", torch.ones(1, device="xpu")
+            )
+            got = cache
+        else:
+            cache = _full_ds_mla_cache("xpu")
+            block_table, starts, _, lens = _gather_case(4, 16, False)
+            args = (cache, block_table.to("xpu"), starts.to("xpu"), len(lens))
+            expected = torch.empty(sum(lens), 576, dtype=torch.bfloat16, device="xpu")
+            got = torch.empty_like(expected)
+            torch_impl(args[0], expected, *args[1:])
+            ops.cp_gather_and_upconvert_fp8_kv_cache(args[0], got, *args[1:])
+    finally:
+        set_kernel_usable(name, None)
+    assert len(calls) == 1
+    assert torch.equal(got.view(torch.uint8), expected.view(torch.uint8))
+
+
+def test_xpu_mla_kv_cache_backend_option(monkeypatch):
+    """kernel_config.sparse_indexer_backend also selects the XPU MLA KV cache
+    ops: "triton" uses torch without probing, "native" fails loudly when the
+    compiled op is unusable, and formats without a torch implementation
+    always use the compiled op."""
+    from types import SimpleNamespace
+
+    import vllm.config
+    from vllm.utils import kernel_probe
+    from vllm.v1.attention.ops import xpu_mla_sparse
+
+    real_kernel_usable = kernel_probe.kernel_usable
+
+    def no_probe(*args, **kwargs):
+        raise AssertionError("probed")
+
+    config = SimpleNamespace(
+        kernel_config=SimpleNamespace(sparse_indexer_backend="triton")
+    )
+    monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", lambda: config)
+    monkeypatch.setattr(kernel_probe, "kernel_usable", no_probe)
+    monkeypatch.setattr(xpu_mla_sparse, "_mla_kv_cache_backend", "auto")
+    xpu_mla_sparse.prepare_xpu_mla_kv_cache_ops("fp8_ds_mla", 0)
+    assert xpu_mla_sparse._mla_kv_cache_backend == "triton"
+    use_native = xpu_mla_sparse.xpu_mla_kv_cache_use_native
+    assert not use_native("concat_and_cache_mla", "auto", 64)
+    assert not use_native("concat_and_cache_mla", "fp8_ds_mla", 64)
+    assert not use_native("cp_gather_and_upconvert_fp8_kv_cache")
+    assert use_native("concat_and_cache_mla", "fp8", 64)
+
+    monkeypatch.setattr(kernel_probe, "kernel_usable", real_kernel_usable)
+    monkeypatch.setattr(xpu_mla_sparse, "_mla_kv_cache_backend", "native")
+    name = "_C.concat_and_cache_mla[fp8_ds_mla,rope_free]"
+    kernel_probe.set_kernel_usable(name, False)
+    try:
+        with pytest.raises(RuntimeError, match="sparse_indexer_backend='native'"):
+            use_native("concat_and_cache_mla", "fp8_ds_mla", 0)
+    finally:
+        kernel_probe.set_kernel_usable(name, None)

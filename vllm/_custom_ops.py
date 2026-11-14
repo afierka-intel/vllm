@@ -2917,6 +2917,16 @@ def concat_and_cache_mla(
     scale: torch.Tensor,
     skip_scale: bool = False,
 ) -> None:
+    if current_platform.is_xpu():
+        from vllm.v1.attention.ops import xpu_mla_sparse
+
+        if not xpu_mla_sparse.xpu_mla_kv_cache_use_native(
+            "concat_and_cache_mla", kv_cache_dtype, k_pe.shape[-1]
+        ):
+            xpu_mla_sparse.concat_and_cache_mla_torch(
+                kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype
+            )
+            return
     torch.ops._C_cache_ops.concat_and_cache_mla(
         kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale, skip_scale
     )
@@ -3126,6 +3136,16 @@ def cp_gather_and_upconvert_fp8_kv_cache(
         device_row_ids: Device source row, or -1, for each remapped cache row
 
     """
+    if current_platform.is_xpu() and host_cache is None:
+        from vllm.v1.attention.ops import xpu_mla_sparse
+
+        if not xpu_mla_sparse.xpu_mla_kv_cache_use_native(
+            "cp_gather_and_upconvert_fp8_kv_cache"
+        ):
+            xpu_mla_sparse.cp_gather_and_upconvert_fp8_kv_cache_torch(
+                src_cache, dst, block_table, workspace_starts, batch_size, seq_starts
+            )
+            return
     torch.ops._C_cache_ops.cp_gather_and_upconvert_fp8_kv_cache(
         src_cache,
         dst,

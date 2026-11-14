@@ -354,3 +354,268 @@ def dequant_gather_ds_mla_rows(
             ROPE_OFFSET=DS_MLA_ROPE_OFFSET,
         )
     return out
+
+
+# Portable torch implementations of the MLA KV cache write and read ops, used
+# on XPU when the vllm-xpu-kernels ops are unavailable on the device (or
+# kernel_config.sparse_indexer_backend="triton"). They follow the math of the
+# SYCL ops so that the cache bytes match. Unlike the CUDA writer, the SYCL
+# fp8_ds_mla writer does not round tile scales up to a power of two; readers
+# use the stored scales, so either cache decodes correctly.
+_FP8_E4M3_MAX = 448.0
+
+
+def _write_cache_rows(
+    kv_cache: torch.Tensor,  # [num_blocks, block_size, entry]
+    slot_mapping: torch.Tensor,  # [num_tokens], -1 = padded token
+    rows: torch.Tensor,  # [num_tokens, entry], kv_cache.dtype
+) -> None:
+    num_tokens = slot_mapping.shape[0]
+    if num_tokens == 0:
+        return
+    block_size = kv_cache.shape[1]
+    valid = slot_mapping >= 0
+    # Padded tokens must not write. Without a host sync (graph capture), point
+    # them at the first valid token, which writes the same row with the same
+    # bytes; with no valid token, rewrite one row with its own content.
+    first_valid = torch.argmax(valid.to(torch.int32))
+    src = torch.where(valid, torch.arange(num_tokens, device=valid.device), first_valid)
+    slot = slot_mapping[src].clamp(min=0)
+    block, offset = slot // block_size, slot % block_size
+    rows = torch.where(valid.any(), rows[src], kv_cache[block, offset])
+    kv_cache[block, offset] = rows
+
+
+def ds_mla_entries_torch(kv_c: torch.Tensor, k_pe: torch.Tensor) -> torch.Tensor:
+    """fp8_ds_mla entries (uint8 [num_tokens, 656]) of kv_c [num_tokens, 512]
+    and k_pe [num_tokens, 64 or 0]; rope-free tokens get a zero RoPE tail."""
+    num_tokens = kv_c.shape[0]
+    tiles = kv_c.float().reshape(num_tokens, -1, DS_MLA_TILE)
+    scales = (tiles.abs().amax(dim=-1) / _FP8_E4M3_MAX).clamp(
+        min=torch.finfo(torch.float32).tiny
+    )
+    nope = (
+        (tiles * scales.reciprocal().unsqueeze(-1))
+        .clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX)
+        .to(torch.float8_e4m3fn)
+    )
+    rope = (
+        k_pe.to(torch.bfloat16).contiguous()
+        if k_pe.shape[-1] == DS_MLA_PE_DIM
+        else kv_c.new_zeros((num_tokens, DS_MLA_PE_DIM), dtype=torch.bfloat16)
+    )
+    return torch.cat(
+        [
+            nope.view(torch.uint8).view(num_tokens, DS_MLA_NOPE_DIM),
+            scales.view(torch.uint8),
+            rope.view(torch.uint8),
+        ],
+        dim=-1,
+    )
+
+
+def ds_mla_dequant_torch(entries: torch.Tensor) -> torch.Tensor:
+    """BF16 [num_rows, 576] values of fp8_ds_mla entries (uint8 [num_rows, 656])."""
+    num_rows = entries.shape[0]
+    nope = entries[:, :DS_MLA_NOPE_DIM].view(torch.float8_e4m3fn).float()
+    scales = entries[:, DS_MLA_SCALES_OFFSET:DS_MLA_ROPE_OFFSET].view(torch.float32)
+    nope = nope.view(num_rows, -1, DS_MLA_TILE) * scales.unsqueeze(-1)
+    rope = entries[:, DS_MLA_ROPE_OFFSET:DS_MLA_ENTRY_BYTES].view(torch.bfloat16)
+    return torch.cat(
+        [nope.view(num_rows, DS_MLA_NOPE_DIM).to(torch.bfloat16), rope], dim=-1
+    )
+
+
+def concat_and_cache_mla_torch(
+    kv_c: torch.Tensor,  # [>= num_tokens, kv_lora_rank]
+    k_pe: torch.Tensor,  # [>= num_tokens, pe_dim]
+    kv_cache: torch.Tensor,  # [num_blocks, block_size, entry]
+    slot_mapping: torch.Tensor,  # [num_tokens]
+    kv_cache_dtype: str,
+) -> None:
+    """Torch concat_and_cache_mla for unquantized ("auto", "bfloat16",
+    "float16") and "fp8_ds_mla" caches; slot -1 is skipped."""
+    num_tokens = slot_mapping.shape[0]
+    kv_c, k_pe = kv_c[:num_tokens], k_pe[:num_tokens]
+    if kv_cache_dtype == "fp8_ds_mla":
+        assert kv_c.shape[-1] == DS_MLA_NOPE_DIM
+        assert k_pe.shape[-1] in (0, DS_MLA_PE_DIM)
+        cache = kv_cache.view(torch.uint8)
+        assert cache.shape[-1] == DS_MLA_ENTRY_BYTES
+        rows = ds_mla_entries_torch(kv_c, k_pe)
+    else:
+        assert kv_cache.shape[-1] == kv_c.shape[-1] + k_pe.shape[-1]
+        cache = kv_cache
+        rows = torch.cat([kv_c, k_pe], dim=-1).to(kv_cache.dtype)
+    _write_cache_rows(cache, slot_mapping.flatten(), rows)
+
+
+def cp_gather_and_upconvert_fp8_kv_cache_torch(
+    src_cache: torch.Tensor,  # uint8 [num_blocks, block_size, 656]
+    dst: torch.Tensor,  # bf16 [total_rows, 576]
+    block_table: torch.Tensor,  # int32 [batch_size, max_blocks]
+    workspace_starts: torch.Tensor,  # int32 [batch_size], ascending
+    batch_size: int,
+    seq_starts: torch.Tensor | None = None,  # int32 [batch_size]
+) -> None:
+    """Torch cp_gather_and_upconvert_fp8_kv_cache: dst row i belongs to the
+    last request whose workspace start is <= i and holds that request's
+    context token seq_starts[req] + i - workspace_starts[req]."""
+    total_rows = dst.shape[0]
+    if total_rows == 0 or batch_size == 0:
+        return
+    starts = workspace_starts[:batch_size]
+    out_row = torch.arange(total_rows, dtype=starts.dtype, device=dst.device)
+    req = (torch.searchsorted(starts, out_row, right=True) - 1).clamp(min=0)
+    token = out_row - starts[req]
+    if seq_starts is not None:
+        token = token + seq_starts[req]
+    block_size = src_cache.shape[1]
+    # Rows past a request's context are never read; keep their (unused) block
+    # lookup inside the table.
+    col = (token // block_size).clamp(max=block_table.shape[1] - 1)
+    block = block_table[req, col].long()
+    entries = src_cache[block, (token % block_size).long()]
+    dst.copy_(ds_mla_dequant_torch(entries))
+
+
+# kernel_config.sparse_indexer_backend, captured by
+# prepare_xpu_mla_kv_cache_ops() while the vLLM config is set.
+_mla_kv_cache_backend = "auto"
+
+
+def _mla_kv_cache_probe_name(op: str, kv_cache_dtype: str, pe_dim: int) -> str | None:
+    if op == "cp_gather_and_upconvert_fp8_kv_cache":
+        return f"_C.{op}"
+    if kv_cache_dtype in ("auto", "bfloat16", "float16"):
+        return f"_C.{op}"
+    if kv_cache_dtype == "fp8_ds_mla":
+        # Rope-free entries are a separate check: some vllm-xpu-kernels
+        # releases reject pe_dim == 0.
+        return f"_C.{op}[fp8_ds_mla{'' if pe_dim else ',rope_free'}]"
+    return None  # no torch implementation; always use the compiled op
+
+
+def _mla_kv_cache_probe(name: str, reference: bool) -> list[torch.Tensor]:
+    """Run the compiled op `name` (or its torch implementation) once."""
+    from vllm.platforms import current_platform
+
+    gen = torch.Generator().manual_seed(0)
+    device = current_platform.device_type
+
+    def randn(*shape: int, scale: float = 1.0) -> torch.Tensor:
+        return (torch.randn(shape, generator=gen) * scale).to(device, torch.bfloat16)
+
+    num_blocks, block_size, num_tokens = 2, 8, 6
+    slot_mapping = torch.tensor([5, -1, 0, 9, 15, -1], device=device)
+    if name == "_C.cp_gather_and_upconvert_fp8_kv_cache":
+        cache = torch.zeros(
+            num_blocks, block_size, DS_MLA_ENTRY_BYTES, dtype=torch.uint8, device=device
+        )
+        concat_and_cache_mla_torch(
+            randn(num_tokens, DS_MLA_NOPE_DIM, scale=2.0),
+            randn(num_tokens, DS_MLA_PE_DIM),
+            cache,
+            slot_mapping,
+            "fp8_ds_mla",
+        )
+        # Two requests, the second one starting mid-block.
+        args = (
+            cache,
+            torch.empty(12, DS_MLA_NOPE_DIM + DS_MLA_PE_DIM, dtype=torch.bfloat16).to(
+                device
+            ),
+            torch.tensor([[1, 0], [0, 1]], dtype=torch.int32, device=device),
+            torch.tensor([0, 7], dtype=torch.int32, device=device),
+            2,
+            torch.tensor([0, 3], dtype=torch.int32, device=device),
+        )
+        if reference:
+            cp_gather_and_upconvert_fp8_kv_cache_torch(*args)
+        else:
+            torch.ops._C_cache_ops.cp_gather_and_upconvert_fp8_kv_cache(
+                *args, None, None, None
+            )
+        return [args[1]]
+
+    ds_mla = "fp8_ds_mla" in name
+    pe_dim = 0 if "rope_free" in name else DS_MLA_PE_DIM
+    kv_c = randn(num_tokens, DS_MLA_NOPE_DIM, scale=2.0)
+    k_pe = randn(num_tokens, pe_dim)
+    if ds_mla:
+        cache = torch.zeros(
+            num_blocks, block_size, DS_MLA_ENTRY_BYTES, dtype=torch.uint8, device=device
+        )
+    else:
+        cache = randn(num_blocks, block_size, DS_MLA_NOPE_DIM + pe_dim)
+    kv_cache_dtype = "fp8_ds_mla" if ds_mla else "auto"
+    if reference:
+        concat_and_cache_mla_torch(kv_c, k_pe, cache, slot_mapping, kv_cache_dtype)
+    else:
+        torch.ops._C_cache_ops.concat_and_cache_mla(
+            kv_c,
+            k_pe,
+            cache,
+            slot_mapping,
+            kv_cache_dtype,
+            torch.ones(1, dtype=torch.float32, device=device),
+            False,
+        )
+    if ds_mla:
+        return [ds_mla_dequant_torch(cache.view(-1, DS_MLA_ENTRY_BYTES))]
+    return [cache]
+
+
+def xpu_mla_kv_cache_use_native(
+    op: str, kv_cache_dtype: str = "fp8_ds_mla", pe_dim: int = DS_MLA_PE_DIM
+) -> bool:
+    """Whether the XPU MLA KV cache op `op` ("concat_and_cache_mla" or
+    "cp_gather_and_upconvert_fp8_kv_cache") should run the vllm-xpu-kernels
+    op rather than its torch implementation.
+
+    Follows kernel_config.sparse_indexer_backend: "native" always uses the
+    compiled op, "triton" the portable (torch) implementation, and "auto" the
+    compiled op if a one-time probe shows it works on this device.
+    """
+    from vllm.utils.kernel_probe import kernel_usable
+
+    name = _mla_kv_cache_probe_name(op, kv_cache_dtype, pe_dim)
+    if name is None:
+        return True
+    if _mla_kv_cache_backend == "triton":
+        return False
+    # Unquantized and read results must match exactly. fp8_ds_mla writes may
+    # round a value to an adjacent e4m3 code (2^-3 relative) if the tile scale
+    # is computed in a different order; a wrong layout is off by far more.
+    fp8_write = "fp8_ds_mla" in name
+    usable = kernel_usable(
+        name,
+        lambda: _mla_kv_cache_probe(name, reference=False),
+        lambda: _mla_kv_cache_probe(name, reference=True),
+        atol=1e-4 if fp8_write else 0.0,
+        rtol=0.125 if fp8_write else 0.0,
+    )
+    if not usable and _mla_kv_cache_backend == "native":
+        raise RuntimeError(
+            f"kernel_config.sparse_indexer_backend='native' requires {name} "
+            "from vllm-xpu-kernels, which is not usable on this device. Use "
+            "'auto' or 'triton'."
+        )
+    return usable
+
+
+def prepare_xpu_mla_kv_cache_ops(kv_cache_dtype: str, pe_dim: int) -> None:
+    """Resolve the MLA KV cache op implementations of an MLA layer.
+
+    Call at layer construction: the config is read here, and the probes must
+    not run during torch.compile tracing or graph capture.
+    """
+    from vllm.config import get_current_vllm_config_or_none
+
+    global _mla_kv_cache_backend
+    config = get_current_vllm_config_or_none()
+    if config is not None:
+        _mla_kv_cache_backend = config.kernel_config.sparse_indexer_backend
+    xpu_mla_kv_cache_use_native("concat_and_cache_mla", kv_cache_dtype, pe_dim)
+    if kv_cache_dtype == "fp8_ds_mla":
+        xpu_mla_kv_cache_use_native("cp_gather_and_upconvert_fp8_kv_cache")
