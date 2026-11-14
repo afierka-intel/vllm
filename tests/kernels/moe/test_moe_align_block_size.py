@@ -571,7 +571,15 @@ def test_moe_align_block_size_torch_matches_native_xpu(
     )
 
     torch.testing.assert_close(portable[2], native[2], atol=0, rtol=0)
-    torch.testing.assert_close(portable[1], native[1], atol=0, rtol=0)
+    # Blocks past num_tokens_post_pad hold -1 here (as in the CUDA op) but 0
+    # in the XPU op; no consumer reads them, the fused MoE kernels return for
+    # `pid_m * BLOCK_SIZE_M >= num_tokens_post_padded` before loading
+    # expert_ids, so compare the used blocks only.
+    num_blocks = native[2].item() // block_size
+    torch.testing.assert_close(
+        portable[1][:num_blocks], native[1][:num_blocks], atol=0, rtol=0
+    )
+    assert (portable[1][num_blocks:] == -1).all()
     # The native op does not fix the order of routes within an expert.
     _verify_expert_level_sorting(
         portable[0],

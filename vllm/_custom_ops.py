@@ -2132,8 +2132,9 @@ def _moe_align_block_size_torch(
 
     Same output contract as the compiled op: the routes of each expert are
     padded to a multiple of `block_size` with the sentinel `topk_ids.numel()`,
-    `experts_ids` holds the expert of each block and -1 for unused blocks,
-    and routes to an expert outside [0, num_experts), or mapped to -1 by
+    `experts_ids` holds the expert of each block and, like the CUDA op, -1
+    for the blocks past `num_tokens_post_pad` (the XPU op writes 0 there; the
+    MoE kernels never read them), and routes to an expert outside [0, num_experts), or mapped to -1 by
     `expert_map`, are dropped. Routes keep their original order within an
     expert. Free of host synchronization, so it can be graph-captured.
     """
