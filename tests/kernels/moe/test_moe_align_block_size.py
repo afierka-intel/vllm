@@ -12,6 +12,8 @@ from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     batched_moe_align_block_size,
     moe_align_block_size,
 )
+from vllm.platforms import current_platform
+from vllm.utils.kernel_probe import set_kernel_usable
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.torch_utils import set_random_seed
 
@@ -469,3 +471,153 @@ def test_batched_moe_align_block_size(
     torch.testing.assert_close(
         ref_num_tokens_post_pad, num_tokens_post_pad, atol=0, rtol=0
     )
+
+
+def _align_buffers(
+    topk_ids: torch.Tensor, block_size: int, num_experts: int
+) -> list[torch.Tensor]:
+    max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
+    if topk_ids.numel() < num_experts:
+        max_num_tokens_padded = min(
+            topk_ids.numel() * block_size, max_num_tokens_padded
+        )
+    return [
+        topk_ids.new_empty(max_num_tokens_padded, dtype=torch.int32),
+        topk_ids.new_empty(cdiv(max_num_tokens_padded, block_size), dtype=torch.int32),
+        topk_ids.new_empty(1, dtype=torch.int32),
+    ]
+
+
+def _random_topk_ids(
+    m: int, topk: int, num_experts: int, device: str, with_expert_map: bool
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    topk_ids = torch.stack(
+        [torch.randperm(num_experts, device=device)[:topk] for _ in range(m)]
+    ).to(torch.int32)
+    topk_ids[0, 0] = -1
+    if not with_expert_map:
+        return topk_ids, None
+    expert_map = torch.full((num_experts,), -1, dtype=torch.int32, device=device)
+    expert_map[::2] = torch.arange(
+        cdiv(num_experts, 2), dtype=torch.int32, device=device
+    )
+    return topk_ids, expert_map
+
+
+@pytest.mark.parametrize("m", [1, 3, 256, 999])
+@pytest.mark.parametrize("topk", [1, 2, 8])
+@pytest.mark.parametrize("num_experts", [32, 257])
+@pytest.mark.parametrize("block_size", [32, 128])
+@pytest.mark.parametrize("with_expert_map", [False, True])
+def test_moe_align_block_size_torch_matches_golden(
+    m: int, topk: int, num_experts: int, block_size: int, with_expert_map: bool
+):
+    """The torch implementation of the op against the golden reference."""
+    from vllm._custom_ops import _moe_align_block_size_torch
+
+    topk_ids, expert_map = _random_topk_ids(
+        m, topk, num_experts, "cpu", with_expert_map
+    )
+    sorted_ids, expert_ids, num_tokens = _align_buffers(
+        topk_ids, block_size, num_experts
+    )
+    _moe_align_block_size_torch(
+        topk_ids,
+        num_experts,
+        block_size,
+        sorted_ids,
+        expert_ids,
+        num_tokens,
+        expert_map,
+    )
+    golden = torch_moe_align_block_size(
+        topk_ids, block_size, num_experts, expert_map=expert_map
+    )
+    # Both keep the routes of an expert in their original order.
+    torch.testing.assert_close(num_tokens, golden[2], atol=0, rtol=0)
+    torch.testing.assert_close(expert_ids, golden[1], atol=0, rtol=0)
+    torch.testing.assert_close(sorted_ids, golden[0], atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not current_platform.is_xpu(), reason="XPU-only fallback")
+@pytest.mark.parametrize("m", [1, 33, 2048])
+@pytest.mark.parametrize("topk", [2, 8])
+@pytest.mark.parametrize("num_experts", [64, 256])
+@pytest.mark.parametrize("with_expert_map", [False, True])
+def test_moe_align_block_size_torch_matches_native_xpu(
+    m: int, topk: int, num_experts: int, with_expert_map: bool
+):
+    from vllm import _custom_ops as ops
+
+    if not ops._moe_align_block_size_usable():
+        pytest.skip("_moe_C.moe_align_block_size is not usable on this device")
+    block_size = 64
+    topk_ids, expert_map = _random_topk_ids(
+        m, topk, num_experts, "xpu", with_expert_map
+    )
+    native = _align_buffers(topk_ids, block_size, num_experts)
+    portable = _align_buffers(topk_ids, block_size, num_experts)
+    torch.ops._moe_C.moe_align_block_size(
+        topk_ids, num_experts, block_size, *native, expert_map
+    )
+    ops._moe_align_block_size_torch(
+        topk_ids,
+        num_experts,
+        block_size,
+        portable[0],
+        portable[1],
+        portable[2],
+        expert_map,
+    )
+
+    torch.testing.assert_close(portable[2], native[2], atol=0, rtol=0)
+    # Blocks past num_tokens_post_pad hold -1 here (as in the CUDA op) but 0
+    # in the XPU op; no consumer reads them, the fused MoE kernels return for
+    # `pid_m * BLOCK_SIZE_M >= num_tokens_post_padded` before loading
+    # expert_ids, so compare the used blocks only.
+    num_blocks = native[2].item() // block_size
+    torch.testing.assert_close(
+        portable[1][:num_blocks], native[1][:num_blocks], atol=0, rtol=0
+    )
+    assert (portable[1][num_blocks:] == -1).all()
+    # The native op does not fix the order of routes within an expert.
+    _verify_expert_level_sorting(
+        portable[0],
+        native[0],
+        native[1],
+        block_size,
+        native[2].item(),
+        topk_ids.numel(),
+    )
+    num_padded = native[2].item()
+    assert (portable[0][num_padded:] == topk_ids.numel()).all()
+    assert (native[0][num_padded:] == topk_ids.numel()).all()
+
+
+@pytest.mark.skipif(not current_platform.is_xpu(), reason="XPU-only fallback")
+@pytest.mark.parametrize("with_expert_map", [False, True])
+def test_moe_align_block_size_forced_fallback_xpu(monkeypatch, with_expert_map: bool):
+    from vllm import _custom_ops as ops
+
+    calls = 0
+    torch_impl = ops._moe_align_block_size_torch
+
+    def counting_impl(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return torch_impl(*args, **kwargs)
+
+    monkeypatch.setattr(ops, "_moe_align_block_size_torch", counting_impl)
+    set_kernel_usable("_moe_C.moe_align_block_size", False)
+    try:
+        topk_ids, expert_map = _random_topk_ids(256, 8, 64, "xpu", with_expert_map)
+        actual = moe_align_block_size(
+            topk_ids, 64, 64, expert_map, ignore_invalid_experts=True
+        )
+    finally:
+        set_kernel_usable("_moe_C.moe_align_block_size", None)
+
+    assert calls == 1
+    golden = torch_moe_align_block_size(topk_ids, 64, 64, expert_map=expert_map)
+    for got, expected in zip(actual, golden):
+        torch.testing.assert_close(got, expected, atol=0, rtol=0)
