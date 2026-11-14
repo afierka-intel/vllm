@@ -3033,6 +3033,57 @@ def test_sparse_indexer_topk_aiter_expands_mtp_row_ends(monkeypatch) -> None:
     assert recorded["row_ends"] == [99, 100, 199, 200]
 
 
+def _make_prefill_topk_rows(
+    q_lens: list[int], ctx_lens: list[int], row_relative: bool
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Packed prefill rows: row r of a request with context c selects over
+    logits[r, ks[r]:ke[r]], with 1e30 (dirty) outside. Returns logits, the
+    -inf masked reference, row starts and row ends."""
+    device = current_platform.device_type
+    ks, ke, k_off = [], [], 0
+    for q, c in zip(q_lens, ctx_lens):
+        for i in range(q):
+            ks.append(k_off)
+            ke.append(k_off + c + i + 1)
+        k_off += c + q
+    row_starts = torch.tensor(ks, dtype=torch.int32, device=device)
+    row_ends = torch.tensor(ke, dtype=torch.int32, device=device)
+    if row_relative:
+        row_ends -= row_starts
+        row_starts.zero_()
+    num_rows, width = len(ks), int(row_ends.max())
+    pitch = (width + 255) // 256 * 256
+    logits = torch.randn(num_rows, pitch, device=device)[:, :width]
+    cols = torch.arange(width, device=device)
+    outside = (cols < row_starts[:, None]) | (cols >= row_ends[:, None])
+    logits[outside] = 1e30
+    reference = logits.masked_fill(outside, float("-inf"))
+    return logits, reference, row_starts, row_ends
+
+
+def _assert_prefill_topk(
+    indices: torch.Tensor,
+    reference: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    top_k: int,
+) -> None:
+    """Indices are row-relative, -1 past the row length, and select the
+    torch.topk values (as a set: the kernels do not sort)."""
+    width = reference.shape[1]
+    lens = (row_ends - row_starts)[:, None]
+    valid = torch.arange(top_k, device=indices.device)[None, :] < lens
+    assert ((indices == -1) | ((indices >= 0) & (indices < lens))).all()
+    assert torch.equal((indices >= 0).sum(1), valid.sum(1))
+    picked = reference.gather(
+        1, (indices.long() + row_starts[:, None]).clamp(0, width - 1)
+    ).masked_fill(indices < 0, 0)
+    k = min(top_k, width)
+    expected = reference.topk(k, dim=1).values.masked_fill(~valid[:, :k], 0)
+    expected = torch.nn.functional.pad(expected, (0, top_k - k))
+    torch.testing.assert_close(picked.sort(1).values, expected.sort(1).values)
+
+
 @requires_flashinfer_gvr2
 @pytest.mark.parametrize("top_k", [512, 2048])
 @pytest.mark.parametrize(
@@ -3059,40 +3110,59 @@ def test_sparse_indexer_prefill_topk_gvr2(
     logits[r, ks[r]:ke[r]] (uncleaned outside) with indices relative to ks[r],
     matching torch.topk."""
     set_random_seed(0)
-    ks, ke, k_off = [], [], 0
-    for q, c in zip(q_lens, ctx_lens):
-        for i in range(q):
-            ks.append(k_off)
-            ke.append(k_off + c + i + 1)
-        k_off += c + q
-    row_starts = torch.tensor(ks, dtype=torch.int32, device="cuda")
-    row_ends = torch.tensor(ke, dtype=torch.int32, device="cuda")
-    if row_relative:
-        row_ends -= row_starts
-        row_starts.zero_()
-    num_rows, width = len(ks), int(row_ends.max())
-    pitch = (width + 255) // 256 * 256
-    logits = torch.randn(num_rows, pitch, device="cuda")[:, :width]
-    cols = torch.arange(width, device="cuda")
-    outside = (cols < row_starts[:, None]) | (cols >= row_ends[:, None])
-    logits[outside] = 1e30
-    reference = logits.masked_fill(outside, float("-inf"))
-
+    logits, reference, row_starts, row_ends = _make_prefill_topk_rows(
+        q_lens, ctx_lens, row_relative
+    )
     topk = _make_topk("flashinfer_gvr2")
     starts = None if row_relative else row_starts
     assert topk.resolve_prefill_backend(logits, top_k, starts) == backend
-    indices = torch.full((num_rows, top_k), 7, dtype=torch.int32, device="cuda")
+    indices = torch.full((len(row_ends), top_k), 7, dtype=torch.int32, device="cuda")
     topk.forward_prefill(logits, starts, row_ends, indices, top_k)
+    _assert_prefill_topk(indices, reference, row_starts, row_ends, top_k)
 
-    lens = (row_ends - row_starts)[:, None]
-    valid = torch.arange(top_k, device="cuda")[None, :] < lens
-    assert ((indices == -1) | ((indices >= 0) & (indices < lens))).all()
-    assert torch.equal((indices >= 0).sum(1), valid.sum(1))
-    picked = reference.gather(
-        1, (indices.long() + row_starts[:, None]).clamp(0, width - 1)
-    ).masked_fill(indices < 0, 0)
-    expected = reference.topk(top_k, dim=1).values.masked_fill(~valid, 0)
-    torch.testing.assert_close(picked.sort(1).values, expected.sort(1).values)
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        pytest.param(
+            "per_row",
+            marks=pytest.mark.skipif(
+                not (current_platform.is_cuda_alike() or current_platform.is_xpu()),
+                reason="requires CUDA, ROCm or XPU",
+            ),
+        ),
+        "torch",
+    ],
+)
+@pytest.mark.parametrize("top_k", [512, 2048])
+@pytest.mark.parametrize("row_relative", [True, False])
+@pytest.mark.parametrize(
+    "q_lens,ctx_lens",
+    [([1024, 700, 300], [0, 3300, 1500]), ([3, 5], [0, 4])],  # 2nd: width < top_k
+)
+@torch.inference_mode()
+def test_sparse_indexer_prefill_topk_explicit_backends(
+    backend: str,
+    top_k: int,
+    row_relative: bool,
+    q_lens: list[int],
+    ctx_lens: list[int],
+) -> None:
+    """The torch prefill top-k follows the top_k_per_row_prefill (per_row)
+    contract: both must select the torch.topk set of each row's
+    [row_start, row_end) with row-relative indices and a -1 fill."""
+    set_random_seed(0)
+    logits, reference, row_starts, row_ends = _make_prefill_topk_rows(
+        q_lens, ctx_lens, row_relative
+    )
+    topk = _make_topk(backend)
+    starts = None if row_relative else row_starts
+    assert topk.resolve_prefill_backend(logits, top_k, starts) == backend
+    indices = torch.full(
+        (len(row_ends), top_k), 7, dtype=torch.int32, device=logits.device
+    )
+    topk.forward_prefill(logits, starts, row_ends, indices, top_k)
+    _assert_prefill_topk(indices, reference, row_starts, row_ends, top_k)
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
