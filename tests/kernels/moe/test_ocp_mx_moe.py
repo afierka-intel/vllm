@@ -2989,6 +2989,34 @@ def test_mxfp4_emulation_requires_amd_quark_only_for_mx_activations(monkeypatch)
     assert supported(kFp8Dynamic128Sym)
     assert not supported(kMxfp4Dynamic)
 
+    # Experts picked directly (`make_mxfp4_moe_kernel`) are validated with the
+    # key the oracle selects the emulation with, not a guessed MX one.
+    from vllm.model_executor.layers.fused_moe.config import (
+        mxfp4_w4a8_moe_quant_config,
+        ocp_mx_moe_quant_config,
+    )
+    from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
+        Mxfp4MoeBackend,
+        _validate_mxfp4_experts_config,
+    )
+
+    moe_config = make_dummy_moe_config()
+    _validate_mxfp4_experts_config(
+        emu.OCP_MXQuantizationEmulationTritonExperts,
+        moe_config,
+        Mxfp4MoeBackend.EMULATION,
+    )
+    w_scale = torch.empty(0, dtype=torch.uint8)
+    emu.OCP_MXQuantizationEmulationTritonExperts(
+        moe_config,
+        mxfp4_w4a8_moe_quant_config(w_scale, w_scale, block_shape=[128, 128]),
+    )
+    # An MX activation scheme still needs amd-quark, and says so.
+    with pytest.raises(ImportError, match="amd-quark"):
+        emu.OCP_MXQuantizationEmulationTritonExperts(
+            moe_config, ocp_mx_moe_quant_config("mxfp4", w_scale, w_scale)
+        )
+
 
 @pytest.mark.skipif(
     not (current_platform.is_cuda_alike() or current_platform.is_xpu()),

@@ -2315,6 +2315,11 @@ def _mxfp4_quant_keys_for_experts(
     experts_cls: type[mk.FusedMoEExperts],
     mxfp4_backend: Mxfp4MoeBackend,
 ) -> tuple[QuantKey | None, QuantKey | None]:
+    if mxfp4_backend == Mxfp4MoeBackend.EMULATION:
+        # The emulation accepts every scheme and runs the one of its quant
+        # config, so probing the candidates would always pick W4A4. Validate
+        # it with the key the oracle selects it with instead.
+        return kMxfp4Static, _backend_activation_key(mxfp4_backend)
     for weight_key, activation_key in _MXFP4_SCHEME_CANDIDATES:
         if experts_cls._supports_quant_scheme(weight_key, activation_key):
             return weight_key, activation_key

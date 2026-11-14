@@ -133,6 +133,16 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
         self.quantization_emulation = True
 
         self._quant_dtype = activation_quant_dtype(self.ocp_mx_scheme)
+        # MX activation dtypes are strings; FP8 is a torch dtype.
+        if (
+            self.ocp_mx_scheme.startswith("w_mxfp6")
+            or isinstance(self._quant_dtype, str)
+        ) and not has_quark():
+            raise ImportError(
+                f"OCP MX scheme {self.ocp_mx_scheme} needs the amd-quark package "
+                "for MXFP6 weights or MX activations. Install it with "
+                "`pip install amd-quark`."
+            )
 
     @staticmethod
     def is_supported_config(
