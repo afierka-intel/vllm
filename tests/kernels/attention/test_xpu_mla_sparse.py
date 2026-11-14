@@ -392,3 +392,209 @@ def test_sparse_indexer_explicit_backends(indexer_backend):
     indexer_backend("native")
     with pytest.raises(RuntimeError, match="sparse_indexer_backend='native'"):
         _use_native_indexer_op("_xpu_C.op_missing_from_this_build")
+
+
+# DSA indexer K cache write/gather: native (vllm-xpu-kernels) vs Triton.
+_CACHE_BLOCKS = 8
+
+
+def _indexer_k_cache_inputs(num_tokens: int = 200):
+    """bf16 K rows, shuffled int64 slots with some -1 (skipped) and a cache
+    of random bytes (to check that only the written slots change)."""
+    dev = "xpu"
+    k = 3 * torch.randn(num_tokens, _DIM, device=dev, dtype=torch.bfloat16)
+    slots = torch.randperm(_CACHE_BLOCKS * _BLOCK_SIZE, device=dev)[:num_tokens]
+    slots[::7] = -1
+    kv_cache = torch.randint(
+        0, 256, (_CACHE_BLOCKS, _BLOCK_SIZE, _DIM + 4), dtype=torch.uint8, device=dev
+    )
+    return k, kv_cache, slots
+
+
+def _cache_regions(kv_cache):
+    """[block, token] views of the value bytes and the fp32 scale bytes."""
+    flat = kv_cache.view(kv_cache.shape[0], -1)
+    values = flat[:, : _BLOCK_SIZE * _DIM].view(-1, _BLOCK_SIZE, _DIM)
+    scales = flat[:, _BLOCK_SIZE * _DIM :].view(-1, _BLOCK_SIZE, 4)
+    return values, scales
+
+
+def _indexer_k_cache_ref(k, kv_cache, slots, scale_fmt):
+    """Torch reference of the cache write: per-token amax / 448 scale (rounded
+    up to a power of two for UE8M0), flat token rows, fp32 scales."""
+    out = kv_cache.clone()
+    valid = slots >= 0
+    k, slots = k[valid].float(), slots[valid]
+    scale = k.abs().amax(dim=-1, keepdim=True).clamp(min=1e-4) / 448.0
+    if scale_fmt == "ue8m0":
+        scale = torch.exp2(torch.ceil(torch.log2(scale)))
+    values, scales = _cache_regions(out)
+    blocks, offsets = slots // _BLOCK_SIZE, slots % _BLOCK_SIZE
+    values[blocks, offsets] = (k / scale).to(torch.float8_e4m3fn).view(torch.uint8)
+    scales[blocks, offsets] = scale.view(torch.uint8)
+    return out
+
+
+@requires_xpu
+@pytest.mark.parametrize("scale_fmt", ["ue8m0", "fp32"])
+def test_indexer_k_cache_write_triton_matches_torch_ref(indexer_backend, scale_fmt):
+    from vllm._xpu_ops import indexer_k_quant_and_cache
+
+    torch.manual_seed(0)
+    k, kv_cache, slots = _indexer_k_cache_inputs()
+    ref = _indexer_k_cache_ref(k, kv_cache, slots, scale_fmt)
+    indexer_backend("triton")
+    indexer_k_quant_and_cache(k, kv_cache, slots, _DIM, scale_fmt)
+    assert torch.equal(kv_cache, ref)
+
+
+@requires_xpu
+@pytest.mark.parametrize("scale_fmt", ["ue8m0", "fp32"])
+def test_indexer_k_cache_write_native_vs_triton(indexer_backend, scale_fmt):
+    from vllm._xpu_ops import indexer_k_quant_and_cache
+
+    if not _native_usable("_C_cache_ops.indexer_k_quant_and_cache"):
+        pytest.skip("native indexer_k_quant_and_cache is not usable")
+    torch.manual_seed(0)
+    k, native, slots = _indexer_k_cache_inputs()
+    triton_cache = native.clone()
+    indexer_backend("native")
+    indexer_k_quant_and_cache(k, native, slots, _DIM, scale_fmt)
+    indexer_backend("triton")
+    indexer_k_quant_and_cache(k, triton_cache, slots, _DIM, scale_fmt)
+    assert torch.equal(triton_cache, native)
+
+
+def _gather_inputs():
+    """Ragged sequences over shuffled pages of a random-byte cache."""
+    dev = "xpu"
+    seq_lens = [1, 69, 130, 64]
+    max_blocks = 3
+    kv_cache = torch.randint(
+        0,
+        256,
+        (_CACHE_BLOCKS * 2, _BLOCK_SIZE, _DIM + 4),
+        dtype=torch.uint8,
+        device=dev,
+    )
+    pages = torch.randperm(kv_cache.shape[0], device=dev)[: len(seq_lens) * max_blocks]
+    block_table = pages.int().view(len(seq_lens), max_blocks)
+    cu_seq_lens = torch.tensor([0, *seq_lens], device=dev).cumsum(0).int()
+    return kv_cache, block_table, cu_seq_lens
+
+
+def _gather(kv_cache, block_table, cu_seq_lens):
+    from vllm._xpu_ops import cp_gather_indexer_k_quant_cache
+
+    num_tokens = int(cu_seq_lens[-1])
+    dst_k = torch.empty(
+        num_tokens, _DIM, dtype=torch.float8_e4m3fn, device=kv_cache.device
+    )
+    dst_scale = torch.empty(num_tokens, 4, dtype=torch.uint8, device=kv_cache.device)
+    cp_gather_indexer_k_quant_cache(
+        kv_cache, dst_k, dst_scale, block_table, cu_seq_lens
+    )
+    return dst_k.view(torch.uint8), dst_scale
+
+
+@requires_xpu
+def test_indexer_k_cache_gather_native_vs_triton(indexer_backend):
+    if not _native_usable("_C_cache_ops.cp_gather_indexer_k_quant_cache"):
+        pytest.skip("native cp_gather_indexer_k_quant_cache is not usable")
+    torch.manual_seed(0)
+    inputs = _gather_inputs()
+    indexer_backend("native")
+    native_k, native_scale = _gather(*inputs)
+    indexer_backend("triton")
+    triton_k, triton_scale = _gather(*inputs)
+    assert torch.equal(triton_k, native_k)
+    assert torch.equal(triton_scale, native_scale)
+
+
+@requires_xpu
+@pytest.mark.parametrize("scale_fmt", ["ue8m0", "fp32"])
+def test_indexer_k_cache_triton_round_trip(indexer_backend, scale_fmt):
+    """Triton write then Triton gather returns the stored bytes, and they
+    dequantize to K within FP8 E4M3 rounding."""
+    from vllm._xpu_ops import indexer_k_quant_and_cache
+
+    torch.manual_seed(0)
+    indexer_backend("triton")
+    kv_cache, block_table, cu_seq_lens = _gather_inputs()
+    seq_lens = (cu_seq_lens[1:] - cu_seq_lens[:-1]).tolist()
+    # Slot of every token of every sequence, in gather order.
+    slots = torch.cat(
+        [
+            block_table[i, torch.arange(n, device="xpu") // _BLOCK_SIZE] * _BLOCK_SIZE
+            + torch.arange(n, device="xpu") % _BLOCK_SIZE
+            for i, n in enumerate(seq_lens)
+        ]
+    )
+    k = 3 * torch.randn(slots.numel(), _DIM, device="xpu", dtype=torch.bfloat16)
+    indexer_k_quant_and_cache(k, kv_cache, slots, _DIM, scale_fmt)
+    k_bytes, scale_bytes = _gather(kv_cache, block_table, cu_seq_lens)
+
+    values, scales = _cache_regions(kv_cache)
+    blocks, offsets = slots // _BLOCK_SIZE, slots % _BLOCK_SIZE
+    assert torch.equal(k_bytes, values[blocks, offsets])
+    assert torch.equal(scale_bytes, scales[blocks, offsets])
+
+    scale = scale_bytes.view(torch.float32)
+    k_deq = k_bytes.view(torch.float8_e4m3fn).float() * scale
+    # E4M3 rounds to 2^-4 relative, or 2^-10 absolute (in units of the scale)
+    # in the subnormal range; 2^-20 covers the fp32 divide and multiply.
+    bound = (2.0**-4 + 2.0**-20) * k.float().abs() + 2.0**-10 * scale
+    assert ((k_deq - k.float()).abs() <= bound).all()
+
+
+@requires_xpu
+def test_indexer_k_cache_auto_falls_back_to_triton(indexer_backend, monkeypatch):
+    """With "auto" and the native cache kernels marked unusable, the
+    vllm._custom_ops wrappers run the Triton kernels."""
+    from vllm import _custom_ops as ops
+    from vllm.utils.kernel_probe import set_kernel_usable
+    from vllm.v1.attention.ops import dsa_indexer_cache_triton as mod
+
+    names = (
+        "_C_cache_ops.indexer_k_quant_and_cache",
+        "_C_cache_ops.cp_gather_indexer_k_quant_cache",
+    )
+    calls: list[str] = []
+
+    def counted(name: str):
+        fn = getattr(mod, name)
+
+        def wrapper(*args, **kwargs):
+            calls.append(name)
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    for name in (
+        "indexer_k_quant_and_cache_triton",
+        "cp_gather_indexer_k_quant_cache_triton",
+    ):
+        monkeypatch.setattr(mod, name, counted(name))
+    indexer_backend("auto")
+    torch.manual_seed(0)
+    try:
+        for name in names:
+            set_kernel_usable(name, False)
+        k, kv_cache, slots = _indexer_k_cache_inputs()
+        ops.indexer_k_quant_and_cache(k, kv_cache, slots, _DIM, "ue8m0")
+        kv_cache, block_table, cu_seq_lens = _gather_inputs()
+        num_tokens = int(cu_seq_lens[-1])
+        ops.cp_gather_indexer_k_quant_cache(
+            kv_cache,
+            kv_cache.new_empty(num_tokens, _DIM).view(torch.float8_e4m3fn),
+            kv_cache.new_empty(num_tokens, 4),
+            block_table,
+            cu_seq_lens,
+        )
+    finally:
+        for name in names:
+            set_kernel_usable(name, None)
+    assert calls == [
+        "indexer_k_quant_and_cache_triton",
+        "cp_gather_indexer_k_quant_cache_triton",
+    ]

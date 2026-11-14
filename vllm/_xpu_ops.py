@@ -458,12 +458,122 @@ def _paged_mqa_logits_probe_run() -> torch.Tensor:
     )
 
 
+_INDEXER_K_PROBE_BLOCKS, _INDEXER_K_PROBE_BLOCK_SIZE, _INDEXER_K_PROBE_DIM = 2, 64, 128
+
+
+def _indexer_k_cache_probe_inputs() -> tuple[torch.Tensor, ...]:
+    """K rows whose FP8 quantization is exact: each row's |max| is 56, so the
+    scale is 56 / 448 = 2^-3 (also as UE8M0) and every k / scale is an FP8
+    value. Some slots are -1 (skipped)."""
+    dev = torch.device("xpu", torch.xpu.current_device())
+    num_blocks, block_size, dim = (
+        _INDEXER_K_PROBE_BLOCKS,
+        _INDEXER_K_PROBE_BLOCK_SIZE,
+        _INDEXER_K_PROBE_DIM,
+    )
+    levels = torch.tensor(
+        [0, 1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48], dtype=torch.float32, device=dev
+    )
+    slot_mapping = torch.tensor(
+        [5, 67, -1, 127, 0, 70, -1, 64], dtype=torch.int64, device=dev
+    )
+    idx = torch.arange(slot_mapping.numel() * dim, device=dev)
+    k = (levels[idx * 7 % 12] * (1 - 2 * (idx % 2))).view(-1, dim)
+    k[:, 0] = 56.0
+    kv_cache = torch.zeros(
+        num_blocks, block_size, dim + 4, dtype=torch.uint8, device=dev
+    )
+    return k.to(torch.bfloat16), kv_cache, slot_mapping
+
+
+def _indexer_k_cache_regions(
+    kv_cache: torch.Tensor, dim: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """[block, token] views of the value bytes and the fp32 scale bytes."""
+    num_blocks, block_size = kv_cache.shape[:2]
+    flat = kv_cache.view(num_blocks, -1)
+    values = flat[:, : block_size * dim].view(num_blocks, block_size, dim)
+    scales = flat[:, block_size * dim :].view(num_blocks, block_size, 4)
+    return values, scales
+
+
+def _indexer_k_quant_and_cache_probe_run() -> torch.Tensor:
+    k, kv_cache, slot_mapping = _indexer_k_cache_probe_inputs()
+    torch.ops._C_cache_ops.indexer_k_quant_and_cache(
+        k, kv_cache, slot_mapping, k.shape[-1], "ue8m0"
+    )
+    return kv_cache
+
+
+def _indexer_k_quant_and_cache_probe_ref() -> torch.Tensor:
+    k, kv_cache, slot_mapping = _indexer_k_cache_probe_inputs()
+    block_size = kv_cache.shape[1]
+    valid = slot_mapping >= 0
+    slots, k = slot_mapping[valid], k[valid].float()
+    scale = k.abs().amax(dim=-1, keepdim=True) / 448.0
+    values, scales = _indexer_k_cache_regions(kv_cache, k.shape[-1])
+    blocks, offsets = slots // block_size, slots % block_size
+    fp8 = current_platform.fp8_dtype()
+    values[blocks, offsets] = (k / scale).to(fp8).view(torch.uint8)
+    scales[blocks, offsets] = scale.view(torch.uint8)
+    return kv_cache
+
+
+def _cp_gather_indexer_k_probe_inputs() -> tuple[torch.Tensor, ...]:
+    dev = torch.device("xpu", torch.xpu.current_device())
+    num_blocks, block_size, dim = (
+        _INDEXER_K_PROBE_BLOCKS,
+        _INDEXER_K_PROBE_BLOCK_SIZE,
+        _INDEXER_K_PROBE_DIM,
+    )
+    numel = num_blocks * block_size * (dim + 4)
+    kv_cache = (torch.arange(numel, device=dev) % 251).to(torch.uint8)
+    kv_cache = kv_cache.view(num_blocks, block_size, dim + 4)
+    block_table = torch.tensor([[1, 0], [0, 1]], dtype=torch.int32, device=dev)
+    cu_seq_lens = torch.tensor([0, 70, 100], dtype=torch.int32, device=dev)
+    return kv_cache, block_table, cu_seq_lens
+
+
+def _cp_gather_indexer_k_quant_cache_probe_run() -> tuple[torch.Tensor, ...]:
+    kv_cache, block_table, cu_seq_lens = _cp_gather_indexer_k_probe_inputs()
+    num_tokens = int(cu_seq_lens[-1])
+    dst_k = kv_cache.new_zeros(num_tokens, _INDEXER_K_PROBE_DIM)
+    dst_scale = kv_cache.new_zeros(num_tokens, 4)
+    torch.ops._C_cache_ops.cp_gather_indexer_k_quant_cache(
+        kv_cache,
+        dst_k.view(current_platform.fp8_dtype()),
+        dst_scale,
+        block_table,
+        cu_seq_lens,
+    )
+    return dst_k, dst_scale
+
+
+def _cp_gather_indexer_k_quant_cache_probe_ref() -> tuple[torch.Tensor, ...]:
+    kv_cache, block_table, cu_seq_lens = _cp_gather_indexer_k_probe_inputs()
+    block_size = kv_cache.shape[1]
+    tokens = torch.arange(int(cu_seq_lens[-1]), device=kv_cache.device)
+    seq = torch.searchsorted(cu_seq_lens, tokens.int(), right=True) - 1
+    pos = tokens - cu_seq_lens[seq]
+    blocks = block_table[seq, pos // block_size]
+    values, scales = _indexer_k_cache_regions(kv_cache, _INDEXER_K_PROBE_DIM)
+    return values[blocks, pos % block_size], scales[blocks, pos % block_size]
+
+
 # "<lib>.<op>" -> (run the native op, reference) on the probe inputs.
 _SPARSE_INDEXER_PROBES: dict[str, tuple[Callable, Callable]] = {
     "_xpu_C.fp8_mqa_logits": (_mqa_logits_probe_run, _mqa_logits_probe_ref),
     "_xpu_C.fp8_paged_mqa_logits": (
         _paged_mqa_logits_probe_run,
         _paged_mqa_logits_probe_ref,
+    ),
+    "_C_cache_ops.indexer_k_quant_and_cache": (
+        _indexer_k_quant_and_cache_probe_run,
+        _indexer_k_quant_and_cache_probe_ref,
+    ),
+    "_C_cache_ops.cp_gather_indexer_k_quant_cache": (
+        _cp_gather_indexer_k_quant_cache_probe_run,
+        _cp_gather_indexer_k_quant_cache_probe_ref,
     ),
 }
 
@@ -585,6 +695,63 @@ def _xpu_fp8_paged_mqa_logits_fake(
         (batch_size * next_n, max_model_len),
         dtype=torch.float32,
         device=q.device,
+    )
+
+
+def indexer_k_quant_and_cache(
+    k: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    quant_block_size: int,
+    scale_fmt: str,
+) -> None:
+    """Quantize the indexer K rows to FP8 and store them in the paged cache."""
+    if _use_native_indexer_op("_C_cache_ops.indexer_k_quant_and_cache"):
+        torch.ops._C_cache_ops.indexer_k_quant_and_cache(
+            k, kv_cache, slot_mapping, quant_block_size, scale_fmt
+        )
+        return
+    if quant_block_size != k.shape[-1]:
+        raise RuntimeError(
+            "The Triton indexer K cache writer stores one scale per token and "
+            f"needs quant_block_size == head_dim, got {quant_block_size} and "
+            f"{k.shape[-1]}."
+        )
+    from vllm.v1.attention.ops import dsa_indexer_cache_triton
+
+    # The native kernels and readers use flat token rows ("NORMAL").
+    dsa_indexer_cache_triton.indexer_k_quant_and_cache_triton(
+        k, kv_cache, slot_mapping, quant_block_size, scale_fmt, cache_layout="NORMAL"
+    )
+
+
+def cp_gather_indexer_k_quant_cache(
+    kv_cache: torch.Tensor,
+    dst_k: torch.Tensor,
+    dst_scale: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seq_lens: torch.Tensor,
+) -> None:
+    """Gather the FP8 indexer K rows and their scales of each sequence."""
+    if _use_native_indexer_op("_C_cache_ops.cp_gather_indexer_k_quant_cache"):
+        torch.ops._C_cache_ops.cp_gather_indexer_k_quant_cache(
+            kv_cache, dst_k, dst_scale, block_table, cu_seq_lens
+        )
+        return
+    from vllm.v1.attention.ops import dsa_indexer_cache_triton
+
+    tokens = torch.arange(
+        dst_k.shape[0], dtype=cu_seq_lens.dtype, device=cu_seq_lens.device
+    )
+    token_to_seq = torch.searchsorted(cu_seq_lens, tokens, right=True) - 1
+    dsa_indexer_cache_triton.cp_gather_indexer_k_quant_cache_triton(
+        kv_cache,
+        dst_k,
+        dst_scale,
+        block_table,
+        cu_seq_lens,
+        token_to_seq.to(torch.int32),
+        cache_layout="NORMAL",
     )
 
 
