@@ -1,13 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import functools
+from vllm.models.inkling2.common.ops.platform import use_sm100_kernels
 
-
-@functools.cache
-def use_sm100_kernels() -> bool:
-    """Whether to run the Blackwell kernels (tml_fa4, tcgen05 attention,
-    TRT-LLM-gen expert GEMMs, e2m1 conversions). Hopper uses Humming experts;
-    SM12x uses Triton experts and does not support tcgen05."""
-    from vllm.platforms import current_platform
-
-    return current_platform.is_device_capability_family(100)
+__all__ = ["use_sm100_kernels"]
