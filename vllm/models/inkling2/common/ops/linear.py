@@ -33,10 +33,11 @@ def linear(
     if use_sm12x_bf16_ll_gemm(x, weight):
         return sm12x_bf16_ll_gemm(x, weight)
     # Autotuning would profile the CuTe DSL kernels past their 32-row limit.
+    # The FlashInfer query comes last: FlashInfer is a CUDA-only dependency.
     if (
-        x.shape[0] > LOW_M_MAX_TOKENS
+        not use_sm100_kernels()
+        or x.shape[0] > LOW_M_MAX_TOKENS
         or is_flashinfer_autotuning()
-        or not use_sm100_kernels()
     ):
         return torch.nn.functional.linear(x, weight)
     from flashinfer import mm_bf16
