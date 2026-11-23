@@ -28,6 +28,49 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize(
+    "tokens,n,k",
+    [(1, 128, 2304), (37, 384, 4608), (300, 32, 4608), (2048, 128, 2304)],
+)
+@pytest.mark.parametrize("out_dtype", [torch.float32, torch.bfloat16])
+def test_k_group_partials_match_ordered_groups(tokens, n, k, out_dtype, monkeypatch):
+    """`k_group_partials` keeps fp32 1024-wide K-group partials (or their
+    in-order sum); on XPU its descriptor path gives the pointer path's bits
+    at the same tile."""
+    from vllm.models.inkling2.common.ops import linear as ops
+
+    torch.manual_seed(0)
+    x = torch.randn(tokens, k, device=DEVICE).bfloat16()
+    w = torch.randn(n, k, device=DEVICE).bfloat16()
+    groups = [
+        x[:, g : g + 1024].float() @ w[:, g : g + 1024].float().T
+        for g in range(0, k, 1024)
+    ]
+    out = ops.k_group_partials(x, w, out_dtype)
+    if out.shape[0] == len(groups):
+        expected = torch.stack(groups)
+    else:
+        total = groups[0]
+        for partial in groups[1:]:
+            total = total + partial
+        expected = total[None].to(out_dtype)
+    torch.testing.assert_close(out.float(), expected.float(), atol=2e-3, rtol=1e-2)
+    if not ops.use_kernel_autotune():
+        return
+    # One tile for both paths.
+    monkeypatch.setattr(ops, "_TOKEN_BUCKETS", ((1 << 62, (32,)),))
+    monkeypatch.setattr(ops, "_TUNED_TILES", ((32, 64, 4, 3),))
+    ops._k_group_kernel_tuned.cache_clear()
+    try:
+        results = []
+        for use_td in (False, True):
+            monkeypatch.setattr(ops, "use_tensor_descriptor", lambda td=use_td: td)
+            results.append(ops.k_group_partials(x, w, out_dtype))
+    finally:
+        ops._k_group_kernel_tuned.cache_clear()
+    torch.testing.assert_close(results[1], results[0], atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("in_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("width", [4608, 128])
 def test_rms_norm_rounds_once_to_bf16(in_dtype, width):

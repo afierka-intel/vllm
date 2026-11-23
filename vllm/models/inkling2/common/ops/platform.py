@@ -51,15 +51,12 @@ def use_kernel_autotune() -> bool:
 @functools.cache
 def use_tma_k_groups() -> bool:
     """Whether `k_group_partials` runs its host TensorDescriptor kernel for
-    large batches: CUDA with `use_pdl` (SM90+). Other backends take the
-    pointer kernel unless `VLLM_TRITON_USE_TD=1`, until the descriptor
-    kernel is validated there."""
-    import vllm.envs as envs
+    large batches: CUDA with `use_pdl` (SM90+). Other backends run the
+    K-group kernel, whose tensor-descriptor path follows
+    `use_tensor_descriptor()`."""
     from vllm.platforms import current_platform
 
-    if current_platform.is_cuda():
-        return use_pdl()
-    return envs.VLLM_TRITON_USE_TD is True
+    return current_platform.is_cuda() and use_pdl()
 
 
 @functools.cache
