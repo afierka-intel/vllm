@@ -13,7 +13,9 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.flashinfer import is_flashinfer_autotuning
 
-from .platform import use_sm100_kernels
+from .intrinsics import keep_separate, prefetch_l2
+from .pdl import gdc_launch_dependents, gdc_wait
+from .platform import pdl_launch_kwargs, use_sm100_kernels, use_tma_k_groups
 
 # Up to this many rows, FlashInfer's CuTe DSL low-M kernels run near HBM
 # bandwidth (cuBLAS is up to 2x slower); larger batches use cuBLAS.
@@ -84,15 +86,9 @@ def _k_group_tile(
             partial = tl.dot(x, w, partial)
         if g > 0:
             # Keep a short tail's dot separate from the preceding 1024-wide
-            # groups; folding total into its MMA changes the rounding order.
-            partial = tl.inline_asm_elementwise(
-                "mov.b32 $0, $1;",
-                "=f,f",
-                [partial],
-                dtype=tl.float32,
-                is_pure=True,
-                pack=1,
-            )
+            # groups; folding total into its MMA changes the rounding order
+            # (`keep_separate` is an identity off CUDA, see `intrinsics`).
+            partial = keep_separate(partial)
         total = partial if g == 0 else total + partial
     tl.store(
         Y + (first * M + rows[:, None]) * N + cols[None, :],
@@ -109,15 +105,7 @@ def _prefetch_k_group_tile(
     cols = pid_n * BN + tl.arange(0, BN)
     k = pid_k * 1024 + tl.arange(0, 16) * 64
     mask = (cols[:, None] < N) & (k[None, :] < K)
-    tl.inline_asm_elementwise(
-        "{ .reg .pred p; setp.ne.b32 p, $2, 0; "
-        "@p prefetch.global.L2 [$1]; mov.b32 $0, 0; }",
-        "=r,l,r",
-        [W + cols[:, None] * K + k[None, :], mask.to(tl.int32)],
-        dtype=tl.int32,
-        is_pure=False,
-        pack=1,
-    )
+    prefetch_l2(W + cols[:, None] * K + k[None, :], mask)
 
 
 @triton.jit
@@ -134,7 +122,7 @@ def _k_group_kernel(
 ):
     if SPLIT and tl.program_id(1) == 0:
         _prefetch_k_group_tile(W, N, K, BN, tl.program_id(0), tl.program_id(2))
-    tl.extra.cuda.gdc_wait()
+    gdc_wait()
     _k_group_tile(
         X,
         W,
@@ -153,7 +141,7 @@ def _k_group_kernel(
 
 @triton.jit
 def _k_group_sum_kernel(Partials, Y, MN, GROUPS: tl.constexpr, BLOCK: tl.constexpr):
-    tl.extra.cuda.gdc_wait()
+    gdc_wait()
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < MN
     total = tl.load(Partials + offs, mask)
@@ -181,9 +169,9 @@ def _k_group_tma_kernel(
     GROUP_TILES: tl.constexpr = 1024 // BK
     rows = tl.program_id(1) * BM
     cols = tl.program_id(0) * BN
-    tl.extra.cuda.gdc_wait()
+    gdc_wait()
     if LAUNCH_DEPENDENTS:
-        tl.extra.cuda.gdc_launch_dependents()
+        gdc_launch_dependents()
     total = tl.zeros((BM, BN), tl.float32)
     partial = tl.zeros((BM, BN), tl.float32)
     for tile in tl.range(TILES, warp_specialize=True):
@@ -217,7 +205,7 @@ def k_group_partials(
     tokens, hidden = x.shape
     n = weight.shape[0]
     sm120 = current_platform.is_device_capability_family(120)
-    if tokens >= TMA_MIN_TOKENS:
+    if tokens >= TMA_MIN_TOKENS and use_tma_k_groups():
         from triton.tools.tensor_descriptor import TensorDescriptor
 
         out = torch.empty((1, tokens, n), dtype=out_dtype, device=x.device)
@@ -237,7 +225,7 @@ def k_group_partials(
             num_warps=4 if block_n == 64 else 8,
             num_stages=2 if sm120 else 4 if block_n == 64 else 3,
             enable_fp_fusion=False,
-            launch_pdl=True,
+            **pdl_launch_kwargs(),
         )
         return out
     block_m = 16 if tokens <= 128 else 64
@@ -271,7 +259,7 @@ def k_group_partials(
         num_warps=num_warps,
         num_stages=num_stages,
         enable_fp_fusion=False,
-        launch_pdl=True,
+        **pdl_launch_kwargs(),
     )
     return out
 
@@ -289,6 +277,6 @@ def linear_k_groups(
         return partials[0]
     out = torch.empty(partials.shape[1:], dtype=out_dtype, device=x.device)
     _k_group_sum_kernel[(triton.cdiv(out.numel(), 1024),)](
-        partials, out, out.numel(), partials.shape[0], 1024, launch_pdl=True
+        partials, out, out.numel(), partials.shape[0], 1024, **pdl_launch_kwargs()
     )
     return out

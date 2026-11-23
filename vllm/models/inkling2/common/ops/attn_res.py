@@ -12,8 +12,11 @@ returned as is (fp32) without a norm weight.
 
 import torch
 
-from vllm.models.inkling2.common.ops.norm import rsqrt
 from vllm.triton_utils import tl, tldevice, triton
+
+from .intrinsics import rsqrt
+from .pdl import gdc_wait
+from .platform import pdl_launch_kwargs
 
 
 @triton.jit
@@ -74,7 +77,7 @@ def _attn_res_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    tl.extra.cuda.gdc_wait()
+    gdc_wait()
     # One program per (token, query).
     t = tl.program_id(1).to(tl.int64)
     q_off = tl.program_id(0) * D
@@ -188,7 +191,7 @@ def _attn_res_row_kernel(
     BLOCK_A: tl.constexpr,
     BLOCK_B: tl.constexpr,
 ):
-    tl.extra.cuda.gdc_wait()
+    gdc_wait()
     # Small batches: one program per (token, query) holds the row in registers
     # as a power-of-2 head [0, BLOCK_A) and a masked tail [BLOCK_A, D), so the
     # sources are read twice instead of three times.
@@ -291,7 +294,7 @@ def attn_res(
         APPLY_NORM=apply_norm,
         BLOCK_N=triton.next_power_of_2(num_stack + 1),
         enable_fp_fusion=False,
-        launch_pdl=True,
+        **pdl_launch_kwargs(),
     )
     # The queries of a token run back to back and share its sources in L2.
     grid = (num_q, num_tokens)

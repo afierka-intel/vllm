@@ -1,8 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Host-side platform predicates of the Inkling2 kernels."""
+"""Host-side platform predicates of the Inkling2 kernels.
+
+Each names one capability, so that the shared code takes the CUDA fast
+paths of `nvidia/` exactly where they ran before and the portable Triton
+paths everywhere else (e.g. XPU).
+"""
 
 import functools
+from collections.abc import Mapping
+from types import MappingProxyType
 
 
 @functools.cache
@@ -13,3 +20,49 @@ def use_sm100_kernels() -> bool:
     from vllm.platforms import current_platform
 
     return current_platform.is_device_capability_family(100)
+
+
+@functools.cache
+def use_pdl() -> bool:
+    """Whether the Triton kernels use programmatic dependent launch
+    (griddepcontrol): CUDA SM90+. Elsewhere launches are stream ordered."""
+    from vllm.platforms import current_platform
+
+    return current_platform.is_cuda() and current_platform.has_device_capability(90)
+
+
+@functools.cache
+def pdl_launch_kwargs() -> Mapping[str, bool]:
+    """Launch options of the PDL kernels: `launch_pdl=True` with `use_pdl`,
+    else none (backends without PDL reject the option, even when False)."""
+    return MappingProxyType({"launch_pdl": True} if use_pdl() else {})
+
+
+@functools.cache
+def use_tma_k_groups() -> bool:
+    """Whether `k_group_partials` runs its host TensorDescriptor kernel for
+    large batches: CUDA with `use_pdl` (SM90+). Other backends take the
+    pointer kernel unless `VLLM_TRITON_USE_TD=1`, until the descriptor
+    kernel is validated there."""
+    import vllm.envs as envs
+    from vllm.platforms import current_platform
+
+    if current_platform.is_cuda():
+        return use_pdl()
+    return envs.VLLM_TRITON_USE_TD is True
+
+
+@functools.cache
+def use_native_conv_mix() -> bool:
+    """Whether the `csrc/inkling2` conv/mix ops run here: CUDA Hopper and
+    SM10x builds that register them. Otherwise `conv_mix` runs `short_conv`
+    + `attn_res`."""
+    import torch
+
+    from vllm.platforms import current_platform
+
+    return (
+        current_platform.is_cuda()
+        and any(current_platform.is_device_capability_family(f) for f in (90, 100))
+        and hasattr(torch.ops._C, "inkling2_conv_mix")
+    )

@@ -15,6 +15,8 @@ from vllm.triton_utils import tl, tldevice, triton
 
 from .activation import _situ
 from .linear import k_group_partials
+from .pdl import gdc_launch_dependents, gdc_wait
+from .platform import pdl_launch_kwargs
 
 # Up to this many tokens, kernels let the next kernel launch (and wait) as soon
 # as they start, which hides its launch; with more, its waiting programs would
@@ -176,9 +178,9 @@ def _combine_kernel(
     PUSH: tl.constexpr,
     HALO_ROWS: tl.constexpr,
 ):
-    tl.extra.cuda.gdc_wait()
+    gdc_wait()
     if LAUNCH_DEPENDENTS:
-        tl.extra.cuda.gdc_launch_dependents()
+        gdc_launch_dependents()
     token = tl.program_id(0).to(tl.int64)
     cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     acc = tl.zeros((BLOCK,), tl.float32)
@@ -237,7 +239,7 @@ def _combine(
         sp is not None,
         HALO_ROWS,
         num_warps=2,
-        launch_pdl=True,
+        **pdl_launch_kwargs(),
     )
 
 
