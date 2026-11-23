@@ -129,14 +129,19 @@ def test_e4m3_kv_load_preserves_all_byte_values_and_masks():
 @pytest.mark.parametrize("window", [0, 1024])
 @torch.inference_mode()
 def test_portable_attention_dequantizes_kv_before_mma(
-    cache_dtype, query_len, splits, window
+    cache_dtype, query_len, splits, window, monkeypatch
 ):
     """Stored FP16/FP8 values match explicit BF16 dequantization in all phases."""
+    from vllm.models.inkling2.common.ops import rel_attention as ops
     from vllm.models.inkling2.common.ops.rel_attention import (
         MODE_OUT_LSE,
         MODE_PARTIAL,
         rel_attention,
     )
+
+    # Exact equality needs one tile config for both cache dtypes; the
+    # autotuner keys on the dtype.
+    monkeypatch.setattr(ops, "use_kernel_autotune", lambda: False)
 
     torch.manual_seed(42)
     heads, kv_heads, page, dim = 24, 8, 16, 128
@@ -178,6 +183,70 @@ def test_portable_attention_dequantizes_kv_before_mma(
     expected = run(kv.bfloat16())
     for observed, reference in zip(actual, expected):
         torch.testing.assert_close(observed, reference, atol=0, rtol=0)
+
+
+@requires_triton_attention
+@pytest.mark.parametrize("heads", [24, 48])
+@pytest.mark.parametrize(
+    "query_len,splits,page", [(300, 1, 64), (300, 1, 128), (1, 1, 128), (1, 5, 128)]
+)
+@pytest.mark.parametrize("window", [0, 1024])
+@torch.inference_mode()
+def test_rel_attention_descriptor_path_matches_pointer_path(
+    heads, query_len, splits, page, window, monkeypatch
+):
+    """The per-page tensor-descriptor K/V loads agree with the pointer path
+    to fp32 rounding at the same tile config (the dot operands come from
+    different layouts), including a partial last page of stale NaNs."""
+    from vllm.models.inkling2.common.ops import rel_attention as ops
+
+    monkeypatch.setattr(ops, "use_kernel_autotune", lambda: False)
+    torch.manual_seed(0)
+    kv_heads, dim, kv_len = 8, 128, 1900
+    num_pages = -(-kv_len // page) + 2
+    q = torch.randn(query_len, heads, dim, device=DEVICE).bfloat16()
+    kv = torch.randn(num_pages, page, kv_heads, 2 * dim, device=DEVICE).bfloat16()
+    table = torch.randperm(num_pages, device=DEVICE)[: num_pages - 2].view(1, -1)
+    # Slots past the sequence end hold stale values.
+    last = table[0, -1]
+    kv[last, kv_len % page :] = float("nan")
+    lengths = torch.tensor([kv_len], device=DEVICE, dtype=torch.int32)
+    cu = torch.tensor([0, query_len], device=DEVICE, dtype=torch.int32)
+    rel = torch.randn(query_len, heads, 1024, device=DEVICE).bfloat16()
+    sheared = shear_rel_logits(rel, [(query_len, kv_len)], 128, bool(window))
+    k, v = kv.split(dim, dim=-1)
+    block_m = ops._block_m(query_len, heads // kv_heads)
+    assert ops.use_kv_descriptors(k, v, block_m, True)
+
+    def run(use_td):
+        if splits == 1:
+            out = torch.empty_like(q, dtype=torch.float32)
+            lse = torch.empty(heads, query_len, device=DEVICE)
+        else:
+            out = torch.empty(splits, *q.shape, device=DEVICE)
+            lse = torch.empty(splits, query_len, heads, device=DEVICE)
+        ops.rel_attention(
+            q,
+            k,
+            v,
+            out,
+            lse,
+            sheared,
+            block_table=table.int(),
+            cache_seqlens=lengths,
+            cu_seqlens_q=cu,
+            max_query_len=query_len,
+            softmax_scale=dim**-0.5,
+            window=window,
+            num_splits=splits,
+            mode=ops.MODE_OUT_LSE if splits == 1 else ops.MODE_PARTIAL,
+            use_td=use_td,
+        )
+        return out, lse
+
+    for observed, reference in zip(run(True), run(False)):
+        assert not observed.isnan().any()
+        torch.testing.assert_close(observed, reference, atol=1e-6, rtol=1e-5)
 
 
 @requires_triton_attention

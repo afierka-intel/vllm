@@ -39,6 +39,16 @@ def pdl_launch_kwargs() -> Mapping[str, bool]:
 
 
 @functools.cache
+def use_kernel_autotune() -> bool:
+    """Whether the portable Triton kernels autotune their tiles: XPU. CUDA
+    keeps the fixed launch configs (tiles, warps, stages) chosen for Hopper
+    and Blackwell, so its launches are unchanged."""
+    from vllm.platforms import current_platform
+
+    return current_platform.is_xpu()
+
+
+@functools.cache
 def use_tma_k_groups() -> bool:
     """Whether `k_group_partials` runs its host TensorDescriptor kernel for
     large batches: CUDA with `use_pdl` (SM90+). Other backends take the
