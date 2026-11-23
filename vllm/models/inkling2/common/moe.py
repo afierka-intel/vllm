@@ -55,7 +55,13 @@ class FlatExperts(Protocol):
     gate / up rows) and `w2`. A call returns the bf16 `[T * topk, H]`
     down-projection rows of the local slots of `ids` (-1: not local), with
     the softcapped SiTU (`gate_cap`, `up_cap`) of the `w13` output scaled by
-    the routing `weights`; the other rows are left unset."""
+    the routing `weights`; the other rows are left unset.
+
+    A backend whose `combines` is True (e.g. the SYCL fused MoE on XPU)
+    returns the combined bf16 `[T, H]` output instead: the routing weight
+    scales each down-projection row in fp32 and the sum is rounded once to
+    bf16, as `combine` does. It serves only the reduced output (no
+    `reduce=False` rows, no `push`). Without the attribute it is False."""
 
     def __call__(
         self,
@@ -69,11 +75,18 @@ class FlatExperts(Protocol):
     ) -> torch.Tensor: ...
 
 
-def flat_experts_class(quant_format: QuantFormat) -> Callable[..., FlatExperts]:
-    """This platform's `FlatExperts` for `quant_format` experts. Raises
+def flat_experts_class(
+    quant_format: QuantFormat, topk: int, gate_cap: float, up_cap: float
+) -> Callable[..., FlatExperts]:
+    """This platform's `FlatExperts` constructor for `quant_format` experts
+    with `topk` slots per token and the SiTU softcaps of the layer. Raises
     `NotImplementedError` (at model init) where no kernel serves them."""
     if current_platform.is_cuda():
         return HummingExperts
+    if current_platform.is_xpu():
+        from vllm.models.inkling2.xpu.experts import xpu_flat_experts
+
+        return xpu_flat_experts(quant_format, topk, gate_cap, up_cap)
     raise NotImplementedError(
         f"Inkling2 {quant_format.upper()} routed experts have no expert GEMM "
         f"kernel on {current_platform.device_name}"
@@ -203,7 +216,9 @@ class Inkling2Experts(nn.Module):
         # built after loading; unsupported formats fail here.
         self.flat_experts: FlatExperts | None = None
         self.flat_experts_cls = (
-            None if self.sm100 or self.sm120 else flat_experts_class(quant_format)
+            None
+            if self.sm100 or self.sm120
+            else flat_experts_class(quant_format, self.topk, self.gate_cap, self.up_cap)
         )
         if self.sm100:
             load_kernels(
@@ -349,6 +364,16 @@ class Inkling2Experts(nn.Module):
                 self.gate_cap,
                 self.up_cap,
             )
+            if getattr(self.flat_experts, "combines", False):
+                if push is not None or not reduce:
+                    raise NotImplementedError(
+                        f"{type(self.flat_experts).__name__} combines the expert "
+                        "rows itself; it has no unreduced rows to return or push"
+                    )
+                # The fp32 combine was rounded once to bf16 by the experts.
+                if self.ep_size == 1:
+                    return down
+                return tensor_model_parallel_all_reduce(down)
         if push is not None:
             # Each rank's fp32 combine is rounded once to bf16.
             combine_push(down, src2dst, self.topk, push)
