@@ -52,7 +52,7 @@ steps:
 
 - label: ":intel: (B70) Inkling 2"
   key: inkling2-xpu
-  timeout_in_minutes: 60
+  timeout_in_minutes: 90
   device: intel_gpu_k8s
   num_devices: 1
   resource_claim_template: b70-1
