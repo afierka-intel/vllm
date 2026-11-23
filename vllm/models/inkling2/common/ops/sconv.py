@@ -20,16 +20,55 @@ Dynamic convolution (newest tap first, per-token per-head tap weights)::
 
 `y` is rounded to the input dtype. The K/V variant then L2-clips K and
 RMS-normalizes V per head and writes both to the paged KV cache.
+
+With `use_tensor_descriptor()`, the row tiles of the current inputs, the
+residual / addend / output tiles and the q / rel-logit tiles of the prologue
+go through tensor descriptors (2D block IO on Intel GPUs). The paged
+conv-state and KV-cache accesses (one slot per token), the earlier taps and
+the per-token scalars stay pointer accesses. On XPU (`use_kernel_autotune`)
+the tiles and warps are autotuned; CUDA keeps the fixed launch configs.
 """
+
+import functools
 
 import torch
 
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import (
+    tensor_descriptor_compatible,
+    tl,
+    triton,
+    use_tensor_descriptor,
+)
+from vllm.triton_utils.allocation import set_triton_allocator
 
 from .intrinsics import rsqrt
 from .norm import qr_clip_rel_tokens
 from .pdl import gdc_launch_dependents, gdc_wait
-from .platform import pdl_launch_kwargs
+from .platform import pdl_launch_kwargs, use_kernel_autotune
+
+
+@triton.jit
+def _load_rows_td(
+    ptr, rows, cols, stride, row0, col0, BR: tl.constexpr, BC: tl.constexpr
+):
+    """`[BR, BC]` tile at `(row0, col0)` of the row-major `[rows, cols]`
+    tensor at `ptr` (row stride `stride`); out-of-range elements read 0."""
+    desc = tl.make_tensor_descriptor(
+        ptr, shape=[rows, cols], strides=[stride, 1], block_shape=[BR, BC]
+    )
+    return desc.load([row0, col0])
+
+
+@triton.jit
+def _store_rows_td(
+    ptr, value, rows, cols, stride, row0, col0, BR: tl.constexpr, BC: tl.constexpr
+):
+    """Store the `[BR, BC]` tile at `(row0, col0)` of `[rows, cols]`;
+    out-of-range elements are dropped."""
+    desc = tl.make_tensor_descriptor(
+        ptr, shape=[rows, cols], strides=[stride, 1], block_shape=[BR, BC]
+    )
+    desc.store([row0, col0], value.to(ptr.dtype.element_ty))
 
 
 @triton.jit
@@ -218,11 +257,18 @@ def _conv(
     SKIP_IDLE_CACHE: tl.constexpr = False,
     CACHE_FIRST: tl.constexpr = False,
     tile_reads_cache=True,
+    USE_TD: tl.constexpr = False,
+    x_rows=0,
+    x_cols=0,
+    row0=0,
+    col0=0,
 ):
     """Store the current inputs to the cache; return `y` in fp32.
 
     With `CACHE_FIRST` (static W=4 conv), the taps from earlier steps are
-    loaded before waiting on the producer of `x` (PDL).
+    loaded before waiting on the producer of `x` (PDL). With `USE_TD`, the
+    current inputs (the tile at `(row0, col0)` of the `[x_rows, x_cols]`
+    `x`) load through a tensor descriptor.
     """
     tc_mask = t_mask[:, None] & c_mask[None, :]
     slot = tl.load(slot_ptr + toff, mask=t_mask, other=-1)
@@ -255,7 +301,19 @@ def _conv(
         gdc_wait()
 
     dtype = cache_ptr.dtype.element_ty
-    cur = tl.load(x_ptr + toff[:, None] * stride_x + coff[None, :], mask=tc_mask)
+    if USE_TD:
+        cur = _load_rows_td(
+            x_ptr,
+            x_rows,
+            x_cols,
+            stride_x,
+            row0,
+            col0,
+            toff.shape[0],
+            coff.shape[0],
+        )
+    else:
+        cur = tl.load(x_ptr + toff[:, None] * stride_x + coff[None, :], mask=tc_mask)
     cur = cur.to(dtype)
     safe_slot = tl.maximum(slot, 0)
     dst = (
@@ -335,6 +393,7 @@ def _sconv_kernel(
     BT: tl.constexpr,
     BLOCK_C: tl.constexpr,
     SKIP_IDLE_CACHE: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     first = tl.program_id(0) * BT
     tile_reads_cache = True
@@ -377,7 +436,23 @@ def _sconv_kernel(
         SKIP_IDLE_CACHE=SKIP_IDLE_CACHE,
         CACHE_FIRST=not SKIP_IDLE_CACHE,
         tile_reads_cache=tile_reads_cache,
+        USE_TD=USE_TD,
+        x_rows=T,
+        x_cols=C,
+        row0=first,
+        col0=tl.program_id(1) * BLOCK_C,
     ).to(out_ptr.dtype.element_ty)
+    if USE_TD:
+        col0 = tl.program_id(1) * BLOCK_C
+        if HAS_ADDEND:
+            acc = _load_rows_td(addend_ptr, T, C, C, first, col0, BT, BLOCK_C)
+            acc = acc.to(tl.float32)
+            if HAS_RES:
+                res = _load_rows_td(res_ptr, T, C, C, first, col0, BT, BLOCK_C)
+                acc = res.to(tl.float32) + acc
+            y = (acc + y.to(tl.float32)).to(out_ptr.dtype.element_ty)
+        _store_rows_td(out_ptr, y, T, C, C, first, col0, BT, BLOCK_C)
+        return
     offs = toff[:, None] * C + coff[None, :]
     mask = t_mask[:, None] & c_mask[None, :]
     if HAS_ADDEND:
@@ -422,13 +497,7 @@ def short_conv(
     width = weight.shape[1]
     # Prefill tiles skip the cache reads they never need.
     prefill = num_tokens > 256
-    if num_tokens <= 8:
-        block_t, block_c = 1, 1024
-    else:
-        block_t, block_c = (4, 256) if prefill else (2, 512)
-    block_c = min(triton.next_power_of_2(channels), block_c)
-    grid = (triton.cdiv(num_tokens, block_t), triton.cdiv(channels, block_c))
-    _sconv_kernel[grid](
+    args = (
         x,
         cache,
         weight,
@@ -451,20 +520,96 @@ def short_conv(
         block_table.shape[1],
         cache.shape[2],
         (width + 1) ** -0.5,
+    )
+    meta = dict(
         W=width,
         OFF=stream_offset,
         WS=stream_width,
         H=num_heads,
         HAS_RES=residual is not None,
         HAS_ADDEND=addend is not None,
+        SKIP_IDLE_CACHE=prefill,
+        enable_fp_fusion=False,
+    )
+    if use_kernel_autotune():
+        use_td = use_tensor_descriptor() and tensor_descriptor_compatible(
+            x, out, addend, residual
+        )
+        if use_td:
+            # On every launch: Triton's allocator is a per-thread ContextVar.
+            set_triton_allocator(x.device)
+
+        def tuned_grid(meta):
+            return (
+                triton.cdiv(num_tokens, meta["BT"]),
+                triton.cdiv(channels, meta["BLOCK_C"]),
+            )
+
+        _sconv_kernel_tuned(_sconv_bucket(num_tokens))[tuned_grid](
+            *args, **meta, USE_TD=use_td
+        )
+        return out
+    if num_tokens <= 8:
+        block_t, block_c = 1, 1024
+    else:
+        block_t, block_c = (4, 256) if prefill else (2, 512)
+    block_c = min(triton.next_power_of_2(channels), block_c)
+    grid = (triton.cdiv(num_tokens, block_t), triton.cdiv(channels, block_c))
+    _sconv_kernel[grid](
+        *args,
+        **meta,
         BT=block_t,
         BLOCK_C=block_c,
-        SKIP_IDLE_CACHE=prefill,
         num_warps=4,
-        enable_fp_fusion=False,
         **pdl_launch_kwargs(),
     )
     return out
+
+
+# Autotuning buckets of `short_conv`: (upper token count, token tiles) for
+# decode, mixed batches and prefill. Each bucket has its own tuner and config
+# list, so their tuned tiles stay apart, also in Triton's on-disk autotuning
+# cache (keyed by the configs).
+_SCONV_BUCKETS = ((8, (1, 2)), (256, (1, 2, 4)), (1 << 62, (4, 8)))
+
+# (BT, BLOCK_C, num_warps) autotuned on XPU; includes the fixed tiles.
+_SCONV_TILES = (
+    (1, 1024, 4),
+    (2, 512, 4),
+    (4, 256, 4),
+    (2, 1024, 8),
+    (4, 512, 8),
+    (8, 256, 8),
+)
+
+
+def _sconv_bucket(tokens: int) -> int:
+    return next(b for b, _ in _SCONV_BUCKETS if tokens <= b)
+
+
+def _prune_sconv_tiles(configs, named_args, **kwargs):
+    """Channel tiles up to the channels."""
+    args = {**named_args, **kwargs}
+    channels = triton.next_power_of_2(args["H"] * args["WS"])
+    return [c for c in configs if c.kwargs["BLOCK_C"] <= channels] or configs[:1]
+
+
+@functools.cache
+def _sconv_kernel_tuned(bucket: int):
+    """`_sconv_kernel` with the tile and warps autotuned per shape and path,
+    for token counts up to `bucket`."""
+    tiles = dict(_SCONV_BUCKETS)[bucket]
+    return triton.autotune(
+        configs=[
+            triton.Config({"BT": bt, "BLOCK_C": bc}, num_warps=w)
+            for bt, bc, w in _SCONV_TILES
+            if bt in tiles
+        ],
+        key=["W", "WS", "H", "HAS_RES", "HAS_ADDEND", "SKIP_IDLE_CACHE", "USE_TD"],
+        prune_configs_by={"early_config_prune": _prune_sconv_tiles},
+        # The residual may alias the output.
+        restore_value=["out_ptr"],
+    )(_sconv_kernel)
 
 
 # Columns of shift_rel_proj beyond the extent, 256 on either side.
