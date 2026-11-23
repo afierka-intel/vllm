@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from vllm.platforms import current_platform
+from vllm.triton_utils import tensor_descriptor_compatible
 
 if not current_platform.is_xpu():
     pytest.skip("Inkling2 XPU expert backends", allow_module_level=True)
@@ -246,15 +247,20 @@ def test_xpu_moe_layer_matches_reference(dist_init, fmt: str, tokens: int):
     torch.testing.assert_close(out, ref, atol=1e-2 * scale, rtol=2e-2)
 
 
-@pytest.mark.parametrize("block_m", [16, 32, 64])
+@pytest.mark.parametrize("use_td", [False, True])
 @pytest.mark.parametrize("a_div", [1, TOPK])
-@pytest.mark.parametrize("n,k", [(2304, 2304), (2304, 1152), (4608, 4608)])
+@pytest.mark.parametrize(
+    "n,k,block_m",
+    # Mini down projection (K % 256 != 0) and Small gate/up, every row block.
+    [(2304, 1152, 16), (2304, 1152, 64), (4608, 4608, 16), (4608, 4608, 32)],
+)
 def test_nvfp4_w4a16_moe_matches_dequantized_matmul(
-    block_m: int, a_div: int, n: int, k: int
+    n: int, k: int, block_m: int, a_div: int, use_td: bool
 ):
     """Each row the alignment lists (not the -1 slots, none of the empty
     experts) is its activation row times its expert's dequantized weights;
-    rows of several row blocks per expert and of one-row experts."""
+    rows of several row blocks per expert and of one-row experts. Weight
+    tiles load by pointers and through a tensor descriptor."""
     torch.manual_seed(0)
     num_experts, tokens = 24, 40
     values, scales, amax = random_nvfp4(num_experts, n, k)
@@ -268,8 +274,10 @@ def test_nvfp4_w4a16_moe_matches_dequantized_matmul(
     alignment = moe_align_block_size(
         ids, block_m, num_experts, ignore_invalid_experts=True
     )[:3]
+    # The descriptor path is taken when asked for.
+    assert tensor_descriptor_compatible(values)
     out = nvfp4_w4a16_moe(
-        a, values, scales, global_scale, alignment, rows, a_div, block_m
+        a, values, scales, global_scale, alignment, rows, a_div, block_m, use_td
     )
     flat = ids.flatten()
     for expert in range(num_experts):
