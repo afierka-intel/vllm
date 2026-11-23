@@ -24,13 +24,8 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.utils import set_weight_attrs
-from vllm.models.inkling.nvidia.ops.fa4_rel_attention import bucket_max_seqlen_q
 from vllm.models.inkling.nvidia.sconv_swa_attn import InklingConvState
 from vllm.models.inkling2.nvidia.lora import add_linear_lora
-from vllm.models.inkling2.nvidia.ops.attention import (
-    _INKLING2_FA4_REL_ATTENTION_KERNEL,
-    plan_attention,
-)
 from vllm.models.inkling2.nvidia.ops.ll_gemm_sm120 import qkv_bmm, use_qkv_bmm
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import (
@@ -307,6 +302,10 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
             raise ValueError(f"Duplicate layer name: {prefix}")
         forward_context[prefix] = self
         if vllm_config.kernel_config.enable_jit_warmup and use_sm100_kernels():
+            from vllm.models.inkling2.nvidia.ops.attention import (
+                _INKLING2_FA4_REL_ATTENTION_KERNEL,
+            )
+
             _INKLING2_FA4_REL_ATTENTION_KERNEL.register_warmup()
 
     def process_weights_after_loading(self) -> None:
@@ -505,13 +504,6 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
             )
             lse = q.new_empty((self.num_heads, out.shape[0]), dtype=torch.float32)
             if md is not None:
-                num_splits, use_scheduler = plan_attention(
-                    self.is_local,
-                    md.query_lens_cpu[num_decodes:],
-                    md.seq_lens_cpu[num_decodes:],
-                    self.num_heads,
-                    self.num_kv_heads,
-                )
                 self._fa4_attention(
                     md,
                     kv_cache,
@@ -519,8 +511,6 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
                     rel_logits[num_decode_tokens:],
                     out,
                     lse,
-                    num_splits,
-                    use_scheduler,
                     num_decodes,
                 )
             else:
@@ -600,17 +590,16 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
 
     def _fa4_attention(
         self,
-        md: FlashAttentionMetadata,
+        md: Inkling2AttentionMetadata,
         kv_cache: torch.Tensor,
         q: torch.Tensor,
         rel_logits: torch.Tensor,
         out: torch.Tensor,
         lse: torch.Tensor,
-        num_splits: int,
-        use_scheduler: bool,
         num_decodes: int,
     ) -> None:
-        """FA4 for the requests after the first `num_decodes`."""
+        """FA4 (Blackwell) or `_rel_attention_kernel` for the requests after
+        the first `num_decodes`."""
         num_decode_tokens = md.num_decode_tokens if num_decodes else 0
         nt = md.num_actual_tokens - num_decode_tokens
         cu_seqlens_q = md.query_start_loc[num_decodes:]
@@ -637,6 +626,22 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
             out[nt:].zero_()
             lse[:, nt:].zero_()
             return
+        # tml_fa4 and the Gluon kernels: imported on Blackwell only.
+        from vllm.models.inkling.nvidia.ops.fa4_rel_attention import (
+            bucket_max_seqlen_q,
+        )
+        from vllm.models.inkling2.nvidia.ops.attention import (
+            _INKLING2_FA4_REL_ATTENTION_KERNEL,
+            plan_attention,
+        )
+
+        num_splits, use_scheduler = plan_attention(
+            self.is_local,
+            md.query_lens_cpu[num_decodes:],
+            md.seq_lens_cpu[num_decodes:],
+            self.num_heads,
+            self.num_kv_heads,
+        )
         _INKLING2_FA4_REL_ATTENTION_KERNEL(
             q[:nt],
             key_cache,

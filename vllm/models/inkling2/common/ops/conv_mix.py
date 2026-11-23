@@ -1,14 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Hidden-stream short conv fused with the AttnRes mix + RMSNorm of the next
-sublayer, for large batches of an already reduced input (CUDA)."""
+sublayer, for large batches of an already reduced input: the `csrc/inkling2`
+ops on CUDA Hopper / SM10x, `short_conv` + `attn_res` elsewhere."""
 
 import torch
 
 from vllm.models.inkling2.nvidia.ops.seq_parallel import SeqParallel
-from vllm.platforms import current_platform
 
 from .attn_res import attn_res
+from .platform import use_native_conv_mix
 from .sconv import short_conv
 
 
@@ -89,9 +90,9 @@ def conv_mix(
     )
     if sp is None:
         assert halo == 0 and positions.shape[0] == num_tokens and x.dim() == 2
-        if current_platform.is_device_capability_family(120):
+        if not use_native_conv_mix():
             # Native conv/mix kernels require Hopper or SM10x. Keep the
-            # loop executor's cache writes and residual rounding on SM12x.
+            # loop executor's cache writes and residual rounding elsewhere.
             short_conv(
                 x,
                 conv_weight,

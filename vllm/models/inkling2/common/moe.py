@@ -5,6 +5,11 @@
 Experts are sharded contiguously over the TP group (EP size = TP size); each
 rank returns the full all-reduced bf16 output. Checkpoint names under
 `model.llm.layers.N.mlp` map 1:1 to parameters.
+
+Blackwell (SM10x) and SM12x route into tile-padded expert rows with quantized
+activations (`nvidia/ops/moe.py`). Everywhere else the flow is Hopper's:
+`select_experts`, then a `FlatExperts` backend for the expert GEMMs on the
+flat rows (Humming on CUDA), then `combine`.
 """
 
 from collections.abc import Callable, Sequence
@@ -40,6 +45,39 @@ from .ops.moe import combine, select_experts
 from .ops.platform import use_sm100_kernels
 
 QuantFormat = Literal["nvfp4", "mxfp8"]
+
+
+class FlatExperts(Protocol):
+    """Expert GEMMs over the flat (token * topk + slot) rows of
+    `select_experts` (`HummingExperts` is the reference): built after
+    loading as `cls(weights, shapes, nvfp4)` from the checkpoint-layout
+    weights, block scales and NVFP4 global scales of `w13` (interleaved
+    gate / up rows) and `w2`. A call returns the bf16 `[T * topk, H]`
+    down-projection rows of the local slots of `ids` (-1: not local), with
+    the softcapped SiTU (`gate_cap`, `up_cap`) of the `w13` output scaled by
+    the routing `weights`; the other rows are left unset."""
+
+    def __call__(
+        self,
+        x: torch.Tensor,
+        ids: torch.Tensor,
+        weights: torch.Tensor,
+        src2dst: torch.Tensor,
+        num_global_experts: int,
+        gate_cap: float,
+        up_cap: float,
+    ) -> torch.Tensor: ...
+
+
+def flat_experts_class(quant_format: QuantFormat) -> Callable[..., FlatExperts]:
+    """This platform's `FlatExperts` for `quant_format` experts. Raises
+    `NotImplementedError` (at model init) where no kernel serves them."""
+    if current_platform.is_cuda():
+        return HummingExperts
+    raise NotImplementedError(
+        f"Inkling2 {quant_format.upper()} routed experts have no expert GEMM "
+        f"kernel on {current_platform.device_name}"
+    )
 
 
 class ExpertsLoRA(Protocol):
@@ -160,7 +198,13 @@ class Inkling2Experts(nn.Module):
             and vllm_config is not None
             and vllm_config.kernel_config.moe_backend == "humming"
         )
-        self.humming: HummingExperts | None = None
+        self.humming: HummingNVFP4Experts | None = None
+        # Experts of the flat `select_experts` rows (neither SM10x nor SM12x),
+        # built after loading; unsupported formats fail here.
+        self.flat_experts: FlatExperts | None = None
+        self.flat_experts_cls = (
+            None if self.sm100 or self.sm120 else flat_experts_class(quant_format)
+        )
         if self.sm100:
             load_kernels(
                 (self.w13_weight, self.w2_weight),
@@ -221,12 +265,12 @@ class Inkling2Experts(nn.Module):
                 getattr(self, f"{name}_weight_scale").data,
                 global_scale,
             )
-        self.humming = (
-            HummingNVFP4Experts(weights, self.shapes)
-            if self.humming_nvfp4
-            else HummingExperts(weights, self.shapes, self.nvfp4)
-        )
-        # The Humming copies replace the checkpoint layout.
+        if self.humming_nvfp4:
+            self.humming = HummingNVFP4Experts(weights, self.shapes)
+        else:
+            assert self.flat_experts_cls is not None
+            self.flat_experts = self.flat_experts_cls(weights, self.shapes, self.nvfp4)
+        # The repacked copies replace the checkpoint layout.
         for name in ("w13", "w2"):
             for suffix in ("weight", "weight_scale"):
                 param = getattr(self, f"{name}_{suffix}")
@@ -294,9 +338,9 @@ class Inkling2Experts(nn.Module):
             del gate_up
             down = self._gemm(activated, "w2", tiles, plan, 1)
         else:
-            assert self.humming is not None, "process_weights_after_loading"
+            assert self.flat_experts is not None, "process_weights_after_loading"
             ids, gammas, src2dst = routing
-            down = self.humming(
+            down = self.flat_experts(
                 x,
                 ids,
                 gammas,

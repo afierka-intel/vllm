@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Inkling2 model (NVIDIA).
+"""Inkling2 model.
 
 Decoder layers are tied together by block attention residuals: instead of a
 single residual stream, each sublayer input is a learned softmax mix over the
@@ -8,6 +8,11 @@ outputs of previous blocks of `n_layers_per_attn_res_block` layers plus the
 running partial block. Residual blocks are stored in bf16; mixes are fp32.
 
 Looped checkpoints (`loop_config`) are `Inkling2LoopModel` (`loop.py`).
+
+The CUDA fast paths (fused all-reduce, sequence parallel, SM12x low-M GEMMs)
+and the CUDA-only features (vision tower, LoRA, DSpark) come from `nvidia/`;
+other platforms (e.g. XPU) run the text model on the portable kernels and
+reject those features at init (`_check_platform_support`).
 """
 
 from collections import Counter
@@ -57,6 +62,7 @@ from vllm.models.inkling2.nvidia.ops.ll_gemm_sm120 import (
 from vllm.models.inkling2.nvidia.ops.seq_parallel import SeqParallel
 from vllm.models.inkling2.nvidia.vision import Inkling2VisionEncoder, VisionMetadata
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.v1.worker.encoder_cudagraph_defs import (
     EncoderCudaGraphCaptureInputs,
@@ -277,9 +283,11 @@ class Inkling2Model(nn.Module):
         if get_tensor_model_parallel_world_size() > 1:
             assert self.normalize_values
             group = get_tp_group().cpu_group
-            self.allreduce_workspace = Inkling2AllReduceWorkspace.create(
-                group, config.hidden_size
-            )
+            # FlashInfer MNNVL buffers and `csrc/inkling2` ops: CUDA only.
+            if current_platform.is_cuda():
+                self.allreduce_workspace = Inkling2AllReduceWorkspace.create(
+                    group, config.hidden_size
+                )
             if self.allreduce_workspace is not None and self.seq_parallel_paths:
                 vllm_config = get_current_vllm_config()
                 spec = vllm_config.speculative_config
@@ -508,6 +516,30 @@ class Inkling2Model(nn.Module):
 register_lora()
 
 
+def _check_platform_support(vllm_config: VllmConfig, vision: bool) -> None:
+    """Fail at init, not mid-forward, on the features that so far run on
+    CUDA only: the vision tower (FA3 / tml_fa4 attention), LoRA, and the
+    DSpark draft (also rejected when the speculative config is built)."""
+    if current_platform.is_cuda():
+        return
+    unsupported = []
+    if vision:
+        unsupported.append(
+            "image inputs (serve text only with --language-model-only or "
+            "--limit-mm-per-prompt with an image limit of 0)"
+        )
+    if vllm_config.lora_config is not None:
+        unsupported.append("LoRA")
+    spec = vllm_config.speculative_config
+    if spec is not None and spec.use_dspark():
+        unsupported.append("DSpark speculative decoding")
+    if unsupported:
+        raise NotImplementedError(
+            f"Inkling2 on {current_platform.device_name} does not support "
+            + "; ".join(unsupported)
+        )
+
+
 @MULTIMODAL_REGISTRY.register_processor(
     Inkling2MultiModalProcessor,
     info=Inkling2ProcessingInfo,
@@ -555,18 +587,23 @@ class Inkling2ForConditionalGeneration(
         config: Inkling2MMConfig = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         assert quant_config is None or isinstance(quant_config, Inkling2QuantConfig)
-        assert vllm_config.parallel_config.pipeline_parallel_size == 1
+        if vllm_config.parallel_config.pipeline_parallel_size != 1:
+            raise NotImplementedError("Inkling2 does not support pipeline parallelism")
         if vllm_config.model_config.enable_prompt_embeds:
             # The reference applies embed_norm to raw input embeddings, which
             # cannot be told apart from already-normalized ones here.
             raise ValueError("Inkling2 does not support prompt embeddings")
         self.config = config
         self.text_config = text_config = config.text_config
-        self.visual = (
-            Inkling2VisionEncoder(config.vision_config, text_config.hidden_size)
-            if config.vision_config is not None
+        vision = bool(
+            config.vision_config is not None
             and vllm_config.model_config.multimodal_config is not None
             and vllm_config.model_config.multimodal_config.get_limit_per_prompt("image")
+        )
+        _check_platform_support(vllm_config, vision)
+        self.visual = (
+            Inkling2VisionEncoder(config.vision_config, text_config.hidden_size)
+            if vision and config.vision_config is not None
             else None
         )
         model_cls: type[Inkling2Model] = Inkling2Model
