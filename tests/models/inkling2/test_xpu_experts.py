@@ -11,14 +11,21 @@ from vllm.platforms import current_platform
 if not current_platform.is_xpu():
     pytest.skip("Inkling2 XPU expert backends", allow_module_level=True)
 
+from vllm.model_executor.layers.fused_moe.moe_align_block_size import (  # noqa: E402
+    moe_align_block_size,
+)
 from vllm.models.inkling2.common.moe import (  # noqa: E402
     Inkling2MoE,
     flat_experts_class,
 )
 from vllm.models.inkling2.common.ops.moe import select_experts  # noqa: E402
+from vllm.models.inkling2.common.ops.nvfp4_w4a16_moe import (  # noqa: E402
+    nvfp4_w4a16_moe,
+)
 from vllm.models.inkling2.configs import Inkling2ModelConfig  # noqa: E402
 from vllm.models.inkling2.xpu.experts import (  # noqa: E402
     XpuMxfp8Experts,
+    XpuNvfp4Experts,
     deinterleave_rows,
 )
 
@@ -26,7 +33,26 @@ DEVICE = "xpu"
 GATE_CAP, UP_CAP, TOPK = 4.0, 25.0, 8
 # hidden, intermediate, experts, local experts (EP rank 1 of 4 for Small).
 SHAPES = {"mini": (2304, 1152, 128, 128), "small": (4608, 2304, 384, 96)}
-FORMATS = ["mxfp8"]
+FORMATS = ["mxfp8", "nvfp4"]
+E2M1 = [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6]
+# NVFP4 outer scale denominator of the checkpoints' quantizer (test_moe.py).
+DENOMINATOR = 2688.0
+
+
+def dequant_nvfp4(values: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    lut = torch.tensor(E2M1, device=values.device)
+    v = torch.stack([lut[(values & 0xF).long()], lut[(values >> 4).long()]], -1)
+    return v.flatten(-2) * scales.float().repeat_interleave(16, -1)
+
+
+def random_nvfp4(*shape: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Packed values, e4m3 block scales and the weight amax per expert, with
+    a GEMM output of about unit size."""
+    values = torch.randint(0, 256, (*shape[:-1], shape[-1] // 2), device=DEVICE)
+    scales = torch.rand(*shape[:-1], shape[-1] // 16, device=DEVICE) + 0.5
+    amax = torch.rand(shape[0], device=DEVICE) + 0.5
+    amax *= DENOMINATOR / (3 * shape[-1] ** 0.5)
+    return values.to(torch.uint8), scales.to(torch.float8_e4m3fn), amax
 
 
 def dequant_mxfp8(values: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
@@ -43,19 +69,27 @@ def random_mxfp8(*shape: int) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def random_weights(fmt: str, num_experts: int, hidden: int, inter: int):
-    """Checkpoint-layout `{w13, w2}: (weight, block scales, global scale)`."""
-    assert fmt == "mxfp8"
-    return {
-        "w13": (*random_mxfp8(num_experts, 2 * inter, hidden), None),
-        "w2": (*random_mxfp8(num_experts, hidden, inter), None),
-    }
+    """Checkpoint-layout `{w13, w2}: (weight, block scales, global scale)`;
+    the NVFP4 global scale is `amax / DENOMINATOR`."""
+    shapes = {"w13": (2 * inter, hidden), "w2": (hidden, inter)}
+    if fmt == "mxfp8":
+        return {
+            name: (*random_mxfp8(num_experts, *shape), None)
+            for name, shape in shapes.items()
+        }
+    weights = {}
+    for name, shape in shapes.items():
+        values, scales, amax = random_nvfp4(num_experts, *shape)
+        weights[name] = (values, scales, amax / DENOMINATOR)
+    return weights
 
 
 def dequant(fmt: str, tensors: tuple, expert: int) -> torch.Tensor:
     """fp32 weights `[N, K]` of `expert` from `(weight, scales, global)`."""
-    weight, scale, _ = tensors
-    assert fmt == "mxfp8"
-    return dequant_mxfp8(weight[expert], scale[expert])
+    weight, scale, global_scale = tensors
+    if fmt == "mxfp8":
+        return dequant_mxfp8(weight[expert], scale[expert])
+    return dequant_nvfp4(weight[expert], scale[expert]) * global_scale[expert]
 
 
 def reference(fmt, weights, x, ids, gammas, gamma_after_w2: bool):
@@ -149,8 +183,7 @@ def test_xpu_experts_match_reference(fmt: str, model: str, tokens: int):
     experts = flat_experts_class(fmt, TOPK, GATE_CAP, UP_CAP)(
         weights, ((2 * inter, hidden), (hidden, inter)), fmt == "nvfp4"
     )
-    if fmt == "mxfp8":
-        assert isinstance(experts, XpuMxfp8Experts)
+    assert isinstance(experts, XpuMxfp8Experts if fmt == "mxfp8" else XpuNvfp4Experts)
     rank = 0 if num_local == num_global else 1
     ids, gammas, src2dst = routing(tokens, num_global, num_local, rank)
     x = torch.randn(tokens, hidden, device=DEVICE).bfloat16()
@@ -188,9 +221,14 @@ def test_xpu_moe_layer_matches_reference(dist_init, fmt: str, tokens: int):
         "gate.bias": torch.randn(num_experts, device=DEVICE) * 0.01,
     }
     loaded["gate.weight"] = loaded["gate.weight"].bfloat16()
-    for name, (weight, scale, _) in weights.items():
-        loaded[f"experts.{name}_weight"] = weight
-        loaded[f"experts.{name}_weight_scale"] = scale
+    for name, (weight, scale, global_scale) in weights.items():
+        prefix = f"experts.{name}_weight"
+        loaded[prefix], loaded[f"{prefix}_scale"] = weight, scale
+        if fmt == "nvfp4":
+            loaded[f"{prefix}_amax"] = global_scale * DENOMINATOR
+            loaded[f"{prefix}_outer_scale_denominator"] = torch.tensor(
+                [DENOMINATOR], device=DEVICE
+            )
     for name, param in moe.named_parameters():
         param.weight_loader(param, loaded[name])
     moe.experts.process_weights_after_loading()
@@ -206,3 +244,37 @@ def test_xpu_moe_layer_matches_reference(dist_init, fmt: str, tokens: int):
     scale = ref.abs().max().item()
     assert scale > 0.1
     torch.testing.assert_close(out, ref, atol=1e-2 * scale, rtol=2e-2)
+
+
+@pytest.mark.parametrize("block_m", [16, 32, 64])
+@pytest.mark.parametrize("a_div", [1, TOPK])
+@pytest.mark.parametrize("n,k", [(2304, 2304), (2304, 1152), (4608, 4608)])
+def test_nvfp4_w4a16_moe_matches_dequantized_matmul(
+    block_m: int, a_div: int, n: int, k: int
+):
+    """Each row the alignment lists (not the -1 slots, none of the empty
+    experts) is its activation row times its expert's dequantized weights;
+    rows of several row blocks per expert and of one-row experts."""
+    torch.manual_seed(0)
+    num_experts, tokens = 24, 40
+    values, scales, amax = random_nvfp4(num_experts, n, k)
+    global_scale = amax / DENOMINATOR
+    ids = torch.randint(0, num_experts - 3, (tokens, TOPK), dtype=torch.int32)
+    ids[ids == 2] = -1
+    ids[0, 0] = num_experts - 1  # a one-row expert
+    ids = ids.to(DEVICE)
+    rows = tokens * TOPK
+    a = torch.randn(rows // a_div, k, device=DEVICE).bfloat16()
+    alignment = moe_align_block_size(
+        ids, block_m, num_experts, ignore_invalid_experts=True
+    )[:3]
+    out = nvfp4_w4a16_moe(
+        a, values, scales, global_scale, alignment, rows, a_div, block_m
+    )
+    flat = ids.flatten()
+    for expert in range(num_experts):
+        (r,) = (flat == expert).nonzero(as_tuple=True)
+        w = dequant_nvfp4(values[expert], scales[expert]) * global_scale[expert]
+        ref = a[r // a_div].float() @ w.T
+        # Only the fp32 summation order differs; one bf16 rounding.
+        torch.testing.assert_close(out[r].float(), ref, atol=1e-3, rtol=2**-8)

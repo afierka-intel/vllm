@@ -9,6 +9,10 @@ MXFP8 runs the SYCL grouped-GEMM fused MoE of vllm-xpu-kernels
 applies the routing weight to the down-projection rows in fp32 while
 combining them (`combines`), where Hopper scales the SiTU output before the
 down projection and rounds it to bf16.
+
+NVFP4 has no XPU kernel elsewhere: it runs Hopper's flow with the Triton
+W4A16 grouped GEMM `common.ops.nvfp4_w4a16_moe` in place of Humming, on the
+checkpoint layout (interleaved `w13` rows, consumed by `swiglu`).
 """
 
 from collections.abc import Callable
@@ -16,7 +20,15 @@ from functools import partial
 
 import torch
 
+from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+    moe_align_block_size,
+)
 from vllm.models.inkling2.common.moe import FlatExperts, QuantFormat
+from vllm.models.inkling2.common.ops.moe import swiglu
+from vllm.models.inkling2.common.ops.nvfp4_w4a16_moe import (
+    nvfp4_block_m,
+    nvfp4_w4a16_moe,
+)
 
 ExpertWeights = dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]]
 
@@ -112,13 +124,75 @@ class XpuMxfp8Experts:
         return out
 
 
+class XpuNvfp4Experts:
+    """NVFP4 experts on the Triton W4A16 grouped GEMM, with bf16
+    activations: `w13` GEMM, `swiglu` (routing weight before the down
+    projection, as on Hopper) and `w2` GEMM over the flat rows.
+
+    Args:
+        weights: Per projection (`w13`, `w2`), the checkpoint weights
+            `[E, N, K / 2]` (uint8, two e2m1 each), e4m3 block scales
+            `[E, N, K / 16]` and fp32 global scales `[E]`
+            (`amax / outer_scale_denominator`), used as they are.
+        shapes: `(N, K)` of each projection.
+        nvfp4: Must be True.
+        topk, gate_cap, up_cap: Unused (passed per call).
+
+    """
+
+    def __init__(
+        self,
+        weights: ExpertWeights,
+        shapes: tuple[tuple[int, int], tuple[int, int]],
+        nvfp4: bool,
+        *,
+        topk: int,
+        gate_cap: float,
+        up_cap: float,
+    ) -> None:
+        assert nvfp4
+        self.weights = {}
+        for name, (n, k) in zip(("w13", "w2"), shapes):
+            weight, scale, global_scale = weights[name]
+            assert global_scale is not None
+            assert weight.shape[1:] == (n, k // 2) and scale.shape[1:] == (n, k // 16)
+            self.weights[name] = (weight, scale, global_scale)
+        self.num_experts = weights["w13"][0].shape[0]
+
+    def __call__(
+        self,
+        x: torch.Tensor,
+        ids: torch.Tensor,
+        weights: torch.Tensor,
+        src2dst: torch.Tensor,
+        num_global_experts: int,
+        gate_cap: float,
+        up_cap: float,
+    ) -> torch.Tensor:
+        """bf16 `[T * topk, H]` down-projection rows of the local slots of
+        `ids` (-1: not local); the other rows are left unset."""
+        tokens, topk = ids.shape
+        rows = tokens * topk
+        block_m = nvfp4_block_m(rows, num_global_experts)
+        alignment = moe_align_block_size(
+            ids, block_m, self.num_experts, ignore_invalid_experts=True
+        )[:3]
+        gate_up = nvfp4_w4a16_moe(
+            x, *self.weights["w13"], alignment, rows, topk, block_m
+        )
+        activated = swiglu(gate_up, weights, src2dst, gate_cap, up_cap)
+        del gate_up
+        return nvfp4_w4a16_moe(
+            activated, *self.weights["w2"], alignment, rows, 1, block_m
+        )
+
+
 def xpu_flat_experts(
     quant_format: QuantFormat, topk: int, gate_cap: float, up_cap: float
 ) -> Callable[..., FlatExperts]:
     """The XPU `FlatExperts` constructor of `quant_format` experts."""
     if quant_format == "mxfp8":
-        return partial(XpuMxfp8Experts, topk=topk, gate_cap=gate_cap, up_cap=up_cap)
-    raise NotImplementedError(
-        f"Inkling2 {quant_format.upper()} routed experts have no expert GEMM "
-        "kernel on xpu"
-    )
+        cls: type = XpuMxfp8Experts
+    else:
+        cls = XpuNvfp4Experts
+    return partial(cls, topk=topk, gate_cap=gate_cap, up_cap=up_cap)
