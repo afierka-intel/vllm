@@ -13,6 +13,7 @@ import torch
 from vllm.triton_utils import tl, tldevice, triton
 
 from .intrinsics import rsqrt
+from .platform import use_kernel_autotune
 
 
 @triton.jit
@@ -48,6 +49,8 @@ def pair_rms_norm(dest: torch.Tensor, message: torch.Tensor) -> torch.Tensor:
     assert dest.dtype == message.dtype == torch.float32
     out = message.new_empty((num_streams, num_tokens, 2 * d), dtype=torch.bfloat16)
     if num_tokens:
+        # Not autotuned: 8 warps keep the reduction order that matches the
+        # stacked reference bit for bit (other warp counts are 1 ulp off).
         _pair_rms_norm_kernel[(num_streams, num_tokens)](
             dest,
             message,
@@ -113,7 +116,9 @@ def blend_rms_norm(
     assert norm_weight.shape == (num_streams, d) and norm_weight.stride(1) == 1
     out = message.new_empty((num_streams, num_tokens, d), dtype=torch.bfloat16)
     if num_tokens:
-        _blend_rms_norm_kernel[(num_streams, num_tokens)](
+        tuned = use_kernel_autotune()
+        kernel = _blend_rms_norm_kernel_tuned if tuned else _blend_rms_norm_kernel
+        kernel[(num_streams, num_tokens)](
             dest,
             message,
             gain_forget,
@@ -125,8 +130,14 @@ def blend_rms_norm(
             norm_eps,
             D=d,
             BLOCK=triton.next_power_of_2(d),
-            num_warps=8,
             # The blend is unfused (no FMA), as the reference.
             enable_fp_fusion=False,
+            **({} if tuned else {"num_warps": 8}),
         )
     return out
+
+
+# The blend norm with its warps autotuned on XPU (includes the fixed 8).
+_blend_rms_norm_kernel_tuned = triton.autotune(
+    configs=[triton.Config({}, num_warps=w) for w in (4, 8, 16)], key=["D"]
+)(_blend_rms_norm_kernel)

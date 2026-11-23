@@ -8,6 +8,8 @@ order of the expert GEMMs over checkpoint-layout weights; the routing
 helpers are shared with the fused routing kernels of `nvidia/ops/moe.py`.
 """
 
+import functools
+
 import torch
 
 from vllm.models.inkling2.nvidia.ops.seq_parallel import HALO_ROWS, SeqParallel
@@ -16,7 +18,7 @@ from vllm.triton_utils import tl, tldevice, triton
 from .activation import _situ
 from .linear import k_group_partials
 from .pdl import gdc_launch_dependents, gdc_wait
-from .platform import pdl_launch_kwargs
+from .platform import pdl_launch_kwargs, use_kernel_autotune
 
 # Up to this many tokens, kernels let the next kernel launch (and wait) as soon
 # as they start, which hides its launch; with more, its waiting programs would
@@ -301,7 +303,9 @@ def select_experts(
     ids = torch.empty((tokens, topk), dtype=torch.int32, device=x.device)
     weights = torch.empty(tokens * topk, dtype=torch.float32, device=x.device)
     src2dst = torch.empty(tokens * topk, dtype=torch.int32, device=x.device)
-    _select_kernel[(tokens,)](
+    tuned = use_kernel_autotune()
+    kernel = _select_kernel_tuned(tokens <= 256) if tuned else _select_kernel
+    kernel[(tokens,)](
         partials,
         bias,
         expert_bounds,
@@ -316,9 +320,21 @@ def select_experts(
         GROUPS=partials.shape[0],
         TOPK=topk,
         SORT=tokens <= 128,
-        num_warps=4 if tokens <= 256 else 1,
+        **({} if tuned else {"num_warps": 4 if tokens <= 256 else 1}),
     )
     return ids, weights, src2dst
+
+
+@functools.cache
+def _select_kernel_tuned(small: bool):
+    """`_select_kernel` with its warps autotuned on XPU, for up to 256
+    tokens (`small`) or more; includes the fixed 4 / 1. Distinct lists keep
+    the two tuners apart in Triton's on-disk autotuning cache."""
+    warps = (2, 4, 8) if small else (1, 2, 4)
+    return triton.autotune(
+        configs=[triton.Config({}, num_warps=w) for w in warps],
+        key=["E", "GROUPS", "TOPK", "SORT"],
+    )(_select_kernel)
 
 
 @triton.jit
