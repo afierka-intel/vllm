@@ -9,6 +9,9 @@ from typing import Any
 import pytest
 import torch
 
+import vllm.models.inkling2.common.ops.attn_res as attn_res_ops
+import vllm.models.inkling2.common.ops.linear as linear_ops
+import vllm.models.inkling2.common.ops.loop as loop_ops
 import vllm.models.inkling2.common.ops.sconv as sconv_ops
 from tests.models.inkling2.test_attention import shear_rel_logits
 from tests.models.inkling2.utils import DEVICE, device_graph
@@ -21,11 +24,49 @@ from vllm.models.inkling2.common.ops.sconv import (
     short_conv,
 )
 from vllm.platforms import current_platform
+from vllm.triton_utils import triton
 
 pytestmark = pytest.mark.skipif(
     not (torch.cuda.is_available() or current_platform.is_xpu()),
     reason="needs CUDA or XPU",
 )
+requires_xpu = pytest.mark.skipif(
+    not current_platform.is_xpu(), reason="autotuned on XPU only"
+)
+
+
+def _each_tuned_config(monkeypatch, tuner) -> Iterator[Any]:
+    """On XPU, pin each config of `tuner` in turn (a one-config tuner
+    launches it without benchmarking); elsewhere one pass on the fixed
+    launch config."""
+    if not linear_ops.use_kernel_autotune():
+        yield None
+        return
+    for config in list(tuner.configs):
+        monkeypatch.setattr(tuner, "configs", [config])
+        yield config
+
+
+def _spy_k_group_launches(monkeypatch) -> list[bool]:
+    """The `USE_TD` of every autotuned K-group launch."""
+    calls: list[bool] = []
+    tuned = linear_ops._k_group_kernel_tuned
+
+    class Launcher:
+        def __init__(self, bucket):
+            self.tuner = tuned(bucket)
+
+        def __getitem__(self, grid):
+            launch = self.tuner[grid]
+
+            def run(*args, **kwargs):
+                calls.append(kwargs["USE_TD"])
+                return launch(*args, **kwargs)
+
+            return run
+
+    monkeypatch.setattr(linear_ops, "_k_group_kernel_tuned", Launcher)
+    return calls
 
 
 @pytest.mark.parametrize(
@@ -62,13 +103,93 @@ def test_k_group_partials_match_ordered_groups(tokens, n, k, out_dtype, monkeypa
     monkeypatch.setattr(ops, "_TUNED_TILES", ((32, 64, 4, 3),))
     ops._k_group_kernel_tuned.cache_clear()
     try:
+        calls = _spy_k_group_launches(monkeypatch)
         results = []
         for use_td in (False, True):
             monkeypatch.setattr(ops, "use_tensor_descriptor", lambda td=use_td: td)
             results.append(ops.k_group_partials(x, w, out_dtype))
     finally:
         ops._k_group_kernel_tuned.cache_clear()
+    # The second launch really took the descriptor path.
+    assert calls == [False, True]
     torch.testing.assert_close(results[1], results[0], atol=0, rtol=0)
+
+
+@requires_xpu
+@pytest.mark.parametrize(
+    "tokens,n,k",
+    # Router / dynamic taps (split K groups) and an unsplit in-order sum.
+    [(8, 32, 4608), (40, 384, 4608), (300, 128, 2304), (4096, 128, 2304)],
+)
+@pytest.mark.parametrize("use_td", [False, True])
+def test_k_group_tiles_are_bitwise_identical(tokens, n, k, use_td):
+    """Every autotuned K-group tile gives the bits of the first one (with
+    and without descriptors), so the tuned pick (per process, per TP rank)
+    cannot change a router's top-k."""
+    from vllm.models.inkling2.common.ops import linear as ops
+    from vllm.triton_utils.allocation import set_triton_allocator
+
+    torch.manual_seed(0)
+    x = torch.randn(tokens, k, device=DEVICE).bfloat16()
+    w = torch.randn(n, k, device=DEVICE).bfloat16()
+    groups = triton.cdiv(k, 1024)
+    split = groups > 1 and tokens < 4096
+    if use_td:
+        set_triton_allocator(x.device)
+    results = []
+    for bm, bn, warps, stages in ops._TUNED_TILES:
+        out = torch.empty(groups if split else 1, tokens, n, device=DEVICE)
+        grid = (triton.cdiv(n, bn), triton.cdiv(tokens, bm), groups if split else 1)
+        ops._k_group_kernel[grid](
+            x,
+            w,
+            out,
+            tokens,
+            n,
+            k,
+            bm,
+            bn,
+            split,
+            USE_TD=use_td,
+            num_warps=warps,
+            num_stages=stages,
+            enable_fp_fusion=False,
+        )
+        results.append(((bm, bn, warps, stages), out))
+    first = results[0][1]
+    for tile, out in results[1:]:
+        assert torch.equal(out.view(torch.int32), first.view(torch.int32)), tile
+
+
+@requires_xpu
+def test_k_group_buckets_keep_separate_tuning_keys():
+    """Buckets 64 and 1024 prune to the same configs at N <= 32 (Inkling 2's
+    dynamic taps); the bucket in the tuning key still keeps their picks
+    apart, in memory and in Triton's on-disk cache (keyed by the tuning key
+    and the configs)."""
+    from vllm.models.inkling2.common.ops import linear as ops
+
+    n, k = 32, 4608
+    small, large = ops._k_group_kernel_tuned(64), ops._k_group_kernel_tuned(1024)
+    args = {"N": n}
+    pruned = [
+        [str(c) for c in ops._prune_k_group_tiles(t.configs, args)]
+        for t in (small, large)
+    ]
+    assert pruned[0] == pruned[1]
+    torch.manual_seed(0)
+    w = torch.randn(n, k, device=DEVICE).bfloat16()
+    for tokens in (40, 100):
+        x = torch.randn(tokens, k, device=DEVICE).bfloat16()
+        ops.k_group_partials(x, w)
+    keys = []
+    for bucket, tuner in ((64, small), (1024, large)):
+        assert tuner.keys[-1] == "BUCKET"
+        # (N, K, SPLIT, USE_TD, BUCKET, dtypes...) of this weight shape.
+        shape_keys = {key for key in tuner.cache if key[:2] == (n, k)}
+        assert shape_keys and all(key[4] == bucket for key in shape_keys)
+        keys.append(shape_keys)
+    assert not keys[0] & keys[1]
 
 
 @pytest.mark.parametrize("in_dtype", [torch.bfloat16, torch.float32])
@@ -252,7 +373,7 @@ def test_prologue_shears_rel_logits(is_local, split, monkeypatch):
 # Small batches keep rows in registers; large ones loop over D chunks.
 @pytest.mark.parametrize("tokens", [29, 300])
 def test_attn_res_matches_softmax_mix_then_norm(
-    num_stack, num_q, with_addend, normalize, tokens
+    num_stack, num_q, with_addend, normalize, tokens, monkeypatch
 ):
     dim = 4608
     stack = torch.randn(num_stack, tokens, dim, device=DEVICE).bfloat16()
@@ -272,15 +393,25 @@ def test_attn_res_matches_softmax_mix_then_norm(
     ref = mix * torch.rsqrt(mix.square().mean(-1, keepdim=True) + 1e-6)
     ref = (ref * weight.float()[:, None]).bfloat16()
 
-    out = attn_res(stack, last, addend, queries, weight, 1e-6, normalize)
-    assert out.dtype == torch.bfloat16
-    torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-2)
+    for _ in _each_tuned_config(monkeypatch, _attn_res_tuner(tokens, num_q)):
+        out = attn_res(stack, last, addend, queries, weight, 1e-6, normalize)
+        assert out.dtype == torch.bfloat16
+        torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-2)
+
+
+def _attn_res_tuner(tokens: int, num_q: int):
+    """The autotuned AttnRes launch `attn_res` takes on XPU."""
+    if tokens * num_q <= 256:
+        return attn_res_ops._attn_res_row_kernel_tuned
+    return attn_res_ops._attn_res_kernel_tuned
 
 
 @pytest.mark.parametrize("num_stack,with_addend", [(1, False), (3, True)])
 # Small batches keep rows in registers; large ones loop over D chunks.
 @pytest.mark.parametrize("tokens", [29, 300])
-def test_attn_res_without_norm_returns_fp32_mix(num_stack, with_addend, tokens):
+def test_attn_res_without_norm_returns_fp32_mix(
+    num_stack, with_addend, tokens, monkeypatch
+):
     """Without a norm weight, `attn_res` returns the fp32 softmax mix (the
     loop's sublayer inputs before their controllers, and its message reads:
     a mix of two blocks)."""
@@ -297,13 +428,14 @@ def test_attn_res_without_norm_returns_fp32_mix(num_stack, with_addend, tokens):
     probs = torch.einsum("ntd,qd,nt->qtn", values, queries, inv_rms).softmax(-1)
     ref = torch.einsum("qtn,ntd->qtd", probs, values * inv_rms[..., None])
 
-    out = attn_res(stack, last, addend, queries, None, 0.0, True)
-    assert out.dtype == torch.float32
-    torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-4)
+    for _ in _each_tuned_config(monkeypatch, _attn_res_tuner(tokens, 4)):
+        out = attn_res(stack, last, addend, queries, None, 0.0, True)
+        assert out.dtype == torch.float32
+        torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-4)
 
 
 @pytest.mark.parametrize("tokens", [1, 300])
-def test_loop_blend_matches_per_stream_controllers(tokens):
+def test_loop_blend_matches_per_stream_controllers(tokens, monkeypatch):
     """The stream-batched controllers (shared `dest` and norm weight, as a
     local layer's q/k/v) equal each stream's reference controller followed by
     its RMSNorm."""
@@ -322,18 +454,24 @@ def test_loop_blend_matches_per_stream_controllers(tokens):
     message = torch.randn(streams, tokens, dim, device=DEVICE)
     norm_weight = torch.randn(1, dim, device=DEVICE).bfloat16().expand(streams, -1)
 
-    out = Inkling2LoopDecoderLayer.blend(
-        layer, slice(0, streams), dest, message, norm_weight, 1e-6
-    )
-    assert out.dtype == torch.bfloat16 and out.shape == (streams, tokens, dim)
+    refs = []
     for s in range(streams):
         controller = Inkling2MessageController(
             layer.controller_down[s],
             layer.controller_gain_forget[s, :dim],
             layer.controller_gain_forget[s, dim:],
         )
-        ref = rms_norm(controller(dest[s], message[s]), norm_weight[s], 1e-6)
-        torch.testing.assert_close(out[s].float(), ref.float(), atol=2e-2, rtol=2e-2)
+        refs.append(rms_norm(controller(dest[s], message[s]), norm_weight[s], 1e-6))
+    # Every autotuned warp count of the blend norm (XPU).
+    for _ in _each_tuned_config(monkeypatch, loop_ops._blend_rms_norm_kernel_tuned):
+        out = Inkling2LoopDecoderLayer.blend(
+            layer, slice(0, streams), dest, message, norm_weight, 1e-6
+        )
+        assert out.dtype == torch.bfloat16 and out.shape == (streams, tokens, dim)
+        for s in range(streams):
+            torch.testing.assert_close(
+                out[s].float(), refs[s].float(), atol=2e-2, rtol=2e-2
+            )
 
 
 def _dense_conv(x, weight, dyn):
@@ -702,3 +840,22 @@ def test_sm12x_linear_large_batch_fallback():
     weight = torch.randn(129, 256, device=DEVICE).bfloat16()
     expected = torch.nn.functional.linear(x, weight)
     torch.testing.assert_close(linear(x, weight), expected, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(current_platform.is_xpu(), reason="the TD gate off XPU")
+def test_td_paths_stay_off_on_cuda(monkeypatch):
+    """With TD forced on (`VLLM_TRITON_USE_TD=1`), the prologue, q/r, short
+    conv and K-group launches keep their pointer paths off XPU: none of them
+    sets up the descriptors' allocator."""
+
+    def no_descriptors(device):
+        raise AssertionError("a tensor-descriptor path ran off XPU")
+
+    for module in (sconv_ops, linear_ops):
+        monkeypatch.setattr(module, "use_tensor_descriptor", lambda *_: True)
+        monkeypatch.setattr(module, "set_triton_allocator", no_descriptors)
+    test_attention_prologue_writes_clipped_k_and_normed_v(False, True, monkeypatch)
+    test_short_conv_chunked_matches_full_sequence(True, STEPS)
+    test_k_group_partials_match_ordered_groups(
+        37, 384, 4608, torch.float32, monkeypatch
+    )

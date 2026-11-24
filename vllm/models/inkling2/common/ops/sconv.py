@@ -21,18 +21,20 @@ Dynamic convolution (newest tap first, per-token per-head tap weights)::
 `y` is rounded to the input dtype. The K/V variant then L2-clips K and
 RMS-normalizes V per head and writes both to the paged KV cache.
 
-With `use_tensor_descriptor()`, the row tiles of the current inputs, the
-residual / addend / output tiles and the q / rel-logit tiles of the prologue
-go through tensor descriptors (2D block IO on Intel GPUs). The paged
-conv-state and KV-cache accesses (one slot per token), the earlier taps and
-the per-token scalars stay pointer accesses. On XPU (`use_kernel_autotune`)
-the tiles and warps are autotuned; CUDA keeps the fixed launch configs.
+On XPU with `use_tensor_descriptor()`, the row tiles of the current inputs,
+the residual / addend / output tiles and the q / rel-logit tiles of the
+prologue go through tensor descriptors (2D block IO). The paged conv-state and
+KV-cache accesses (one slot per token), the earlier taps and the per-token
+scalars stay pointer accesses. CUDA keeps pointer accesses, whatever
+`VLLM_TRITON_USE_TD` says. On XPU (`use_kernel_autotune`) the tiles and warps
+are autotuned; CUDA keeps the fixed launch configs.
 """
 
 import functools
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import (
     tensor_descriptor_compatible,
     tl,
@@ -394,6 +396,9 @@ def _sconv_kernel(
     BLOCK_C: tl.constexpr,
     SKIP_IDLE_CACHE: tl.constexpr,
     USE_TD: tl.constexpr = False,
+    # Token bucket of the autotuned launch (unused in the body): an autotune
+    # key, so that the buckets never share a tuned tile.
+    BUCKET: tl.constexpr = 0,
 ):
     first = tl.program_id(0) * BT
     tile_reads_cache = True
@@ -532,8 +537,10 @@ def short_conv(
         enable_fp_fusion=False,
     )
     if use_kernel_autotune():
-        use_td = use_tensor_descriptor() and tensor_descriptor_compatible(
-            x, out, addend, residual
+        use_td = (
+            current_platform.is_xpu()
+            and use_tensor_descriptor()
+            and tensor_descriptor_compatible(x, out, addend, residual)
         )
         if use_td:
             # On every launch: Triton's allocator is a per-thread ContextVar.
@@ -545,8 +552,9 @@ def short_conv(
                 triton.cdiv(channels, meta["BLOCK_C"]),
             )
 
-        _sconv_kernel_tuned(_sconv_bucket(num_tokens))[tuned_grid](
-            *args, **meta, USE_TD=use_td
+        bucket = _sconv_bucket(num_tokens)
+        _sconv_kernel_tuned(bucket)[tuned_grid](
+            *args, **meta, USE_TD=use_td, BUCKET=bucket
         )
         return out
     if num_tokens <= 8:
@@ -567,9 +575,11 @@ def short_conv(
 
 
 # Autotuning buckets of `short_conv`: (upper token count, token tiles) for
-# decode, mixed batches and prefill. Each bucket has its own tuner and config
-# list, so their tuned tiles stay apart, also in Triton's on-disk autotuning
-# cache (keyed by the configs).
+# decode, mixed batches and prefill. Each bucket has its own tuner, and the
+# bucket is part of the tuning key, so their tuned tiles stay apart, also in
+# Triton's on-disk autotuning cache. The first config of every bucket
+# (VLLM_TRITON_FORCE_FIRST_CONFIG) is valid at any shape: channel tiles past
+# the channels are masked.
 _SCONV_BUCKETS = ((8, (1, 2)), (256, (1, 2, 4)), (1 << 62, (4, 8)))
 
 # (BT, BLOCK_C, num_warps) autotuned on XPU; includes the fixed tiles.
@@ -605,7 +615,16 @@ def _sconv_kernel_tuned(bucket: int):
             for bt, bc, w in _SCONV_TILES
             if bt in tiles
         ],
-        key=["W", "WS", "H", "HAS_RES", "HAS_ADDEND", "SKIP_IDLE_CACHE", "USE_TD"],
+        key=[
+            "W",
+            "WS",
+            "H",
+            "HAS_RES",
+            "HAS_ADDEND",
+            "SKIP_IDLE_CACHE",
+            "USE_TD",
+            "BUCKET",
+        ],
         prune_configs_by={"early_config_prune": _prune_sconv_tiles},
         # The residual may alias the output.
         restore_value=["out_ptr"],
@@ -1076,14 +1095,18 @@ def attention_prologue(
         2 + (0 if qr_tokens else qr_blocks),
     )
     tuned = use_kernel_autotune()
-    use_td = use_tensor_descriptor() and tensor_descriptor_compatible(
-        k,
-        v,
-        q.flatten(1),
-        q_out.flatten(1),
-        q_scale,
-        rel_out.flatten(1),
-        rel_proj.flatten(0, 1),
+    use_td = (
+        current_platform.is_xpu()
+        and use_tensor_descriptor()
+        and tensor_descriptor_compatible(
+            k,
+            v,
+            q.flatten(1),
+            q_out.flatten(1),
+            q_scale,
+            rel_out.flatten(1),
+            rel_proj.flatten(0, 1),
+        )
     )
     if use_td:
         # On every launch: Triton's allocator is a per-thread ContextVar.
@@ -1225,9 +1248,10 @@ def attention_prologue(
 
 
 # The prologue launches with their warps (and the q/r token count of the
-# separate q/r launch) autotuned on XPU; the configs include the fixed ones.
+# separate q/r launch) autotuned on XPU; the configs include the fixed ones,
+# the prologue's first (VLLM_TRITON_FORCE_FIRST_CONFIG).
 _attn_prologue_kernel_tuned = triton.autotune(
-    configs=[triton.Config({}, num_warps=w) for w in (2, 4, 8)],
+    configs=[triton.Config({}, num_warps=w) for w in (4, 2, 8)],
     key=["W", "D", "DYNAMIC", "BT", "HQ", "E", "FUSE_QR", "HAS_TAU", "USE_TD"],
 )(_attn_prologue_kernel)
 

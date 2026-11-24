@@ -186,6 +186,9 @@ def _rel_decode_combine_kernel(
     BLOCK_S: tl.constexpr,
     BLOCK_D: tl.constexpr,
     GATED: tl.constexpr,
+    # Batch class of the autotuned launch (unused in the body): an autotune
+    # key, so that the two tuners never share a tuned tile.
+    LARGE: tl.constexpr = False,
 ):
     """Merge the split partials, then apply the output gate and attention sink
     if `GATED`."""
@@ -419,7 +422,7 @@ def _decode_attention(
             return (num_tokens, num_heads, head_dim // meta["BLOCK_D"])
 
         large = num_tokens * num_heads >= 512
-        _rel_decode_combine_kernel_tuned(large)[grid](*args, **meta)
+        _rel_decode_combine_kernel_tuned(large)[grid](*args, **meta, LARGE=large)
         return
     # Small batches spread the merge over more programs; larger ones merge a
     # whole head per (narrow) program.
@@ -434,11 +437,12 @@ def _decode_attention(
 
 # (BLOCK_D, num_warps) of the partials combine autotuned on XPU, for small
 # and large batches (`num_tokens * num_heads >= 512`); they include the fixed
-# ones. Distinct lists keep the two tuners apart in Triton's on-disk
-# autotuning cache (keyed by the configs).
+# ones, first (VLLM_TRITON_FORCE_FIRST_CONFIG; every BLOCK_D divides the
+# head dim 128). `LARGE` in the key keeps the two tuners apart, also in
+# Triton's on-disk autotuning cache.
 _COMBINE_TILES = {
     False: ((32, 4), (64, 2), (128, 1)),
-    True: ((64, 2), (128, 1), (128, 2)),
+    True: ((128, 1), (64, 2), (128, 2)),
 }
 
 
@@ -448,5 +452,5 @@ def _rel_decode_combine_kernel_tuned(large: bool):
         configs=[
             triton.Config({"BLOCK_D": b}, num_warps=w) for b, w in _COMBINE_TILES[large]
         ],
-        key=["H", "D", "NUM_SPLITS", "GATED"],
+        key=["H", "D", "NUM_SPLITS", "GATED", "LARGE"],
     )(_rel_decode_combine_kernel)

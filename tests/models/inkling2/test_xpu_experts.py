@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from vllm.platforms import current_platform
-from vllm.triton_utils import tensor_descriptor_compatible
+from vllm.triton_utils import tensor_descriptor_compatible, tl, triton
 
 if not current_platform.is_xpu():
     pytest.skip("Inkling2 XPU expert backends", allow_module_level=True)
@@ -19,8 +19,11 @@ from vllm.models.inkling2.common.moe import (  # noqa: E402
     Inkling2MoE,
     flat_experts_class,
 )
+from vllm.models.inkling2.common.ops import moe as moe_ops  # noqa: E402
+from vllm.models.inkling2.common.ops.linear import linear_k_groups  # noqa: E402
 from vllm.models.inkling2.common.ops.moe import select_experts  # noqa: E402
 from vllm.models.inkling2.common.ops.nvfp4_w4a16_moe import (  # noqa: E402
+    _e4m3_to_f32,
     nvfp4_w4a16_moe,
 )
 from vllm.models.inkling2.configs import Inkling2ModelConfig  # noqa: E402
@@ -286,3 +289,87 @@ def test_nvfp4_w4a16_moe_matches_dequantized_matmul(
         ref = a[r // a_div].float() @ w.T
         # Only the fp32 summation order differs; one bf16 rounding.
         torch.testing.assert_close(out[r].float(), ref, atol=1e-3, rtol=2**-8)
+
+
+@triton.jit
+def _decode_e4m3_kernel(Codes, Out):
+    offs = tl.arange(0, 256)
+    tl.store(Out + offs, _e4m3_to_f32(tl.load(Codes + offs)))
+
+
+def test_nvfp4_e4m3_scale_decode_matches_torch():
+    """All 256 e4m3fn codes decode as torch does: zeros, subnormals, normals
+    up to 448, negatives, and NaN for 0x7F / 0xFF."""
+    codes = torch.arange(256, device=DEVICE).to(torch.uint8)
+    out = torch.empty(256, device=DEVICE)
+    _decode_e4m3_kernel[(1,)](codes, out)
+    expected = codes.view(torch.float8_e4m3fn).float()
+    assert torch.equal(out.isnan(), expected.isnan())
+    assert expected.isnan().sum() == 2
+    finite = ~expected.isnan()
+    # Bits, so that the sign of zero counts too.
+    assert torch.equal(
+        out[finite].view(torch.int32), expected[finite].view(torch.int32)
+    )
+
+
+@pytest.mark.parametrize("use_td", [False, True])
+@pytest.mark.parametrize("n,k,block_m", [(2304, 1152, 16), (4608, 4608, 32)])
+def test_nvfp4_w4a16_moe_every_finite_scale_code(
+    n: int, k: int, block_m: int, use_td: bool
+):
+    """Block scales of every finite e4m3 code (subnormal, the largest,
+    negative and zero), one code per output column, against the dequantized
+    matmul (same tolerance as the random-scale test)."""
+    torch.manual_seed(0)
+    num_experts, tokens = 4, 16
+    values, _, amax = random_nvfp4(num_experts, n, k)
+    global_scale = amax / DENOMINATOR
+    codes = torch.arange(256, dtype=torch.int32)
+    codes = codes[(codes & 0x7F) != 0x7F]
+    column = codes[torch.arange(n) % codes.numel()].to(torch.uint8)
+    scales = column[None, :, None].expand(num_experts, n, k // 16).contiguous()
+    scales = scales.to(DEVICE).view(torch.float8_e4m3fn)
+    assert not scales.float().isnan().any()
+    ids = torch.randint(0, num_experts, (tokens, TOPK), dtype=torch.int32)
+    ids = ids.to(DEVICE)
+    rows = tokens * TOPK
+    a = torch.randn(rows, k, device=DEVICE).bfloat16()
+    alignment = moe_align_block_size(ids, block_m, num_experts)[:3]
+    out = nvfp4_w4a16_moe(
+        a, values, scales, global_scale, alignment, rows, 1, block_m, use_td
+    )
+    flat = ids.flatten()
+    for expert in range(num_experts):
+        (r,) = (flat == expert).nonzero(as_tuple=True)
+        w = dequant_nvfp4(values[expert], scales[expert]) * global_scale[expert]
+        ref = a[r].float() @ w.T
+        torch.testing.assert_close(out[r].float(), ref, atol=1e-3, rtol=2**-8)
+
+
+@pytest.mark.parametrize("tokens", [5, 300])
+def test_select_experts_every_tuned_config(tokens: int, monkeypatch):
+    """Each autotuned warp count of the router top-k (small and large
+    batches) gives torch's experts and routing weights."""
+    torch.manual_seed(0)
+    hidden, num_experts, route_scale = 2304, 128, 8.0
+    x = torch.randn(tokens, hidden, device=DEVICE).bfloat16()
+    gate = torch.randn(num_experts, hidden, device=DEVICE).bfloat16() * 0.02
+    bias = torch.randn(num_experts, device=DEVICE) * 0.01
+    bounds = torch.tensor([4, 68], dtype=torch.int32, device=DEVICE)
+    logits = linear_k_groups(x, gate)
+    _, ref_ids = torch.topk(logits.sigmoid() + bias, TOPK, sorted=True)
+    selected = torch.nn.functional.logsigmoid(logits.gather(1, ref_ids))
+    ref_weights = selected.softmax(-1) * route_scale
+    local = (ref_ids >= 4) & (ref_ids < 68)
+    tuner = moe_ops._select_kernel_tuned(tokens <= 256)
+    for config in list(tuner.configs):
+        # A one-config tuner launches it without benchmarking.
+        monkeypatch.setattr(tuner, "configs", [config])
+        ids, weights, src2dst = select_experts(x, gate, bias, TOPK, route_scale, bounds)
+        torch.testing.assert_close(ids.long(), torch.where(local, ref_ids - 4, -1))
+        torch.testing.assert_close(weights.view(tokens, -1), ref_weights)
+        rows = torch.arange(tokens * TOPK, device=DEVICE).view(tokens, -1)
+        torch.testing.assert_close(
+            src2dst.view(tokens, -1).long(), torch.where(local, rows, -1)
+        )

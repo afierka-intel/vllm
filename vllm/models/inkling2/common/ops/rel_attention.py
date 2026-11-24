@@ -13,17 +13,20 @@ head, and one KV split: split `s` of `S` takes key blocks `s, s + S, ...`
 of the rows' visible range, so a split count that depends only on the batch
 holds for every replay of a CUDA graph.
 
-With `use_tensor_descriptor()` and 16-bit KV, the K and V tiles load through
-per-page tensor descriptors (2D block loads on Intel GPUs); a key tile then
-never spans two pages (`PAGE % BLOCK_N == 0`). Q, the sheared relative
-logits and the outputs stay pointer accesses: their rows are tokens x GQA
-group, and the group (3 or 6 for Inkling 2) is not a power of two. On XPU
-(`use_kernel_autotune`) the key tile and warps are autotuned; CUDA keeps the
-fixed launch config.
+On XPU with `use_tensor_descriptor()` and 16-bit KV, the K and V tiles load
+through per-page tensor descriptors (2D block loads); a key tile then never
+spans two pages (`PAGE % BLOCK_N == 0`, asserted in the kernel). Q, the
+sheared relative logits and the outputs stay pointer accesses: their rows are
+tokens x GQA group, and the group (3 or 6 for Inkling 2) is not a power of
+two. CUDA always takes the pointer path, whatever `VLLM_TRITON_USE_TD` says:
+the Hopper pipeliner cannot predicate the in-loop `tensormap_create` of the
+per-page descriptors. On XPU (`use_kernel_autotune`) the key tile and warps
+are autotuned; CUDA keeps the fixed launch config.
 """
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import (
     tensor_descriptor_compatible,
     tl,
@@ -137,6 +140,9 @@ def _rel_attention_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
+    if USE_TD:
+        # The per-page descriptors load whole key tiles of one page.
+        tl.static_assert(PAGE % BLOCK_N == 0)
     TOKENS: tl.constexpr = BLOCK_M // G
     E_PAD: tl.constexpr = E + 256
     LOG2E: tl.constexpr = 1.4426950408889634
@@ -319,7 +325,9 @@ def _fixed_config(block_m: int) -> dict[str, int]:
     )
 
 
-# (BLOCK_N, num_warps) autotuned on XPU; includes every fixed config.
+# (BLOCK_N, num_warps) autotuned on XPU; includes every fixed config. The
+# first (taken by VLLM_TRITON_FORCE_FIRST_CONFIG) has the smallest key tile,
+# which `use_kv_descriptors` requires to divide the page.
 _TUNED_TILES = ((64, 4), (128, 4), (64, 8), (128, 8))
 
 
@@ -350,8 +358,10 @@ def use_kv_descriptors(
     use_td: bool | None = None,
 ) -> bool:
     """Whether `rel_attention` loads K/V tiles through per-page descriptors:
-    `use_tensor_descriptor(use_td)`, 16-bit KV and whole key tiles per page
-    (for every autotuned tile, or the fixed one)."""
+    on XPU only, with `use_tensor_descriptor(use_td)`, 16-bit KV and whole key
+    tiles per page (for every autotuned tile, or the fixed one)."""
+    if not current_platform.is_xpu():
+        return False
     if use_kernel_autotune():
         min_block_n = min(n for n, _ in _TUNED_TILES)
     else:
@@ -394,7 +404,7 @@ def rel_attention(
     the bf16 `(T, H * D)` `out` (gated by `gate` and `sinks` unless
     drafting; a single split); `MODE_PARTIAL` the fp32 `out`
     `(S, T, H, D)` and log2 `lse` `(S, T, H)` partials. `use_td`
-    overrides `use_tensor_descriptor()`.
+    overrides `use_tensor_descriptor()` (on XPU; see `use_kv_descriptors`).
     """
     num_tokens, num_heads, head_dim = q.shape
     page, num_kv_heads = key_cache.shape[1:3]

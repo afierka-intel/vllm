@@ -16,8 +16,8 @@ bf16, and the global scale is applied to the fp32 accumulator. Fp8 types
 are not used (XPU Triton has no `float8e4nv`): the codes are decoded with
 integer ops.
 
-With `use_tensor_descriptor()` the weight tiles load through a tensor
-descriptor over the `[E * N, K / 2]` bytes (2D block loads on Intel GPUs);
+On XPU with `use_tensor_descriptor()` the weight tiles load through a tensor
+descriptor over the `[E * N, K / 2]` bytes (2D block loads);
 the gathered activation rows, the block scales (rows of `K / 16` bytes, not
 16-byte aligned at every shape) and the scattered output rows stay pointer
 accesses. The tiles are autotuned per weight shape, row block and path.
@@ -25,6 +25,7 @@ accesses. The tiles are autotuned per weight shape, row block and path.
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import (
     tensor_descriptor_compatible,
     tl,
@@ -33,7 +34,9 @@ from vllm.triton_utils import (
 )
 from vllm.triton_utils.allocation import set_triton_allocator
 
-# (BLOCK_N, BLOCK_K, num_warps, num_stages), tuned on Intel B70 (Xe2).
+# (BLOCK_N, BLOCK_K, num_warps, num_stages), tuned on Intel B70 (Xe2). The
+# first (VLLM_TRITON_FORCE_FIRST_CONFIG) divides every shape `nvfp4_w4a16_moe`
+# accepts; the kernel asserts that a tile divides the weight shape.
 _TILES = (
     (64, 128, 4, 2),
     (128, 64, 4, 2),
@@ -59,13 +62,15 @@ def _prune_tiles(configs, named_args, **kwargs):
 
 @triton.jit
 def _e4m3_to_f32(codes):
-    """fp32 values of e4m3fn codes (finite only: the block scales)."""
+    """fp32 values of e4m3fn codes, as torch decodes them: subnormals
+    `m * 2^-9`, and NaN for the codes 0x7F / 0xFF (e4m3fn has no inf)."""
     bits = codes.to(tl.int32)
     exponent = (bits >> 3) & 0xF
     mantissa = bits & 0x7
     normal = (((exponent + 120) << 23) | (mantissa << 20)).to(tl.float32, bitcast=True)
     value = tl.where(exponent == 0, mantissa.to(tl.float32) * 0.001953125, normal)
-    return tl.where((bits & 0x80) != 0, -value, value)
+    value = tl.where((bits & 0x80) != 0, -value, value)
+    return tl.where((bits & 0x7F) == 0x7F, float("nan"), value)
 
 
 @triton.jit
@@ -137,6 +142,8 @@ def _nvfp4_w4a16_moe_kernel(
 ):
     """`Out[r] = A[r // A_DIV] @ dequant(W[e]).T` for the rows `r` of
     expert `e` in row block `program_id(0)` (`r == num_rows`: padding)."""
+    # The weight tiles are not masked.
+    tl.static_assert(N % BLOCK_N == 0 and K % BLOCK_K == 0)
     pid_m = tl.program_id(0)
     if pid_m * BLOCK_M >= tl.load(NumRowsPadded):
         return
@@ -213,15 +220,21 @@ def nvfp4_w4a16_moe(
     `global_scales` `[E]`. `alignment` is `(sorted_token_ids, expert_ids,
     num_tokens_post_padded)` of `moe_align_block_size(ids, block_m, E)`;
     the rows it does not list are left unset. `use_td` overrides
-    `use_tensor_descriptor()`."""
+    `use_tensor_descriptor()` (on XPU; elsewhere the weights load by
+    pointers)."""
     sorted_rows, block_experts, num_rows_padded = alignment
     _, n, k_half = weight.shape
     k = 2 * k_half
     assert a.shape[1] == k and a.dtype == torch.bfloat16 and a.is_contiguous()
     assert scales.shape == (weight.shape[0], n, k // 16)
     assert scales.dtype == torch.float8_e4m3fn and global_scales.dtype == torch.float32
-    assert n % 64 == 0 and k % 64 == 0, (n, k)
-    use_td = use_tensor_descriptor(use_td) and tensor_descriptor_compatible(weight)
+    # The first tile (64, 128) divides every accepted shape.
+    assert n % 64 == 0 and k % 128 == 0, (n, k)
+    use_td = (
+        current_platform.is_xpu()
+        and use_tensor_descriptor(use_td)
+        and tensor_descriptor_compatible(weight)
+    )
     if use_td:
         # On every launch: Triton's allocator is a per-thread ContextVar.
         set_triton_allocator(a.device)

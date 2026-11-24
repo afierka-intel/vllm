@@ -137,7 +137,8 @@ def blend_rms_norm(
     return out
 
 
-# The blend norm with its warps autotuned on XPU (includes the fixed 8).
+# The blend norm with its warps autotuned on XPU (the fixed 8 first, for
+# VLLM_TRITON_FORCE_FIRST_CONFIG).
 _blend_rms_norm_kernel_tuned = triton.autotune(
-    configs=[triton.Config({}, num_warps=w) for w in (4, 8, 16)], key=["D"]
+    configs=[triton.Config({}, num_warps=w) for w in (8, 4, 16)], key=["D"]
 )(_blend_rms_norm_kernel)

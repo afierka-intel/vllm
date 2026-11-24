@@ -318,10 +318,10 @@ def attn_res(
 
 
 # The AttnRes launches with their warps (and the D chunk) autotuned on XPU;
-# the configs include the fixed ones.
+# the configs include the fixed ones, first (VLLM_TRITON_FORCE_FIRST_CONFIG).
 _ATTN_RES_KEY = ["D", "N_STACK", "HAS_ADDEND", "NORMALIZE", "APPLY_NORM"]
 _attn_res_row_kernel_tuned = triton.autotune(
-    configs=[triton.Config({}, num_warps=w) for w in (4, 8, 16)],
+    configs=[triton.Config({}, num_warps=w) for w in (8, 4, 16)],
     key=_ATTN_RES_KEY,
 )(_attn_res_row_kernel)
 _attn_res_kernel_tuned = triton.autotune(

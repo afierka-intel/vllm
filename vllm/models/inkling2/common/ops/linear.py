@@ -6,7 +6,8 @@ reference `linear` with fp32 accumulation in ordered 1024-wide K groups.
 On XPU (`use_kernel_autotune`) the K-group kernel's tile is autotuned per
 token bucket and weight shape, and with `use_tensor_descriptor()` its x / W
 tiles load and its output tile stores through tensor descriptors (2D block
-IO on Intel GPUs). CUDA keeps the fixed tiles and pointer accesses."""
+IO). CUDA keeps the fixed tiles and pointer accesses, whatever
+`VLLM_TRITON_USE_TD` says."""
 
 import functools
 
@@ -174,6 +175,9 @@ def _k_group_kernel(
     BN: tl.constexpr,
     SPLIT: tl.constexpr,
     USE_TD: tl.constexpr = False,
+    # Token bucket of the autotuned launch (unused in the body): an autotune
+    # key, so that the buckets never share a tuned tile.
+    BUCKET: tl.constexpr = 0,
 ):
     if SPLIT and tl.program_id(1) == 0:
         _prefetch_k_group_tile(W, N, K, BN, tl.program_id(0), tl.program_id(2))
@@ -292,8 +296,10 @@ def k_group_partials(
         device=x.device,
     )
     if use_kernel_autotune():
-        use_td = use_tensor_descriptor() and tensor_descriptor_compatible(
-            x, weight, out[0]
+        use_td = (
+            current_platform.is_xpu()
+            and use_tensor_descriptor()
+            and tensor_descriptor_compatible(x, weight, out[0])
         )
         if use_td:
             # On every launch: Triton's allocator is a per-thread ContextVar.
@@ -306,7 +312,8 @@ def k_group_partials(
                 groups if split else 1,
             )
 
-        _k_group_kernel_tuned(_token_bucket(tokens))[tuned_grid](
+        bucket = _token_bucket(tokens)
+        _k_group_kernel_tuned(bucket)[tuned_grid](
             x,
             weight,
             out,
@@ -315,6 +322,7 @@ def k_group_partials(
             hidden,
             SPLIT=split,
             USE_TD=use_td,
+            BUCKET=bucket,
             enable_fp_fusion=False,
         )
         return out
@@ -348,8 +356,10 @@ def k_group_partials(
 
 
 # Autotuning buckets of `k_group_partials`: (upper token count, row tiles).
-# Each bucket has its own tuner and config list, so their tuned tiles stay
-# apart, also in Triton's on-disk autotuning cache (keyed by the configs).
+# Each bucket has its own tuner, and the bucket is part of the tuning key, so
+# their tuned tiles stay apart, also in Triton's on-disk autotuning cache when
+# pruning leaves two buckets the same configs. The first config of every
+# bucket (VLLM_TRITON_FORCE_FIRST_CONFIG) is valid at any shape.
 _TOKEN_BUCKETS = (
     (16, (16,)),
     (64, (16, 32)),
@@ -357,7 +367,9 @@ _TOKEN_BUCKETS = (
     (1 << 62, (32, 64)),
 )
 
-# (BM, BN, num_warps, num_stages) autotuned on XPU.
+# (BM, BN, num_warps, num_stages) autotuned on XPU. Every tile gives the same
+# bits (each output's K-group sums run in the same order; see
+# test_k_group_tiles_are_bitwise_identical).
 _TUNED_TILES = (
     (16, 32, 4, 3),
     (16, 64, 4, 3),
@@ -390,7 +402,7 @@ def _k_group_kernel_tuned(bucket: int):
             for bm, bn, w, s in _TUNED_TILES
             if bm in rows
         ],
-        key=["N", "K", "SPLIT", "USE_TD"],
+        key=["N", "K", "SPLIT", "USE_TD", "BUCKET"],
         prune_configs_by={"early_config_prune": _prune_k_group_tiles},
     )(_k_group_kernel)
 

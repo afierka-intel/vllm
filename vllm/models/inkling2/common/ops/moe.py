@@ -261,6 +261,9 @@ def _select_kernel(
     GROUPS: tl.constexpr,
     TOPK: tl.constexpr,
     SORT: tl.constexpr,
+    # Batch class of the autotuned launch (unused in the body): an autotune
+    # key, so that the two tuners never share tuned warps.
+    SMALL: tl.constexpr = False,
 ):
     """Local expert ids (-1: not local), routing weights and identity
     `src2dst` of the flat rows of one token."""
@@ -304,7 +307,8 @@ def select_experts(
     weights = torch.empty(tokens * topk, dtype=torch.float32, device=x.device)
     src2dst = torch.empty(tokens * topk, dtype=torch.int32, device=x.device)
     tuned = use_kernel_autotune()
-    kernel = _select_kernel_tuned(tokens <= 256) if tuned else _select_kernel
+    small = tokens <= 256
+    kernel = _select_kernel_tuned(small) if tuned else _select_kernel
     kernel[(tokens,)](
         partials,
         bias,
@@ -320,7 +324,7 @@ def select_experts(
         GROUPS=partials.shape[0],
         TOPK=topk,
         SORT=tokens <= 128,
-        **({} if tuned else {"num_warps": 4 if tokens <= 256 else 1}),
+        **(dict(SMALL=small) if tuned else {"num_warps": 4 if small else 1}),
     )
     return ids, weights, src2dst
 
@@ -328,12 +332,13 @@ def select_experts(
 @functools.cache
 def _select_kernel_tuned(small: bool):
     """`_select_kernel` with its warps autotuned on XPU, for up to 256
-    tokens (`small`) or more; includes the fixed 4 / 1. Distinct lists keep
-    the two tuners apart in Triton's on-disk autotuning cache."""
-    warps = (2, 4, 8) if small else (1, 2, 4)
+    tokens (`small`) or more; the fixed 4 / 1 first
+    (VLLM_TRITON_FORCE_FIRST_CONFIG). `SMALL` in the key keeps the two
+    tuners apart, also in Triton's on-disk autotuning cache."""
+    warps = (4, 2, 8) if small else (1, 2, 4)
     return triton.autotune(
         configs=[triton.Config({}, num_warps=w) for w in warps],
-        key=["E", "GROUPS", "TOPK", "SORT"],
+        key=["E", "GROUPS", "TOPK", "SORT", "SMALL"],
     )(_select_kernel)
 
 
