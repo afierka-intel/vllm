@@ -865,6 +865,7 @@ def test_td_paths_stay_off_on_cuda(monkeypatch):
     platform.use_kernel_autotune.cache_clear()
     assert not platform.use_kernel_td()
     assert not platform.use_kernel_td(True)
+    test_attention_prologue_writes_clipped_k_and_normed_v(False, True, monkeypatch)
     test_short_conv_chunked_matches_full_sequence(True, STEPS, 0)
     test_k_group_partials_match_ordered_groups(
         37, 384, 4608, torch.float32, monkeypatch
