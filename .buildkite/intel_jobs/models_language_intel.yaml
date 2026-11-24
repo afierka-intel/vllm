@@ -62,15 +62,23 @@ steps:
   source_file_dependencies:
   - vllm/models/inkling2/
   - vllm/models/inkling/nvidia/sconv_swa_attn.py
+  - vllm/models/inkling/nvidia/ops/sconv.py
+  - vllm/models/inkling/nvidia/ops/norm.py
   - vllm/models/inkling/nvidia/ops/fa4_rel_attention.py
-  - vllm/model_executor/layers/fused_moe/
+  - vllm/model_executor/layers/fused_moe/moe_align_block_size.py
+  - vllm/_custom_ops.py
+  - vllm/v1/attention/backends/flash_attn.py
+  - vllm/v1/core/single_type_kv_cache_manager.py
+  - vllm/utils/flashinfer.py
+  - vllm/utils/platform_utils.py
+  - vllm/compilation/breakable_cudagraph.py
   - vllm/triton_utils/
   - vllm/platforms/xpu.py
   - requirements/xpu.txt
   - tests/models/inkling2/
   commands:
-    # The portable Triton kernels, the tiny-model engines and the XPU expert
-    # backends; DSpark, LoRA, vision and the CUDA expert GEMMs skip off CUDA.
+    # The portable Triton kernels, the tiny-model engines, the XPU expert
+    # backends and the XPU gates (DSpark, LoRA, image inputs, FP8 KV).
     - cd tests
     - >-
       pytest -v -s
@@ -78,3 +86,4 @@ steps:
       models/inkling2/test_attention.py
       models/inkling2/test_model.py
       models/inkling2/test_xpu_experts.py
+      models/inkling2/test_platform_gates.py
