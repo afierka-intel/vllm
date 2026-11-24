@@ -45,6 +45,14 @@ from vllm.triton_utils import tl, triton
 
 logger = init_logger(__name__)
 
+# MoE config entries that `invoke_fused_moe_nvfp4_emulation_kernel` passes as
+# kernel parameters itself, or drops (not parameters of this kernel); the
+# other entries are launch options.
+_LAUNCHER_CONFIG_KEYS = frozenset(
+    {"BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K", "GROUP_SIZE_M"}
+    | {"SPLIT_K", "USE_TMA"}
+)
+
 
 @triton.jit
 def fused_moe_nvfp4_emulation_kernel(
@@ -292,6 +300,15 @@ def invoke_fused_moe_nvfp4_emulation_kernel(
     grid = lambda META: (
         triton.cdiv(EM, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
+    # Pass the rest of the config as launch options, as
+    # invoke_fused_moe_triton_kernel does with **config: num_warps,
+    # num_stages and the platform options a tuned file may carry (num_ctas,
+    # waves_per_eu / matrix_instr_nonkdim / kpack on ROCm, grf_mode on XPU),
+    # so a tuned entry applies as a whole. SPLIT_K and USE_TMA are
+    # fused_moe_kernel parameters that this kernel does not have.
+    launch_options = {
+        key: value for key, value in config.items() if key not in _LAUNCHER_CONFIG_KEYS
+    }
 
     fused_moe_nvfp4_emulation_kernel[grid](
         A,
@@ -328,6 +345,7 @@ def invoke_fused_moe_nvfp4_emulation_kernel(
         BLOCK_SIZE_N=config["BLOCK_SIZE_N"],
         BLOCK_SIZE_K=config["BLOCK_SIZE_K"],
         GROUP_SIZE_M=config["GROUP_SIZE_M"],
+        **launch_options,
     )
 
 
