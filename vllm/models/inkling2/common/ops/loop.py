@@ -12,6 +12,7 @@ import torch
 
 from vllm.triton_utils import tl, tldevice, triton
 
+from .autotune import autotune
 from .intrinsics import rsqrt
 from .platform import use_kernel_autotune
 
@@ -139,6 +140,6 @@ def blend_rms_norm(
 
 # The blend norm with its warps autotuned on XPU (the fixed 8 first, for
 # VLLM_TRITON_FORCE_FIRST_CONFIG).
-_blend_rms_norm_kernel_tuned = triton.autotune(
+_blend_rms_norm_kernel_tuned = autotune(
     configs=[triton.Config({}, num_warps=w) for w in (8, 4, 16)], key=["D"]
 )(_blend_rms_norm_kernel)

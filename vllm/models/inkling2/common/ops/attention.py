@@ -12,6 +12,7 @@ import torch
 from vllm.triton_utils import tl, tldevice, triton
 from vllm.utils.platform_utils import num_compute_units
 
+from .autotune import autotune
 from .intrinsics import ex2, lg2, sigmoid
 from .pdl import gdc_wait
 from .platform import pdl_launch_kwargs, use_kernel_autotune, use_sm100_kernels
@@ -95,7 +96,7 @@ def gate_sink(
 
 # The gate/sink with its column block and warps autotuned on XPU (includes
 # the fixed 512 / 4).
-_gate_sink_kernel_tuned = triton.autotune(
+_gate_sink_kernel_tuned = autotune(
     configs=[
         triton.Config({"BLOCK": b}, num_warps=w)
         for b, w in ((512, 4), (1024, 4), (2048, 8), (256, 2))
@@ -448,7 +449,7 @@ _COMBINE_TILES = {
 
 @functools.cache
 def _rel_decode_combine_kernel_tuned(large: bool):
-    return triton.autotune(
+    return autotune(
         configs=[
             triton.Config({"BLOCK_D": b}, num_warps=w) for b, w in _COMBINE_TILES[large]
         ],

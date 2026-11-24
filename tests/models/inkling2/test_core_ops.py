@@ -162,37 +162,6 @@ def test_k_group_tiles_are_bitwise_identical(tokens, n, k, use_td):
         assert torch.equal(out.view(torch.int32), first.view(torch.int32)), tile
 
 
-@requires_xpu
-def test_k_group_buckets_keep_separate_tuning_keys():
-    """Buckets 64 and 1024 prune to the same configs at N <= 32 (Inkling 2's
-    dynamic taps); the bucket in the tuning key still keeps their picks
-    apart, in memory and in Triton's on-disk cache (keyed by the tuning key
-    and the configs)."""
-    from vllm.models.inkling2.common.ops import linear as ops
-
-    n, k = 32, 4608
-    small, large = ops._k_group_kernel_tuned(64), ops._k_group_kernel_tuned(1024)
-    args = {"N": n}
-    pruned = [
-        [str(c) for c in ops._prune_k_group_tiles(t.configs, args)]
-        for t in (small, large)
-    ]
-    assert pruned[0] == pruned[1]
-    torch.manual_seed(0)
-    w = torch.randn(n, k, device=DEVICE).bfloat16()
-    for tokens in (40, 100):
-        x = torch.randn(tokens, k, device=DEVICE).bfloat16()
-        ops.k_group_partials(x, w)
-    keys = []
-    for bucket, tuner in ((64, small), (1024, large)):
-        assert tuner.keys[-1] == "BUCKET"
-        # (N, K, SPLIT, USE_TD, BUCKET, dtypes...) of this weight shape.
-        shape_keys = {key for key in tuner.cache if key[:2] == (n, k)}
-        assert shape_keys and all(key[4] == bucket for key in shape_keys)
-        keys.append(shape_keys)
-    assert not keys[0] & keys[1]
-
-
 @pytest.mark.parametrize("in_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("width", [4608, 128])
 def test_rms_norm_rounds_once_to_bf16(in_dtype, width):

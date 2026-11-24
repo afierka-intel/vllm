@@ -129,6 +129,20 @@ def test_pdl_launch_kwargs_per_platform(emulate, platform, capability, kwargs):
     assert predicates.use_tma_k_groups() == kwargs.get("launch_pdl", False)
 
 
+@pytest.mark.parametrize("platform", ["xpu", "cuda"])
+def test_batch_invariant_runs_fixed_configs(emulate, monkeypatch, platform):
+    """`VLLM_BATCH_INVARIANT=1` turns autotuning off on XPU (the fixed launch
+    configs run, as on CUDA); CUDA never autotunes."""
+    from vllm import envs
+
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    emulate(platform, None if platform == "xpu" else 90)
+    assert not predicates.use_kernel_autotune()
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", False)
+    predicates.use_kernel_autotune.cache_clear()
+    assert predicates.use_kernel_autotune() == (platform == "xpu")
+
+
 def test_xpu_predicates_take_portable_paths(emulate):
     """XPU: `short_conv` + `attn_res`, stream-ordered launches (no
     `launch_pdl` option at all), autotuned tiles, no SM10x kernels."""

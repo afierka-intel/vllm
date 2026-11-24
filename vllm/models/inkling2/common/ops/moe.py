@@ -16,6 +16,7 @@ from vllm.models.inkling2.nvidia.ops.seq_parallel import HALO_ROWS, SeqParallel
 from vllm.triton_utils import tl, tldevice, triton
 
 from .activation import _situ
+from .autotune import autotune
 from .linear import k_group_partials
 from .pdl import gdc_launch_dependents, gdc_wait
 from .platform import pdl_launch_kwargs, use_kernel_autotune
@@ -336,7 +337,7 @@ def _select_kernel_tuned(small: bool):
     (VLLM_TRITON_FORCE_FIRST_CONFIG). `SMALL` in the key keeps the two
     tuners apart, also in Triton's on-disk autotuning cache."""
     warps = (4, 2, 8) if small else (1, 2, 4)
-    return triton.autotune(
+    return autotune(
         configs=[triton.Config({}, num_warps=w) for w in warps],
         key=["E", "GROUPS", "TOPK", "SORT", "SMALL"],
     )(_select_kernel)

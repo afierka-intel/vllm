@@ -14,6 +14,7 @@ import torch
 
 from vllm.triton_utils import tl, tldevice, triton
 
+from .autotune import autotune
 from .intrinsics import rsqrt
 from .pdl import gdc_wait
 from .platform import pdl_launch_kwargs, use_kernel_autotune
@@ -320,11 +321,11 @@ def attn_res(
 # The AttnRes launches with their warps (and the D chunk) autotuned on XPU;
 # the configs include the fixed ones, first (VLLM_TRITON_FORCE_FIRST_CONFIG).
 _ATTN_RES_KEY = ["D", "N_STACK", "HAS_ADDEND", "NORMALIZE", "APPLY_NORM"]
-_attn_res_row_kernel_tuned = triton.autotune(
+_attn_res_row_kernel_tuned = autotune(
     configs=[triton.Config({}, num_warps=w) for w in (8, 4, 16)],
     key=_ATTN_RES_KEY,
 )(_attn_res_row_kernel)
-_attn_res_kernel_tuned = triton.autotune(
+_attn_res_kernel_tuned = autotune(
     configs=[
         triton.Config({"BLOCK_D": b}, num_warps=w)
         for b, w in ((1024, 4), (512, 4), (1024, 8), (2048, 8), (512, 2))

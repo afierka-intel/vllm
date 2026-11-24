@@ -48,12 +48,17 @@ def pdl_launch_kwargs() -> Mapping[str, bool]:
 
 @functools.cache
 def use_kernel_autotune() -> bool:
-    """Whether the portable Triton kernels autotune their tiles: XPU. CUDA
-    keeps the fixed launch configs (tiles, warps, stages) chosen for Hopper
-    and Blackwell, so its launches are unchanged."""
+    """Whether the portable Triton kernels autotune their tiles: XPU, unless
+    `VLLM_BATCH_INVARIANT` asks for run-to-run and batch-size invariant
+    results, which a timing-based pick per token bucket cannot give. Then,
+    as on CUDA (and as Hopper's Humming experts take their batch-invariant
+    heuristic configs), the fixed launch configs run. CUDA keeps the fixed
+    configs (tiles, warps, stages) chosen for Hopper and Blackwell, so its
+    launches are unchanged."""
+    from vllm import envs
     from vllm.platforms import current_platform
 
-    return current_platform.is_xpu()
+    return current_platform.is_xpu() and not envs.VLLM_BATCH_INVARIANT
 
 
 @functools.cache

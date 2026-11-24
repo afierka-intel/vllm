@@ -43,6 +43,7 @@ from vllm.triton_utils import (
 )
 from vllm.triton_utils.allocation import set_triton_allocator
 
+from .autotune import autotune
 from .intrinsics import rsqrt
 from .norm import qr_clip_rel_tokens
 from .pdl import gdc_launch_dependents, gdc_wait
@@ -609,7 +610,7 @@ def _sconv_kernel_tuned(bucket: int):
     """`_sconv_kernel` with the tile and warps autotuned per shape and path,
     for token counts up to `bucket`."""
     tiles = dict(_SCONV_BUCKETS)[bucket]
-    return triton.autotune(
+    return autotune(
         configs=[
             triton.Config({"BT": bt, "BLOCK_C": bc}, num_warps=w)
             for bt, bc, w in _SCONV_TILES
@@ -1250,12 +1251,12 @@ def attention_prologue(
 # The prologue launches with their warps (and the q/r token count of the
 # separate q/r launch) autotuned on XPU; the configs include the fixed ones,
 # the prologue's first (VLLM_TRITON_FORCE_FIRST_CONFIG).
-_attn_prologue_kernel_tuned = triton.autotune(
+_attn_prologue_kernel_tuned = autotune(
     configs=[triton.Config({}, num_warps=w) for w in (4, 2, 8)],
     key=["W", "D", "DYNAMIC", "BT", "HQ", "E", "FUSE_QR", "HAS_TAU", "USE_TD"],
 )(_attn_prologue_kernel)
 
-_qr_rel_kernel_tuned = triton.autotune(
+_qr_rel_kernel_tuned = autotune(
     configs=[
         triton.Config({"QR_TOKENS": t}, num_warps=w)
         for t, w in ((8, 4), (4, 4), (16, 4), (8, 8), (16, 8))

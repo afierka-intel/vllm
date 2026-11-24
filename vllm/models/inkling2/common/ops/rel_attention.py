@@ -35,6 +35,7 @@ from vllm.triton_utils import (
 )
 from vllm.triton_utils.allocation import set_triton_allocator
 
+from .autotune import autotune
 from .platform import use_kernel_autotune
 
 # The query tile of tml_fa4 that shears the relative logits.
@@ -341,7 +342,7 @@ def _prune_tiles(configs, named_args, **kwargs):
 
 # The same kernel with the key tile and warps autotuned per shape and path.
 # A launch only writes its outputs, so the tuning runs leave no trace.
-_rel_attention_kernel_tuned = triton.autotune(
+_rel_attention_kernel_tuned = autotune(
     configs=[
         triton.Config({"BLOCK_N": n}, num_warps=w, num_stages=2)
         for n, w in _TUNED_TILES

@@ -27,6 +27,7 @@ from vllm.triton_utils import (
 from vllm.triton_utils.allocation import set_triton_allocator
 from vllm.utils.flashinfer import is_flashinfer_autotuning
 
+from .autotune import autotune
 from .intrinsics import keep_separate, prefetch_l2
 from .pdl import gdc_launch_dependents, gdc_wait
 from .platform import (
@@ -396,7 +397,7 @@ def _k_group_kernel_tuned(bucket: int):
     """`_k_group_kernel` with the tile autotuned per weight shape, split and
     path, for token counts up to `bucket`."""
     rows = dict(_TOKEN_BUCKETS)[bucket]
-    return triton.autotune(
+    return autotune(
         configs=[
             triton.Config({"BM": bm, "BN": bn}, num_warps=w, num_stages=s)
             for bm, bn, w, s in _TUNED_TILES

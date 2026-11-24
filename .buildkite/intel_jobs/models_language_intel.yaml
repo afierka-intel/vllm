@@ -88,3 +88,5 @@ steps:
       models/inkling2/test_model.py
       models/inkling2/test_xpu_experts.py
       models/inkling2/test_platform_gates.py
+    # The tuned launch path: each case times every config of a fresh key.
+    - pytest -v -s models/inkling2/test_autotune.py
