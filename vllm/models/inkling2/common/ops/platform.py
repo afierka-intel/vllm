@@ -61,15 +61,11 @@ def use_tma_k_groups() -> bool:
 
 @functools.cache
 def use_native_conv_mix() -> bool:
-    """Whether the `csrc/inkling2` conv/mix ops run here: CUDA Hopper and
-    SM10x builds that register them. Otherwise `conv_mix` runs `short_conv`
-    + `attn_res`."""
-    import torch
-
+    """Whether `conv_mix` runs the `csrc/inkling2` conv/mix op: everywhere
+    but SM12x and XPU, which run `short_conv` + `attn_res`. Off XPU this is
+    the decision of the CUDA kernels before the portable paths."""
     from vllm.platforms import current_platform
 
-    return (
-        current_platform.is_cuda()
-        and any(current_platform.is_device_capability_family(f) for f in (90, 100))
-        and hasattr(torch.ops._C, "inkling2_conv_mix")
+    return not (
+        current_platform.is_xpu() or current_platform.is_device_capability_family(120)
     )
