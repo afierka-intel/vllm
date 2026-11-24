@@ -21,13 +21,14 @@ Dynamic convolution (newest tap first, per-token per-head tap weights)::
 `y` is rounded to the input dtype. The K/V variant then L2-clips K and
 RMS-normalizes V per head and writes both to the paged KV cache.
 
-On XPU with `use_kernel_td()`, the row tiles of the current inputs
-and the residual / addend / output tiles of `short_conv` go through tensor
-descriptors (2D block IO). The paged conv-state accesses (one slot per
-token), the earlier taps and the per-token scalars stay pointer accesses.
-CUDA keeps pointer accesses, whatever `VLLM_TRITON_USE_TD` says. On XPU
-(`use_kernel_autotune`) the `short_conv` tiles and warps are autotuned, with
-the fixed tile first; CUDA keeps the fixed launch configs.
+On XPU with `use_kernel_td()`, the row tiles of the current inputs,
+the residual / addend / output tiles and the q / rel-logit tiles of the
+prologue go through tensor descriptors (2D block IO). The paged conv-state and
+KV-cache accesses (one slot per token), the earlier taps and the per-token
+scalars stay pointer accesses. CUDA keeps pointer accesses, whatever
+`VLLM_TRITON_USE_TD` says. On XPU (`use_kernel_autotune`) the `short_conv`
+tiles and warps are autotuned, with the fixed tile first; the prologue keeps
+its fixed launch configs everywhere.
 """
 
 import functools
@@ -750,6 +751,7 @@ def _attn_prologue_kernel(
     BLOCK_E: tl.constexpr,
     QR_TOKENS: tl.constexpr,
     FUSE_QR: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     gdc_wait()
     # The decode attention kernel prefetches cached keys meanwhile.
@@ -788,6 +790,7 @@ def _attn_prologue_kernel(
                 HAS_TAU,
                 BLOCK_HQ,
                 BLOCK_E,
+                USE_TD,
             )
     else:
         _kv_conv_tile(
@@ -831,6 +834,7 @@ def _attn_prologue_kernel(
             D,
             DYNAMIC,
             BT,
+            USE_TD,
         )
 
 
@@ -862,6 +866,7 @@ def _qr_rel_kernel(
     BLOCK_HQ: tl.constexpr,
     BLOCK_E: tl.constexpr,
     QR_TOKENS: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     # Runs alongside the K/V conv launch (`_attn_prologue_kernel` without
     # FUSE_QR), which started it after its own grid dependency wait; waiting
@@ -896,6 +901,7 @@ def _qr_rel_kernel(
         HAS_TAU,
         BLOCK_HQ,
         BLOCK_E,
+        USE_TD,
     )
     gdc_wait()
 
@@ -942,6 +948,7 @@ def _kv_conv_tile(
     D: tl.constexpr,
     DYNAMIC: tl.constexpr,
     BT: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     toff = tl.program_id(0) * BT + tl.arange(0, BT)
     head = tl.program_id(1)
@@ -988,6 +995,11 @@ def _kv_conv_tile(
         dyn_ptr if DYNAMIC else None,
         stride_dyn,
         D,
+        USE_TD=USE_TD,
+        x_rows=T,
+        x_cols=tl.num_programs(1) * D,
+        row0=tl.program_id(0) * BT,
+        col0=head * D,
     )
     y = y.to(k_ptr.dtype.element_ty).to(tl.float32)
     sum_sq = tl.sum(y * y, axis=1)
@@ -1112,6 +1124,21 @@ def attention_prologue(
         num_heads,
         2 + (0 if qr_tokens else qr_blocks),
     )
+    # Fixed warps, also on XPU: they set the reduction order of the K L2
+    # clip, the V RMS norm and the q / r clipping, so the KV cache bits do not
+    # depend on a timing pick (as for `_pair_rms_norm_kernel`).
+    use_td = use_kernel_td() and tensor_descriptor_compatible(
+        k,
+        v,
+        q.flatten(1),
+        q_out.flatten(1),
+        q_scale,
+        rel_out.flatten(1),
+        rel_proj.flatten(0, 1),
+    )
+    if use_td:
+        # On every launch: Triton's allocator is a per-thread ContextVar.
+        set_triton_allocator(q.device)
     _attn_prologue_kernel[grid](
         k,
         v,
@@ -1175,8 +1202,9 @@ def attention_prologue(
         BLOCK_E=block_e,
         QR_TOKENS=triton.cdiv(block_t, num_heads),
         FUSE_QR=not qr_tokens,
-        num_warps=4,
+        USE_TD=use_td,
         enable_fp_fusion=False,
+        num_warps=4,
         **pdl_launch_kwargs(),
     )
     if qr_tokens:
@@ -1207,6 +1235,7 @@ def attention_prologue(
             BLOCK_HQ=max(triton.next_power_of_2(num_q_heads), 16),
             BLOCK_E=block_e,
             QR_TOKENS=qr_tokens,
+            USE_TD=use_td,
             num_warps=4,
             enable_fp_fusion=False,
             **pdl_launch_kwargs(),
