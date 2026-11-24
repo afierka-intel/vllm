@@ -11,10 +11,11 @@ that survives pruning before the launch returns, from about a second (row
 kernels) to tens of seconds (`_rel_attention_kernel`, `_qr_rel_kernel`) per
 key on a B70, and longer with `VLLM_TRITON_USE_TD=0`; the engine step that
 meets a new key blocks for that long. The profile and warmup dummy runs tune
-only the keys of their own batches (uniform requests; the attention-side
-kernels do not run in them), so with an empty cache the first real requests tune the
-attention-side keys and the token buckets they reach (Inkling-2-Mini on one
-B70: about 4 minutes over the first requests of a 1024-token batch).
+the keys of their own uniform batches; real batches then reach new keys (the
+prefill tiles, the decode split plans, the prologue's separate q/r launch, other
+token buckets). Inkling-2-Mini on one B70 with an empty cache: engine init
+590 s (99 s with `VLLM_TRITON_FORCE_FIRST_CONFIG=1`), then 175 s of tuning
+over the first requests of a 1024-token batch.
 
 The picks are cached on disk (`cache_results=True`, under
 `TRITON_CACHE_DIR`), keyed by the Triton version, the backend target, the
