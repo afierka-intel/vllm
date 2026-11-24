@@ -36,6 +36,8 @@ def _tuners():
     variant)."""
     return [
         rel_attention_ops._rel_attention_kernel_tuned,
+        sconv_ops._attn_prologue_kernel_tuned,
+        sconv_ops._qr_rel_kernel_tuned,
         *(linear_ops._k_group_kernel_tuned(b) for b, _ in linear_ops._TOKEN_BUCKETS),
         *(sconv_ops._sconv_kernel_tuned(b) for b, _ in sconv_ops._SCONV_BUCKETS),
     ]
@@ -115,6 +117,17 @@ def test_short_conv_tunes_and_matches_full_sequence(cold_tuning):
         False, test_core_ops.LONG_STEPS, 0
     )
     _assert_tuned(cold_tuning, "_sconv_kernel")
+
+
+@pytest.mark.parametrize("split", [False, True])
+def test_attention_prologue_tunes_and_matches_reference(
+    cold_tuning, monkeypatch, split
+):
+    test_core_ops.test_attention_prologue_writes_clipped_k_and_normed_v(
+        False, split, monkeypatch
+    )
+    names = ("_attn_prologue_kernel", "_qr_rel_kernel")
+    _assert_tuned(cold_tuning, *(names if split else names[:1]))
 
 
 def test_k_group_buckets_keep_separate_tuning_keys():

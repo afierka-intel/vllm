@@ -859,9 +859,9 @@ def test_sm12x_linear_large_batch_fallback():
 
 @pytest.mark.skipif(current_platform.is_xpu(), reason="the TD gate off XPU")
 def test_td_paths_stay_off_on_cuda(monkeypatch):
-    """With TD forced on (`VLLM_TRITON_USE_TD=1`), the short conv and K-group
-    launches keep their pointer paths off XPU: none of them sets up the
-    descriptors' allocator."""
+    """With TD forced on (`VLLM_TRITON_USE_TD=1`), the prologue, q/r, short
+    conv and K-group launches keep their pointer paths off XPU: none of them
+    sets up the descriptors' allocator."""
 
     def no_descriptors(device):
         raise AssertionError("a tensor-descriptor path ran off XPU")
@@ -869,6 +869,7 @@ def test_td_paths_stay_off_on_cuda(monkeypatch):
     for module in (sconv_ops, linear_ops):
         monkeypatch.setattr(module, "use_tensor_descriptor", lambda *_: True)
         monkeypatch.setattr(module, "set_triton_allocator", no_descriptors)
+    test_attention_prologue_writes_clipped_k_and_normed_v(False, True, monkeypatch)
     test_short_conv_chunked_matches_full_sequence(True, STEPS, 0)
     test_k_group_partials_match_ordered_groups(
         37, 384, 4608, torch.float32, monkeypatch
