@@ -101,6 +101,33 @@ def test_split_dots_needs_whole_groups_and_a_16_wide_dot(block_k):
         _launch({**LAUNCH_CONFIG, "BLOCK_SIZE_K": block_k}, split_dots=True)
 
 
+def _td_operands(k: int = 256):
+    """CPU activations and packed weights of the launcher's TD predicate."""
+    return torch.empty(4, k).bfloat16(), torch.empty(4, 128, k // 2, dtype=torch.uint8)
+
+
+@pytest.mark.parametrize("use_td", [None, False, True])
+def test_td_on_xpu_only(monkeypatch, use_td):
+    """The weight tiles load through a tensor descriptor on XPU unless
+    turned off (`use_tensor_descriptor`), and never elsewhere (also not when
+    forced)."""
+    monkeypatch.delenv("VLLM_TRITON_USE_TD", raising=False)
+    a, b = _td_operands()
+    expected = current_platform.is_xpu() and use_td is not False
+    assert nvfp4_emulation_moe.nvfp4_emulation_use_td(a, b, LAUNCH_CONFIG, use_td) == (
+        expected
+    )
+
+
+def test_td_off_with_a_k_tail():
+    """No tensor descriptor when K is not a multiple of BLOCK_SIZE_K (the
+    known Triton TD + tl.dot miscompilation that fused_moe_kernel avoids
+    the same way)."""
+    a, b = _td_operands()
+    config = {**LAUNCH_CONFIG, "BLOCK_SIZE_K": 96}
+    assert not nvfp4_emulation_moe.nvfp4_emulation_use_td(a, b, config, True)
+
+
 def random_nvfp4(experts: int, n: int, k: int):
     """Packed e2m1 values `[E, N, K / 2]`, e4m3 block scales `[E, N, K / 16]`
     and per-expert global scales `[E]`, for a GEMM output of about unit size
@@ -117,7 +144,9 @@ def dequant_nvfp4(values, scales, global_scale) -> torch.Tensor:
     return break_fp4_bytes(values, torch.float32) * block * global_scale
 
 
-def launch(a, values, scales, global_scale, alignment, top_k, config, split_dots):
+def launch(
+    a, values, scales, global_scale, alignment, top_k, config, split_dots, use_td
+):
     """The `[M * top_k, N]` rows of `C`, NaN where the kernel writes none."""
     c = torch.full(
         (a.shape[0], top_k, values.shape[1]),
@@ -142,6 +171,7 @@ def launch(a, values, scales, global_scale, alignment, top_k, config, split_dots
         config,
         compute_type=tl.bfloat16,
         split_dots=split_dots,
+        use_td=use_td,
     )
     return c.view(-1, values.shape[1])
 
@@ -169,9 +199,12 @@ def check_rows(out, a, values, scales, global_scale, ids, a_div, split_dots):
 
 
 CONFIG = {"BLOCK_SIZE_N": 64, "GROUP_SIZE_M": 1, "num_warps": 4, "num_stages": 2}
+# Weight tiles by pointers and (XPU only) through a tensor descriptor.
+USE_TD = [False, True] if current_platform.is_xpu() else [None]
 
 
 @requires_gpu
+@pytest.mark.parametrize("use_td", USE_TD)
 @pytest.mark.parametrize("split_dots", [True, False])
 @pytest.mark.parametrize("a_div", [1, 8])
 @pytest.mark.parametrize(
@@ -187,7 +220,9 @@ CONFIG = {"BLOCK_SIZE_N": 64, "GROUP_SIZE_M": 1, "num_warps": 4, "num_stages": 2
         (4608, 4608, 64, 64),
     ],
 )
-def test_kernel_matches_dequantized_matmul(n, k, block_m, block_k, a_div, split_dots):
+def test_kernel_matches_dequantized_matmul(
+    n, k, block_m, block_k, a_div, split_dots, use_td
+):
     """Both K-loop paths over rows of several row blocks per expert, of a
     one-row expert, of empty experts and of -1 slots (left unwritten)."""
     torch.manual_seed(0)
@@ -202,7 +237,9 @@ def test_kernel_matches_dequantized_matmul(n, k, block_m, block_k, a_div, split_
         ids, block_m, experts, ignore_invalid_experts=True
     )[:3]
     config = {**CONFIG, "BLOCK_SIZE_M": block_m, "BLOCK_SIZE_K": block_k}
-    out = launch(a, values, scales, global_scale, alignment, a_div, config, split_dots)
+    out = launch(
+        a, values, scales, global_scale, alignment, a_div, config, split_dots, use_td
+    )
     check_rows(out, a, values, scales, global_scale, ids, a_div, split_dots)
 
 
@@ -230,9 +267,10 @@ def test_block_scale_decode_matches_torch():
 
 
 @requires_gpu
+@pytest.mark.parametrize("use_td", USE_TD)
 @pytest.mark.parametrize("split_dots", [True, False])
 @pytest.mark.parametrize("n,k,block_m", [(2304, 1152, 16), (4608, 4608, 32)])
-def test_kernel_every_finite_scale_code(n, k, block_m, split_dots):
+def test_kernel_every_finite_scale_code(n, k, block_m, split_dots, use_td):
     """Block scales of every finite e4m3 code (subnormal, the largest,
     negative and zero), one code per output column."""
     torch.manual_seed(0)
@@ -247,5 +285,31 @@ def test_kernel_every_finite_scale_code(n, k, block_m, split_dots):
     a = torch.randn(tokens * top_k, k, device=DEVICE).bfloat16()
     alignment = moe_align_block_size(ids, block_m, experts)[:3]
     config = {**CONFIG, "BLOCK_SIZE_M": block_m, "BLOCK_SIZE_K": 128}
-    out = launch(a, values, scales, global_scale, alignment, 1, config, split_dots)
+    out = launch(
+        a, values, scales, global_scale, alignment, 1, config, split_dots, use_td
+    )
     check_rows(out, a, values, scales, global_scale, ids, 1, split_dots)
+
+
+@pytest.mark.skipif(not current_platform.is_xpu(), reason="TD path is XPU-only")
+@pytest.mark.parametrize("split_dots", [True, False])
+@pytest.mark.parametrize(
+    "n,k,block_m,block_k", [(2304, 1152, 16, 128), (4608, 4608, 32, 128)]
+)
+def test_td_matches_pointer_path_bitwise(n, k, block_m, block_k, split_dots):
+    """The tensor-descriptor weight loads give bitwise the same output as
+    the pointer loads (same config, no K tail)."""
+    torch.manual_seed(0)
+    experts, tokens, top_k = 24, 40, 8
+    values, scales, global_scale = random_nvfp4(experts, n, k)
+    ids = torch.randint(0, experts, (tokens, top_k), dtype=torch.int32).to(DEVICE)
+    a = torch.randn(tokens * top_k, k, device=DEVICE).bfloat16()
+    alignment = moe_align_block_size(ids, block_m, experts)[:3]
+    config = {**CONFIG, "BLOCK_SIZE_M": block_m, "BLOCK_SIZE_K": block_k}
+    td0, td1 = (
+        launch(
+            a, values, scales, global_scale, alignment, 1, config, split_dots, use_td
+        )
+        for use_td in (False, True)
+    )
+    assert torch.equal(td0.view(torch.int16), td1.view(torch.int16))
