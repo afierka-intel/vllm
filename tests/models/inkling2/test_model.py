@@ -3,6 +3,7 @@
 """End-to-end smoke test of a tiny random-weight Inkling2 model (TP=1)."""
 
 import copy
+import functools
 import json
 from typing import Any
 
@@ -31,9 +32,10 @@ DEVICE = current_platform.device_type
 
 
 def _memory_fraction(fraction: float, min_gib: float = 4.0) -> float:
-    """`fraction` of the device memory, or more on devices with less than
-    `min_gib / fraction` GiB (e.g. 32 GB cards), so that the engine still
-    gets `min_gib` GiB."""
+    """`fraction` of the device memory. On XPU (e.g. 32 GB cards) at least
+    `min_gib` GiB, so that the engine fits; CUDA keeps `fraction`."""
+    if not current_platform.is_xpu():
+        return fraction
     total = current_platform.get_device_total_memory() / 2**30
     return max(fraction, min_gib / total)
 
@@ -243,13 +245,11 @@ def test_portable_fp16_kv_config(tmp_path, looped):
 @pytest.mark.parametrize("looped", [False, True])
 @pytest.mark.parametrize(
     "draft_sample_method,kv_cache_dtype,moe_backend",
-    [(None, "auto", "auto")]
-    # The DSpark draft is CUDA-only (rejected at config on other platforms).
-    + (
-        [("greedy", "auto", "auto"), ("probabilistic", "auto", "auto")]
-        if current_platform.is_cuda()
-        else []
-    )
+    [
+        (None, "auto", "auto"),
+        ("greedy", "auto", "auto"),
+        ("probabilistic", "auto", "auto"),
+    ]
     + (
         [
             (None, "float16", "auto"),
@@ -264,7 +264,7 @@ def test_portable_fp16_kv_config(tmp_path, looped):
     ),
 )
 def test_tiny_model_generates(
-    tmp_path, draft_sample_method, kv_cache_dtype, moe_backend, looped
+    tmp_path, capfd, draft_sample_method, kv_cache_dtype, moe_backend, looped
 ):
     """One local and one full layer load (dummy weights) and decode with the
     paged KV and conv-state caches and CUDA graphs, optionally speculating
@@ -272,7 +272,8 @@ def test_tiny_model_generates(
     Probabilistic drafting caches the draft's bf16 logits for rejection."""
     config = copy.deepcopy(TINY_LOOP_CONFIG if looped else TINY_CONFIG)
     (tmp_path / "config.json").write_text(json.dumps(config))
-    llm = LLM(
+    make_llm = functools.partial(
+        LLM,
         speculative_config=(
             None
             if draft_sample_method is None
@@ -296,6 +297,15 @@ def test_tiny_model_generates(
         limit_mm_per_prompt={"image": 0},
         disable_log_stats=False,
     )
+    if current_platform.is_xpu() and draft_sample_method is not None:
+        # The DSpark draft runs CUDA kernels: on XPU the engine core fails
+        # at model init with the gate's error (logged by the engine core).
+        with pytest.raises(RuntimeError, match="Engine core initialization failed"):
+            make_llm()
+        err = capfd.readouterr().err
+        assert "Inkling2 on XPU does not support DSpark speculative decoding" in err
+        return
+    llm = make_llm()
     prompts = [list(range(2, 300)), [5, 5, 5]]
     outputs = llm.generate(
         [{"prompt_token_ids": p} for p in prompts],
