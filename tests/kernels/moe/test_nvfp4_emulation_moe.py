@@ -37,7 +37,9 @@ class _LaunchSpy:
         self.kwargs.append(kwargs)
 
 
-def _launch(config: dict, tokens: int = 4, top_k: int = 2) -> None:
+def _launch(
+    config: dict, tokens: int = 4, top_k: int = 2, use_td: bool | None = False
+) -> None:
     """Launch the kernel over random-shaped operands (on the CPU: the spy
     only records the launch)."""
     experts, n, k = 4, 128, 256
@@ -64,6 +66,7 @@ def _launch(config: dict, tokens: int = 4, top_k: int = 2) -> None:
         top_k,
         config,
         compute_type=tl.bfloat16,
+        use_td=use_td,
     )
 
 
@@ -105,6 +108,21 @@ def test_launch_without_warps_keeps_triton_defaults(monkeypatch):
     assert "num_warps" not in kwargs and "num_stages" not in kwargs
 
 
+@pytest.mark.parametrize("use_td", [None, False, True])
+def test_launch_td_on_xpu_only(monkeypatch, use_td):
+    """The weight tiles load through a tensor descriptor on XPU unless
+    turned off (`use_tensor_descriptor`), and never elsewhere."""
+    monkeypatch.delenv("VLLM_TRITON_USE_TD", raising=False)
+    spy = _LaunchSpy()
+    monkeypatch.setattr(
+        nvfp4_emulation_moe.fused_moe_nvfp4_emulation_kernel, "run", spy
+    )
+    monkeypatch.setattr(nvfp4_emulation_moe, "set_triton_allocator", lambda d: None)
+    _launch({**TILES, "GROUP_SIZE_M": 1}, use_td=use_td)
+    (kwargs,) = spy.kwargs
+    assert kwargs["USE_TD"] == (current_platform.is_xpu() and use_td is not False)
+
+
 def random_nvfp4(experts: int, n: int, k: int):
     """Packed e2m1 values `[E, N, K / 2]`, e4m3 block scales `[E, N, K / 16]`
     and per-expert global scales `[E]`, for a GEMM output of about unit size
@@ -123,7 +141,9 @@ def dequant_nvfp4(values, scales, global_scale) -> torch.Tensor:
     return pairs.flatten(-2) * block * global_scale
 
 
-def launch(a, values, scales, global_scale, alignment, top_k, config, split_dots):
+def launch(
+    a, values, scales, global_scale, alignment, top_k, config, split_dots, use_td
+):
     """The `[M * top_k, N]` rows of `C`, NaN where the kernel writes none."""
     c = torch.full(
         (a.shape[0], top_k, values.shape[1]),
@@ -148,6 +168,7 @@ def launch(a, values, scales, global_scale, alignment, top_k, config, split_dots
         config,
         compute_type=tl.bfloat16,
         split_dots=split_dots,
+        use_td=use_td,
     )
     return c.view(-1, values.shape[1])
 
@@ -165,14 +186,20 @@ def check_rows(out, a, values, scales, global_scale, ids, a_div, split_dots):
             # Exact bf16 weights: only the fp32 summation order differs.
             torch.testing.assert_close(out[rows].float(), ref, atol=1e-3, rtol=2**-8)
         else:
-            # Weights times the global scale, rounded to bf16.
-            torch.testing.assert_close(out[rows].float(), ref, atol=1e-2, rtol=2e-2)
+            # Weights times the global scale, rounded to bf16 (2^-9
+            # relative): the error grows with each column's scale.
+            column = ref.abs().amax(0, keepdim=True).clamp_min(1.0)
+            err = (out[rows].float() - ref).abs()
+            assert (err <= 1e-2 * column + 2e-2 * ref.abs()).all(), err.max()
 
 
 CONFIG = {"BLOCK_SIZE_N": 64, "GROUP_SIZE_M": 1, "num_warps": 4, "num_stages": 2}
+# Weight tiles by pointers and (XPU only) through a tensor descriptor.
+USE_TD = [False, True] if current_platform.is_xpu() else [None]
 
 
 @requires_gpu
+@pytest.mark.parametrize("use_td", USE_TD)
 @pytest.mark.parametrize("split_dots", [True, False])
 @pytest.mark.parametrize("a_div", [1, 8])
 @pytest.mark.parametrize(
@@ -186,7 +213,9 @@ CONFIG = {"BLOCK_SIZE_N": 64, "GROUP_SIZE_M": 1, "num_warps": 4, "num_stages": 2
         (4608, 4608, 32, 64),
     ],
 )
-def test_kernel_matches_dequantized_matmul(n, k, block_m, block_k, a_div, split_dots):
+def test_kernel_matches_dequantized_matmul(
+    n, k, block_m, block_k, a_div, split_dots, use_td
+):
     """Both K-loop paths over rows of several row blocks per expert, of a
     one-row expert, of empty experts and of -1 slots (left unwritten)."""
     torch.manual_seed(0)
@@ -201,7 +230,9 @@ def test_kernel_matches_dequantized_matmul(n, k, block_m, block_k, a_div, split_
         ids, block_m, experts, ignore_invalid_experts=True
     )[:3]
     config = {**CONFIG, "BLOCK_SIZE_M": block_m, "BLOCK_SIZE_K": block_k}
-    out = launch(a, values, scales, global_scale, alignment, a_div, config, split_dots)
+    out = launch(
+        a, values, scales, global_scale, alignment, a_div, config, split_dots, use_td
+    )
     check_rows(out, a, values, scales, global_scale, ids, a_div, split_dots)
 
 
@@ -229,9 +260,10 @@ def test_block_scale_decode_matches_torch():
 
 
 @requires_gpu
+@pytest.mark.parametrize("use_td", USE_TD)
 @pytest.mark.parametrize("split_dots", [True, False])
 @pytest.mark.parametrize("n,k,block_m", [(2304, 1152, 16), (4608, 4608, 32)])
-def test_kernel_every_finite_scale_code(n, k, block_m, split_dots):
+def test_kernel_every_finite_scale_code(n, k, block_m, split_dots, use_td):
     """Block scales of every finite e4m3 code (subnormal, the largest,
     negative and zero), one code per output column."""
     torch.manual_seed(0)
@@ -246,7 +278,9 @@ def test_kernel_every_finite_scale_code(n, k, block_m, split_dots):
     a = torch.randn(tokens * top_k, k, device=DEVICE).bfloat16()
     alignment = moe_align_block_size(ids, block_m, experts)[:3]
     config = {**CONFIG, "BLOCK_SIZE_M": block_m, "BLOCK_SIZE_K": 128}
-    out = launch(a, values, scales, global_scale, alignment, 1, config, split_dots)
+    out = launch(
+        a, values, scales, global_scale, alignment, 1, config, split_dots, use_td
+    )
     check_rows(out, a, values, scales, global_scale, ids, 1, split_dots)
 
 
