@@ -1,8 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Host-side platform predicates of the Inkling2 kernels."""
+"""Host-side platform predicates of the Inkling2 kernels.
+
+Each names one capability, so that the shared code takes the CUDA fast
+paths of `nvidia/` exactly where they ran before and the portable Triton
+paths everywhere else (e.g. XPU).
+"""
 
 import functools
+from collections.abc import Mapping
+from types import MappingProxyType
 
 
 @functools.cache
@@ -18,11 +25,25 @@ def use_sm100_kernels() -> bool:
 @functools.cache
 def use_pdl() -> bool:
     """Whether the Triton kernels use programmatic dependent launch
-    (griddepcontrol) and TMA descriptors, both SM90+. Ampere and Ada (SM8x)
-    run the same kernels without them, and Humming experts like Hopper."""
+    (griddepcontrol) and TMA descriptors, both SM90+ (named and defined as in
+    vllm-project/vllm#69165). ROCm reports its gfx capability (gfx942 is
+    9.4), so it launches as before the portable paths. XPU reports no device
+    capability: there the kernels run stream ordered."""
     from vllm.platforms import current_platform
 
     return current_platform.has_device_capability(90)
+
+
+@functools.cache
+def pdl_launch_kwargs() -> Mapping[str, bool]:
+    """Launch options of the PDL kernels: `launch_pdl=use_pdl()` (CUDA and
+    ROCm, as before the portable paths), none on XPU, whose Triton rejects
+    the option even when it is False."""
+    from vllm.platforms import current_platform
+
+    if current_platform.is_xpu():
+        return MappingProxyType({})
+    return MappingProxyType({"launch_pdl": use_pdl()})
 
 
 @functools.cache
