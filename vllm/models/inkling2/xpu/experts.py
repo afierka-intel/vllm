@@ -187,11 +187,34 @@ class XpuNvfp4Experts:
         )
 
 
+def mxfp8_experts_supported() -> bool:
+    """Whether `XpuMxfp8Experts` runs on the current device: where
+    `XpuFusedMoe` picks the `xe_2` grouped GEMM (Xe2 / Xe3, e.g. Arc Pro
+    B60 / B70), which takes bf16 activations with e4m3 weights. Its `xe_3`
+    GEMM picks the weight layout from the activation dtype, so bf16
+    activations would read the e4m3 weights as bf16; upstream `XPUExperts`
+    quantizes the activations there. That W8A8 path is not implemented
+    here."""
+    from vllm_xpu_kernels.fused_moe_interface import _uses_xe2_grouped_gemm
+
+    device = torch.device("xpu", torch.xpu.current_device())
+    return _uses_xe2_grouped_gemm(torch.empty(0, device=device))
+
+
 def xpu_flat_experts(
     quant_format: QuantFormat, topk: int, gate_cap: float, up_cap: float
 ) -> Callable[..., FlatExperts]:
-    """The XPU `FlatExperts` constructor of `quant_format` experts."""
+    """The XPU `FlatExperts` constructor of `quant_format` experts. Raises
+    `NotImplementedError` for MXFP8 on devices without the `xe_2` grouped
+    GEMM (`mxfp8_experts_supported`)."""
     if quant_format == "mxfp8":
+        if not mxfp8_experts_supported():
+            raise NotImplementedError(
+                "Inkling2 MXFP8 routed experts on XPU run the xe_2 grouped "
+                "GEMM of vllm-xpu-kernels (Xe2 / Xe3 devices, e.g. Arc Pro "
+                "B60 / B70); this device (or FORCE_XE3P_KERNEL) selects the "
+                "xe_3 GEMM, which needs quantized activations"
+            )
         cls: type = XpuMxfp8Experts
     else:
         cls = XpuNvfp4Experts
