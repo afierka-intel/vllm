@@ -28,6 +28,20 @@ requires_triton_attention = pytest.mark.skipif(
     not (_cuda_attention or current_platform.is_xpu()),
     reason="Inkling2 attention requires Ampere or newer, or XPU",
 )
+requires_xpu_td = pytest.mark.skipif(
+    not current_platform.is_xpu(),
+    reason="Inkling 2 TD paths are XPU-only; Hopper TMA pipeliner cannot "
+    "predicate tensormap_create in this kernel",
+)
+# (KV page, tile): on XPU each tile of the autotuned rel_attention launch,
+# pinned in turn (the path XPU ships), at the XPU default page 64 (K/V
+# descriptors with TD on) and the first tile at page 16; elsewhere the fixed
+# launch config.
+REL_ATTENTION_PAGE_TILES = (
+    [(64, 0), (64, 1), (64, 2), (64, 3), (16, 0)]
+    if current_platform.is_xpu()
+    else [(16, None)]
+)
 
 HEAD_DIM = 128
 REL_EXTENT = 1024
@@ -129,11 +143,15 @@ def test_e4m3_kv_load_preserves_all_byte_values_and_masks():
 @pytest.mark.parametrize("cache_dtype", [torch.float16, *FP8_KV_DTYPES])
 @pytest.mark.parametrize("query_len,splits", [(37, 1), (1, 1), (1, 3), (8, 1), (8, 3)])
 @pytest.mark.parametrize("window", [0, 1024])
+@pytest.mark.parametrize("page,tile", REL_ATTENTION_PAGE_TILES)
 @torch.inference_mode()
 def test_portable_attention_dequantizes_kv_before_mma(
-    cache_dtype, query_len, splits, window
+    cache_dtype, query_len, splits, window, page, tile, monkeypatch
 ):
-    """Stored FP16/FP8 values match explicit BF16 dequantization in all phases."""
+    """Stored FP16/FP8 values match explicit BF16 dequantization in all
+    phases, on the shipped launch path (autotuned on XPU, with one tuned tile
+    pinned for both cache dtypes: the autotuner keys on the dtype)."""
+    from vllm.models.inkling2.common.ops import attention_sm90 as ops
     from vllm.models.inkling2.common.ops.attention_sm90 import (
         MODE_OUT_LSE,
         MODE_PARTIAL,
@@ -141,14 +159,25 @@ def test_portable_attention_dequantizes_kv_before_mma(
     )
 
     torch.manual_seed(42)
-    heads, kv_heads, page, dim = 24, 8, 16, 128
+    heads, kv_heads, dim = 24, 8, 128
+    num_pages = 80 * 16 // page
     q = torch.randn(query_len, heads, dim, device=DEVICE).bfloat16()
-    kv = torch.randn(80, page, kv_heads, 2 * dim, device=DEVICE).to(cache_dtype)
-    table = torch.randperm(80, device=DEVICE).view(1, -1).int()
+    kv = torch.randn(num_pages, page, kv_heads, 2 * dim, device=DEVICE).to(cache_dtype)
+    table = torch.randperm(num_pages, device=DEVICE).view(1, -1).int()
     lengths = torch.tensor([1200], device=DEVICE, dtype=torch.int32)
     cu = torch.tensor([0, query_len], device=DEVICE, dtype=torch.int32)
     rel = torch.randn(query_len, heads, 1024, device=DEVICE).bfloat16()
     sheared = shear_rel_logits(rel, [(query_len, 1200)], 128, bool(window))
+    if tile is not None:
+        assert ops.use_kernel_autotune()
+        k, v = kv.split(dim, dim=-1)
+        block_m = ops._block_m(query_len, heads // kv_heads)
+        tuner = ops._rel_attention_tuner(block_m)
+        config = tuner.configs[tile]
+        if ops.use_kv_descriptors(k, v, block_m) and page % config.kwargs["BLOCK_N"]:
+            pytest.skip("the key tile spans two pages: pruned with TD")
+        # A one-config tuner launches it without benchmarking.
+        monkeypatch.setattr(tuner, "configs", [config])
 
     def run(cache):
         if splits == 1:
@@ -180,6 +209,88 @@ def test_portable_attention_dequantizes_kv_before_mma(
     expected = run(kv.bfloat16())
     for observed, reference in zip(actual, expected):
         torch.testing.assert_close(observed, reference, atol=0, rtol=0)
+
+
+@requires_xpu_td
+@pytest.mark.parametrize("heads", [24, 48])
+@pytest.mark.parametrize(
+    "query_len,splits,page", [(300, 1, 64), (300, 1, 128), (1, 1, 128), (1, 5, 128)]
+)
+@pytest.mark.parametrize("window", [0, 1024])
+@torch.inference_mode()
+def test_rel_attention_descriptor_path_matches_pointer_path(
+    heads, query_len, splits, page, window, monkeypatch
+):
+    """The per-page tensor-descriptor K/V loads agree with the pointer path
+    to fp32 rounding at the same tile config (the dot operands come from
+    different layouts), including a partial last page of stale NaNs."""
+    from vllm.models.inkling2.common.ops import attention_sm90 as ops
+
+    monkeypatch.setattr(ops, "use_kernel_autotune", lambda: False)
+    torch.manual_seed(0)
+    kv_heads, dim, kv_len = 8, 128, 1900
+    num_pages = -(-kv_len // page) + 2
+    q = torch.randn(query_len, heads, dim, device=DEVICE).bfloat16()
+    kv = torch.randn(num_pages, page, kv_heads, 2 * dim, device=DEVICE).bfloat16()
+    table = torch.randperm(num_pages, device=DEVICE)[: num_pages - 2].view(1, -1)
+    # Slots past the sequence end hold stale values.
+    last = table[0, -1]
+    kv[last, kv_len % page :] = float("nan")
+    lengths = torch.tensor([kv_len], device=DEVICE, dtype=torch.int32)
+    cu = torch.tensor([0, query_len], device=DEVICE, dtype=torch.int32)
+    rel = torch.randn(query_len, heads, 1024, device=DEVICE).bfloat16()
+    sheared = shear_rel_logits(rel, [(query_len, kv_len)], 128, bool(window))
+    k, v = kv.split(dim, dim=-1)
+    block_m = ops._block_m(query_len, heads // kv_heads)
+    assert ops.use_kv_descriptors(k, v, block_m, True)
+
+    def run(use_td):
+        if splits == 1:
+            out = torch.empty_like(q, dtype=torch.float32)
+            lse = torch.empty(heads, query_len, device=DEVICE)
+        else:
+            out = torch.empty(splits, *q.shape, device=DEVICE)
+            lse = torch.empty(splits, query_len, heads, device=DEVICE)
+        ops.rel_attention(
+            q,
+            k,
+            v,
+            out,
+            lse,
+            sheared,
+            block_table=table.int(),
+            cache_seqlens=lengths,
+            cu_seqlens_q=cu,
+            max_query_len=query_len,
+            softmax_scale=dim**-0.5,
+            window=window,
+            num_splits=splits,
+            mode=ops.MODE_OUT_LSE if splits == 1 else ops.MODE_PARTIAL,
+            use_td=use_td,
+        )
+        return out, lse
+
+    for observed, reference in zip(run(True), run(False)):
+        assert not observed.isnan().any()
+        torch.testing.assert_close(observed, reference, atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.skipif(
+    current_platform.is_xpu() or not torch.cuda.is_available(),
+    reason="the TD gate off XPU",
+)
+def test_rel_attention_descriptors_stay_off_on_cuda(monkeypatch):
+    """`VLLM_TRITON_USE_TD=1` (or `use_td=True`) leaves CUDA on the pointer
+    path: the Hopper pipeliner cannot predicate the per-page descriptors'
+    `tensormap_create`."""
+    from vllm.models.inkling2.common.ops import attention_sm90 as ops
+
+    monkeypatch.setenv("VLLM_TRITON_USE_TD", "1")
+    kv = torch.zeros(4, 128, 8, 256, device=DEVICE).bfloat16()
+    k, v = kv.split(128, dim=-1)
+    for block_m in (16, 128):
+        assert not ops.use_kv_descriptors(k, v, block_m)
+        assert not ops.use_kv_descriptors(k, v, block_m, True)
 
 
 @requires_triton_attention

@@ -50,6 +50,34 @@ def pdl_launch_kwargs() -> Mapping[str, bool]:
 
 
 @functools.cache
+def use_kernel_autotune() -> bool:
+    """Whether the portable Triton kernels autotune their tiles: XPU, unless
+    `VLLM_BATCH_INVARIANT` is set. A timing-based pick can differ from run
+    to run, so that mode runs the fixed launch configs, as CUDA always does
+    (the configs chosen for Hopper and Blackwell, so CUDA's launches are
+    unchanged). This gives run-to-run determinism; where a fixed config
+    itself depends on the batch (e.g. the decode split count), the result
+    still depends on the batch."""
+    from vllm import envs
+    from vllm.platforms import current_platform
+
+    return current_platform.is_xpu() and not envs.VLLM_BATCH_INVARIANT
+
+
+def use_kernel_td(use_td: bool | None = None) -> bool:
+    """Whether the portable Triton kernels take their tensor-descriptor
+    paths: on the autotuned launch path (XPU, not under
+    `VLLM_BATCH_INVARIANT`), where `use_tensor_descriptor(use_td)` holds
+    (`VLLM_TRITON_USE_TD`, default on for XPU). Under
+    `VLLM_BATCH_INVARIANT` every kernel runs its fixed pointer launch, as
+    before the TD paths; CUDA never takes them (the per-page and per-token
+    descriptors are not validated there)."""
+    from vllm.triton_utils import use_tensor_descriptor
+
+    return use_kernel_autotune() and use_tensor_descriptor(use_td)
+
+
+@functools.cache
 def use_native_conv_mix() -> bool:
     """Whether the csrc/inkling2 conv/mix kernels run here: they are built
     for Hopper and SM10x only."""
