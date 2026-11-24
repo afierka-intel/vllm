@@ -60,9 +60,59 @@ def rms_norm(
 
 
 @triton.jit
-def _l2_clip(X, Scale, heads, cols, mask, threshold, eps, tau, HAS_TAU):
-    x = tl.load(X + heads * cols.shape[1] + cols, mask, other=0).to(tl.float32)
-    x = x * tl.load(Scale + heads * cols.shape[1] + cols, mask, other=0).to(tl.float32)
+def _load_heads_td(X, H, BLOCK_H: tl.constexpr, D: tl.constexpr):
+    """`[BLOCK_H, D]` rows of the `[H, D]` matrix at `X`; heads past `H`
+    read 0."""
+    desc = tl.make_tensor_descriptor(
+        X, shape=[H, D], strides=[D, 1], block_shape=[BLOCK_H, D]
+    )
+    return desc.load([0, 0])
+
+
+@triton.jit
+def _store_heads_td(X, value, H, W, col, BLOCK_H: tl.constexpr, BC: tl.constexpr):
+    """Store `[BLOCK_H, BC]` at column `col` of the `[H, W]` matrix at `X`;
+    heads past `H` are dropped."""
+    desc = tl.make_tensor_descriptor(
+        X, shape=[H, W], strides=[W, 1], block_shape=[BLOCK_H, BC]
+    )
+    desc.store([0, col], value.to(X.dtype.element_ty))
+
+
+@triton.jit
+def _load_proj_td(table, rows, W, row, col, D_REL: tl.constexpr, BC: tl.constexpr):
+    """`[D_REL, BC]` tile at `(row, col)` of the `[rows, W]` shifted
+    relative-projection table."""
+    desc = tl.make_tensor_descriptor(
+        table, shape=[rows, W], strides=[W, 1], block_shape=[D_REL, BC]
+    )
+    return desc.load([row.to(tl.int32), col.to(tl.int32)])
+
+
+@triton.jit
+def _l2_clip(
+    X,
+    Scale,
+    heads,
+    cols,
+    mask,
+    threshold,
+    eps,
+    tau,
+    HAS_TAU,
+    USE_TD: tl.constexpr = False,
+    H=0,
+):
+    if USE_TD:
+        BLOCK_H: tl.constexpr = heads.shape[0]
+        D: tl.constexpr = cols.shape[1]
+        x = _load_heads_td(X, H, BLOCK_H, D).to(tl.float32)
+        x = x * _load_heads_td(Scale, H, BLOCK_H, D).to(tl.float32)
+    else:
+        x = tl.load(X + heads * cols.shape[1] + cols, mask, other=0).to(tl.float32)
+        x = x * tl.load(Scale + heads * cols.shape[1] + cols, mask, other=0).to(
+            tl.float32
+        )
     sum_sq = tl.sum(x * x, axis=1)
     norm = tl.where(sum_sq > 0, sum_sq * rsqrt(sum_sq), 0.0)
     y = x * tl.minimum(tl.div_rn(threshold, norm + eps), 1.0)[:, None]
@@ -101,6 +151,7 @@ def qr_clip_rel_tokens(
     HAS_TAU: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_E: tl.constexpr,
+    USE_TD: tl.constexpr = False,
 ):
     """For tokens `[t0, t0 + num_t)`: per-head L2 clipping of `q * q_scale`
     (`chunk < 0`) or of `r * r_scale` and the `BLOCK_E` columns `chunk`
@@ -112,7 +163,11 @@ def qr_clip_rel_tokens(
     128-token query tiles: `E + 256` columns per head, column `c` holding
     key `c + (n_block_max - 10) * 128`, where `n_block_max` bounds the key
     blocks of the token's tile, plus the table's padding (keys right of the
-    diagonal, and for window layers those past the extent, are -inf)."""
+    diagonal, and for window layers those past the extent, are -inf).
+
+    With `USE_TD`, q, its scale, the q output, the `[D_REL, BLOCK_E]` table
+    tile and the logits go through tensor descriptors (r rows of `D_REL`
+    values are narrower than a 2D block)."""
     E_PAD: tl.constexpr = E + 256
     heads = tl.arange(0, BLOCK_H)[:, None]
     h_mask = heads < H
@@ -133,8 +188,13 @@ def qr_clip_rel_tokens(
                 eps,
                 tau,
                 HAS_TAU,
+                USE_TD,
+                H,
             )
-            tl.store(QOut + t * H * D + heads * D + q_cols, q, h_mask)
+            if USE_TD:
+                _store_heads_td(QOut + t * H * D, q, H, D, 0, BLOCK_H, D)
+            else:
+                tl.store(QOut + t * H * D + heads * D + q_cols, q, h_mask)
         elif t < T:
             seq = tl.load(SeqIdx + t)
             q_start = tl.load(CuSeqlensQ + seq)
@@ -164,11 +224,33 @@ def qr_clip_rel_tokens(
             diag8 = diag // 8 * 8
             table = RelProj + (diag - diag8) * (D_REL + 1) * W + E + 256 - diag8
             col = chunk * BLOCK_E + e_idx
-            proj = tl.load(table + tl.trans(r_cols) * W + col)
+            if USE_TD:
+                proj = _load_proj_td(
+                    RelProj,
+                    8 * (D_REL + 1),
+                    W,
+                    (diag - diag8) * (D_REL + 1),
+                    E + 256 - diag8 + chunk * BLOCK_E,
+                    D_REL,
+                    BLOCK_E,
+                )
+            else:
+                proj = tl.load(table + tl.trans(r_cols) * W + col)
             pad = tl.load(table + D_REL * W + col)
             rel = tl.dot(r, proj) + pad.to(tl.float32)
-            tl.store(
-                RelOut + t * H * E_PAD + heads * E_PAD + col,
-                rel.to(RelOut.dtype.element_ty),
-                h_mask,
-            )
+            if USE_TD:
+                _store_heads_td(
+                    RelOut + t * H * E_PAD,
+                    rel,
+                    H,
+                    E_PAD,
+                    chunk * BLOCK_E,
+                    BLOCK_H,
+                    BLOCK_E,
+                )
+            else:
+                tl.store(
+                    RelOut + t * H * E_PAD + heads * E_PAD + col,
+                    rel.to(RelOut.dtype.element_ty),
+                    h_mask,
+                )
