@@ -15,8 +15,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import vllm.models.inkling2.common.ops.attention as attention_ops
 import vllm.models.inkling2.common.ops.attention_sm90 as rel_attention_ops
 import vllm.models.inkling2.common.ops.linear as linear_ops
+import vllm.models.inkling2.common.ops.moe as moe_ops
 import vllm.models.inkling2.common.ops.sconv as sconv_ops
 from tests.models.inkling2 import test_attention, test_core_ops
 from tests.models.inkling2.utils import DEVICE
@@ -33,6 +35,11 @@ def _tuners():
             sconv_ops._sconv_kernel_tuned(b, prefill)
             for b, _ in sconv_ops._SCONV_BUCKETS
             for prefill in (False, True)
+        ),
+        *(moe_ops._select_kernel_tuned(small) for small in (False, True)),
+        *(
+            attention_ops._rel_decode_combine_kernel_tuned(large, many)
+            for large, many in ((False, False), (True, False), (True, True))
         ),
     ]
 
@@ -79,6 +86,29 @@ FIXED_FIRST = [
             2,
         )
         for b in (256, 1 << 62)
+    ),
+    # _select_kernel, up to 256 tokens / more (XPU default 2 stages).
+    (lambda: moe_ops._select_kernel_tuned(True), {}, 4, 2),
+    (lambda: moe_ops._select_kernel_tuned(False), {}, 1, 2),
+    # _rel_decode_combine_kernel: small batches, large with <= 32 / more
+    # splits.
+    (
+        lambda: attention_ops._rel_decode_combine_kernel_tuned(False, False),
+        {"BLOCK_D": 32},
+        4,
+        2,
+    ),
+    (
+        lambda: attention_ops._rel_decode_combine_kernel_tuned(True, False),
+        {"BLOCK_D": 128},
+        1,
+        2,
+    ),
+    (
+        lambda: attention_ops._rel_decode_combine_kernel_tuned(True, True),
+        {"BLOCK_D": 128},
+        2,
+        2,
     ),
 ]
 

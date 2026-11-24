@@ -8,15 +8,18 @@ order of the expert GEMMs over checkpoint-layout weights; the routing
 helpers are shared with the fused routing kernels of `nvidia/ops/moe.py`.
 """
 
+import functools
+
 import torch
 
 from vllm.models.inkling2.nvidia.ops.seq_parallel import HALO_ROWS, SeqParallel
 from vllm.triton_utils import tl, tldevice, triton
 
 from .activation import _situ
+from .autotune import autotune
 from .linear import k_group_partials
 from .pdl import gdc_launch_dependents, gdc_wait
-from .platform import pdl_launch_kwargs
+from .platform import pdl_launch_kwargs, use_kernel_autotune
 
 # Up to this many tokens, kernels let the next kernel launch (and wait) as soon
 # as they start, which hides its launch; with more, its waiting programs would
@@ -259,6 +262,9 @@ def _select_kernel(
     GROUPS: tl.constexpr,
     TOPK: tl.constexpr,
     SORT: tl.constexpr,
+    # Batch class of the autotuned launch (unused in the body): an autotune
+    # key, so that the two tuners never share tuned warps.
+    SMALL: tl.constexpr = False,
 ):
     """Local expert ids (-1: not local), routing weights and identity
     `src2dst` of the flat rows of one token."""
@@ -301,7 +307,10 @@ def select_experts(
     ids = torch.empty((tokens, topk), dtype=torch.int32, device=x.device)
     weights = torch.empty(tokens * topk, dtype=torch.float32, device=x.device)
     src2dst = torch.empty(tokens * topk, dtype=torch.int32, device=x.device)
-    _select_kernel[(tokens,)](
+    tuned = use_kernel_autotune()
+    small = tokens <= 256
+    kernel = _select_kernel_tuned(small) if tuned else _select_kernel
+    kernel[(tokens,)](
         partials,
         bias,
         expert_bounds,
@@ -316,9 +325,28 @@ def select_experts(
         GROUPS=partials.shape[0],
         TOPK=topk,
         SORT=tokens <= 128,
-        num_warps=4 if tokens <= 256 else 1,
+        **(dict(SMALL=small) if tuned else {"num_warps": 4 if small else 1}),
     )
     return ids, weights, src2dst
+
+
+@functools.cache
+def _select_kernel_tuned(small: bool):
+    """`_select_kernel` with its warps autotuned on XPU, for up to 256
+    tokens (`small`) or more; the fixed 4 / 1 first
+    (VLLM_TRITON_FORCE_FIRST_CONFIG). `SMALL` in the key keeps the two
+    tuners apart, also in Triton's on-disk autotuning cache."""
+    warps = (4, 2, 8) if small else (1, 2, 4)
+    # The fixed launch passes no num_stages: XPU's default, 2.
+    return autotune(
+        configs=[
+            triton.Config({}, num_warps=w, num_stages=2)
+            if i == 0
+            else triton.Config({}, num_warps=w)
+            for i, w in enumerate(warps)
+        ],
+        key=["E", "GROUPS", "TOPK", "SORT", "SMALL"],
+    )(_select_kernel)
 
 
 @triton.jit
