@@ -4,11 +4,13 @@
 `common.moe.flat_experts_class`.
 
 MXFP8 runs the SYCL grouped-GEMM fused MoE of vllm-xpu-kernels
-(`XpuFusedMoe`) on bf16 activations (W8A16, as Humming on Hopper). It takes
-`[gate | up]` halves where the checkpoint interleaves the `w13` rows, and
-applies the routing weight to the down-projection rows in fp32 while
-combining them (`combines`), where Hopper scales the SiTU output before the
-down projection and rounds it to bf16.
+(`XpuFusedMoe`), with the activation decision of upstream `XPUExperts`:
+bf16 activations (W8A16, as Humming on Hopper) on Xe2 / Xe3 devices,
+MXFP8-quantized ones elsewhere. It takes `[gate | up]` halves where the
+checkpoint interleaves the `w13` rows, and applies the routing weight to
+the down-projection rows in fp32 while combining them (`combines`), where
+Hopper scales the SiTU output before the down projection and rounds it to
+bf16.
 
 NVFP4 runs Hopper's flow with the vendor-neutral NVFP4 emulation MoE Triton
 kernel (`fused_moe/experts/nvfp4_emulation_moe.py`) in W4A16 form (bf16
@@ -34,6 +36,7 @@ from vllm.model_executor.layers.fused_moe.fused_moe import (
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     moe_align_block_size,
 )
+from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 from vllm.models.inkling2.common.moe import FlatExperts, QuantFormat
 from vllm.models.inkling2.common.ops.moe import swiglu
 from vllm.triton_utils import tl
@@ -66,8 +69,43 @@ def _situ_activation(gate_cap: float, up_cap: float) -> dict:
     )
 
 
+def _is_xe2_or_xe3() -> bool:
+    """The device test of upstream `XPUExperts.__init__`
+    (`fused_moe/experts/xpu_moe.py:64`)."""
+    return bool(torch.ops._xpu_C.is_xe2_arch() or torch.ops._xpu_C.is_xe3_arch())
+
+
+def mxfp8_quantizes_activations() -> bool:
+    """Whether the MXFP8 experts feed `XpuFusedMoe` MXFP8-quantized
+    activations: exactly upstream `XPUExperts`' decision
+    (`fused_moe/experts/xpu_moe.py:64-69`, `expects_unquantized_inputs =
+    is_xe2_arch() or is_xe3_arch()`), i.e. on devices that are neither Xe2
+    nor Xe3, whose `XpuFusedMoe` runs the xe_3 grouped GEMM. Like upstream
+    it does not read `FORCE_XE3P_KERNEL`."""
+    return not _is_xe2_or_xe3()
+
+
+def quantize_mxfp8_activations(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """MXFP8 activations as the modular kernel's prepare step makes them for
+    `XPUExperts` (`prepare_finalize/no_dp_ep.py:_quantize_input` with a
+    dynamic MXFP8 quant config): `moe_kernel_quantize_input(...,
+    quant_dtype="mxfp8")`, on XPU `xpu_mxfp8_quantize`: e4m3 values and e8m0
+    scales `[T, H / 32]`."""
+    return moe_kernel_quantize_input(
+        A=x, A_scale=None, quant_dtype="mxfp8", per_act_token_quant=False
+    )
+
+
 class XpuMxfp8Experts:
     """MXFP8 experts on the SYCL fused MoE (`XpuFusedMoe`).
+
+    `XpuFusedMoe` is called directly (precedent: `qwen3_5/xpu/model.py`),
+    with the activation decision (`mxfp8_quantizes_activations`) and the
+    activation quantization (`quantize_mxfp8_activations`) of upstream
+    `XPUExperts`, so that a later switch to `XPUExperts` (once it takes the
+    SiTU, vllm-project/vllm#49598) replaces only `__init__` / `__call__`.
 
     Load-time memory: the de-interleave copies one expert at a time, but
     `XpuFusedMoe` then builds the relayout (`[E, K, N]` on the xe_2 GEMM)
@@ -113,6 +151,7 @@ class XpuMxfp8Experts:
         for (n, k), w, s in zip(shapes, (w13, w2), (w13_scale, w2_scale)):
             assert w.shape[1:] == (n, k) and s.shape[1:] == (n, k // 32)
             assert w.dtype == torch.float8_e4m3fn and s.dtype == torch.uint8
+        self.quantize_activations = mxfp8_quantizes_activations()
         deinterleave_rows(w13.data)
         deinterleave_rows(w13_scale.data)
         self.moe = XpuFusedMoe(
@@ -141,7 +180,10 @@ class XpuMxfp8Experts:
         times their fp32 routing `weights`, summed and rounded once."""
         out = torch.empty_like(x)
         if x.shape[0] > 0:
-            self.moe.apply(out, x, weights.view(ids.shape), ids)
+            a, a_scale = x, None
+            if self.quantize_activations:
+                a, a_scale = quantize_mxfp8_activations(x)
+            self.moe.apply(out, a, weights.view(ids.shape), ids, a1q_scale=a_scale)
         return out
 
 
@@ -242,35 +284,9 @@ class XpuNvfp4Experts:
         return self._gemm("w2", activated, 1, alignment, config, split_dots)
 
 
-def mxfp8_experts_supported() -> bool:
-    """Whether `XpuMxfp8Experts` runs on the current device: where
-    `XpuFusedMoe` picks the `xe_2` grouped GEMM (Xe2 / Xe3, e.g. Arc Pro
-    B60 / B70), which takes bf16 activations with e4m3 weights. Its `xe_3`
-    GEMM picks the weight layout from the activation dtype, so bf16
-    activations would read the e4m3 weights as bf16; upstream `XPUExperts`
-    quantizes the activations there. That W8A8 path is not implemented
-    here."""
-    from vllm_xpu_kernels.fused_moe_interface import _uses_xe2_grouped_gemm
-
-    device = torch.device("xpu", torch.xpu.current_device())
-    return _uses_xe2_grouped_gemm(torch.empty(0, device=device))
-
-
 def xpu_flat_experts(
     quant_format: QuantFormat, topk: int, gate_cap: float, up_cap: float
 ) -> Callable[..., FlatExperts]:
-    """The XPU `FlatExperts` constructor of `quant_format` experts. Raises
-    `NotImplementedError` for MXFP8 on devices without the `xe_2` grouped
-    GEMM (`mxfp8_experts_supported`)."""
-    if quant_format == "mxfp8":
-        if not mxfp8_experts_supported():
-            raise NotImplementedError(
-                "Inkling2 MXFP8 routed experts on XPU run the xe_2 grouped "
-                "GEMM of vllm-xpu-kernels (Xe2 / Xe3 devices, e.g. Arc Pro "
-                "B60 / B70); this device (or FORCE_XE3P_KERNEL) selects the "
-                "xe_3 GEMM, which needs quantized activations"
-            )
-        cls: type = XpuMxfp8Experts
-    else:
-        cls = XpuNvfp4Experts
+    """The XPU `FlatExperts` constructor of `quant_format` experts."""
+    cls: type = XpuMxfp8Experts if quant_format == "mxfp8" else XpuNvfp4Experts
     return partial(cls, topk=topk, gate_cap=gate_cap, up_cap=up_cap)

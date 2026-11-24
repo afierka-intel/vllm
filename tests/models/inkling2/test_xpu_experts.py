@@ -5,6 +5,8 @@ the expert shapes of Inkling 2 Mini and Small. The NVFP4 kernel itself
 (`nvfp4_emulation_moe.py`) is tested in
 `tests/kernels/moe/test_nvfp4_emulation_moe.py`."""
 
+import functools
+
 import pytest
 import torch
 
@@ -21,10 +23,13 @@ from vllm.models.inkling2.common.ops import moe as moe_ops  # noqa: E402
 from vllm.models.inkling2.common.ops.linear import linear_k_groups  # noqa: E402
 from vllm.models.inkling2.common.ops.moe import select_experts  # noqa: E402
 from vllm.models.inkling2.configs import Inkling2ModelConfig  # noqa: E402
+from vllm.models.inkling2.xpu import experts as xpu_experts  # noqa: E402
 from vllm.models.inkling2.xpu.experts import (  # noqa: E402
     XpuMxfp8Experts,
     XpuNvfp4Experts,
     deinterleave_rows,
+    mxfp8_quantizes_activations,
+    quantize_mxfp8_activations,
 )
 
 DEVICE = "xpu"
@@ -90,12 +95,24 @@ def dequant(fmt: str, tensors: tuple, expert: int) -> torch.Tensor:
     return dequant_nvfp4(weight[expert], scale[expert]) * global_scale[expert]
 
 
-def reference(fmt, weights, x, ids, gammas, gamma_after_w2: bool):
+def mxfp8_qdq(t: torch.Tensor) -> torch.Tensor:
+    """`t` through the MXFP8 activation quantization of the experts."""
+    values, scales = quantize_mxfp8_activations(t)
+    assert scales is not None
+    exp2 = scales.float().repeat_interleave(32, -1)
+    return (values.float() * exp2).to(t.dtype)
+
+
+def reference(fmt, weights, x, ids, gammas, gamma_after_w2: bool, act_qdq=None):
     """Per-expert fp32 loop over the dequantized checkpoint `weights`: the
     bf16 gate/up GEMM output, SiTU of the interleaved (gate, up) columns and
     a bf16 down projection, with the routing weight before the down
-    projection (rounded to bf16 with the SiTU) or after it (in fp32)."""
+    projection (rounded to bf16 with the SiTU) or after it (in fp32).
+    `act_qdq`: applied to `x` and to the bf16 SiTU output (quantized
+    activations)."""
     out = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
+    if act_qdq is not None:
+        x = act_qdq(x)
     for expert in ids.unique().tolist():
         if expert < 0:
             continue
@@ -111,9 +128,11 @@ def reference(fmt, weights, x, ids, gammas, gamma_after_w2: bool):
             * torch.tanh(up / UP_CAP)
         )
         gamma = gammas.view(ids.shape)[token, slot][:, None]
-        act = act if gamma_after_w2 else act * gamma
+        act = (act if gamma_after_w2 else act * gamma).bfloat16()
+        if act_qdq is not None:
+            act = act_qdq(act)
         w2 = dequant(fmt, weights["w2"], expert)
-        down = (act.bfloat16().float() @ w2.T).bfloat16().float()
+        down = (act.float() @ w2.T).bfloat16().float()
         out.index_add_(0, token, down * gamma if gamma_after_w2 else down)
     return out.bfloat16()
 
@@ -309,6 +328,62 @@ def test_mxfp8_build_memory_peak_is_documented(dist_init):
     extra = torch.xpu.max_memory_allocated() - before
     assert w13_bytes < extra <= 1.05 * layer + 2**20, (extra, layer)
     del experts
+
+
+def test_mxfp8_activation_decision_mirrors_xpu_experts(monkeypatch):
+    """MXFP8 activations are quantized exactly where upstream `XPUExperts`
+    quantizes them (`expects_unquantized_inputs = is_xe2_arch() or
+    is_xe3_arch()`): not on Xe2 / Xe3, whatever `FORCE_XE3P_KERNEL` says."""
+    xpu_ops = torch.ops._xpu_C
+    native = bool(xpu_ops.is_xe2_arch() or xpu_ops.is_xe3_arch())
+    assert mxfp8_quantizes_activations() == (not native)
+    monkeypatch.setenv("FORCE_XE3P_KERNEL", "1")
+    assert mxfp8_quantizes_activations() == (not native)
+    monkeypatch.delenv("FORCE_XE3P_KERNEL")
+    for xe2, xe3 in [(True, False), (False, True), (True, True), (False, False)]:
+        monkeypatch.setattr(xpu_ops, "is_xe2_arch", lambda *a, v=xe2: v)
+        monkeypatch.setattr(xpu_ops, "is_xe3_arch", lambda *a, v=xe3: v)
+        assert mxfp8_quantizes_activations() == (not (xe2 or xe3))
+    # Both formats build on every device.
+    for fmt, cls in (("mxfp8", XpuMxfp8Experts), ("nvfp4", XpuNvfp4Experts)):
+        factory = flat_experts_class(fmt, TOPK, GATE_CAP, UP_CAP)
+        assert isinstance(factory, functools.partial) and factory.func is cls
+
+
+@pytest.mark.parametrize("model", list(SHAPES))
+@pytest.mark.parametrize("tokens", [1, 64, 300])
+def test_xpu_mxfp8_quantized_activations_match_reference(
+    monkeypatch, model: str, tokens: int
+):
+    """The MXFP8 experts with quantized activations (the path of devices
+    that are neither Xe2 nor Xe3, selected here through the device test,
+    not `FORCE_XE3P_KERNEL`, so it runs natively there) vs. the reference
+    with the same MXFP8 QDQ of the w13 and w2 inputs."""
+    monkeypatch.setattr(xpu_experts, "_is_xe2_or_xe3", lambda: False)
+    torch.manual_seed(0)
+    hidden, inter, num_global, num_local = SHAPES[model]
+    weights = random_weights("mxfp8", num_local, hidden, inter)
+    checkpoint = {
+        name: tuple(None if t is None else t.clone() for t in tensors)
+        for name, tensors in weights.items()
+    }
+    experts = flat_experts_class("mxfp8", TOPK, GATE_CAP, UP_CAP)(
+        weights, ((2 * inter, hidden), (hidden, inter)), False
+    )
+    assert isinstance(experts, XpuMxfp8Experts) and experts.quantize_activations
+    rank = 0 if num_local == num_global else 1
+    ids, gammas, src2dst = routing(tokens, num_global, num_local, rank)
+    x = torch.randn(tokens, hidden, device=DEVICE).bfloat16()
+    out = experts(x, ids, gammas, src2dst, num_global, GATE_CAP, UP_CAP)
+    ref = reference("mxfp8", checkpoint, x, ids, gammas, True, act_qdq=mxfp8_qdq)
+    if tokens > 1:
+        assert (out[-1] == 0).all()
+    scale = ref.abs().max().item()
+    assert scale > 0.1
+    # A SiTU output that rounds differently can land on a neighbouring e4m3
+    # code (2^-3 relative) in the w2 input.
+    torch.testing.assert_close(out, ref, atol=3e-2 * scale, rtol=5e-2)
+    assert (out.float() - ref.float()).abs().mean() < 2e-3 * scale
 
 
 @pytest.mark.parametrize("tokens", [5, 300])
