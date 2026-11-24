@@ -20,17 +20,57 @@ Dynamic convolution (newest tap first, per-token per-head tap weights)::
 
 `y` is rounded to the input dtype. The K/V variant then L2-clips K and
 RMS-normalizes V per head and writes both to the paged KV cache.
+
+On XPU with `use_kernel_td()`, the row tiles of the current inputs
+and the residual / addend / output tiles of `short_conv` go through tensor
+descriptors (2D block IO). The paged conv-state accesses (one slot per
+token), the earlier taps and the per-token scalars stay pointer accesses.
+CUDA keeps pointer accesses, whatever `VLLM_TRITON_USE_TD` says. On XPU
+(`use_kernel_autotune`) the `short_conv` tiles and warps are autotuned, with
+the fixed tile first; CUDA keeps the fixed launch configs.
 """
+
+import functools
 
 import torch
 
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import (
+    tensor_descriptor_compatible,
+    tl,
+    triton,
+)
+from vllm.triton_utils.allocation import set_triton_allocator
 
+from .autotune import autotune
 from .e4m3 import cast_store, e4m3_arg
 from .intrinsics import rsqrt
 from .norm import qr_clip_rel_tokens
 from .pdl import gdc_launch_dependents, gdc_wait
-from .platform import pdl_launch_kwargs
+from .platform import pdl_launch_kwargs, use_kernel_autotune, use_kernel_td
+
+
+@triton.jit
+def _load_rows_td(
+    ptr, rows, cols, stride, row0, col0, BR: tl.constexpr, BC: tl.constexpr
+):
+    """`[BR, BC]` tile at `(row0, col0)` of the row-major `[rows, cols]`
+    tensor at `ptr` (row stride `stride`); out-of-range elements read 0."""
+    desc = tl.make_tensor_descriptor(
+        ptr, shape=[rows, cols], strides=[stride, 1], block_shape=[BR, BC]
+    )
+    return desc.load([row0, col0])
+
+
+@triton.jit
+def _store_rows_td(
+    ptr, value, rows, cols, stride, row0, col0, BR: tl.constexpr, BC: tl.constexpr
+):
+    """Store the `[BR, BC]` tile at `(row0, col0)` of `[rows, cols]`;
+    out-of-range elements are dropped."""
+    desc = tl.make_tensor_descriptor(
+        ptr, shape=[rows, cols], strides=[stride, 1], block_shape=[BR, BC]
+    )
+    desc.store([row0, col0], value.to(ptr.dtype.element_ty))
 
 
 @triton.jit
@@ -219,11 +259,18 @@ def _conv(
     SKIP_IDLE_CACHE: tl.constexpr = False,
     CACHE_FIRST: tl.constexpr = False,
     tile_reads_cache=True,
+    USE_TD: tl.constexpr = False,
+    x_rows=0,
+    x_cols=0,
+    row0=0,
+    col0=0,
 ):
     """Store the current inputs to the cache; return `y` in fp32.
 
     With `CACHE_FIRST` (static W=4 conv), the taps from earlier steps are
-    loaded before waiting on the producer of `x` (PDL).
+    loaded before waiting on the producer of `x` (PDL). With `USE_TD`, the
+    current inputs (the tile at `(row0, col0)` of the `[x_rows, x_cols]`
+    `x`) load through a tensor descriptor.
     """
     tc_mask = t_mask[:, None] & c_mask[None, :]
     slot = tl.load(slot_ptr + toff, mask=t_mask, other=-1)
@@ -256,7 +303,19 @@ def _conv(
         gdc_wait()
 
     dtype = cache_ptr.dtype.element_ty
-    cur = tl.load(x_ptr + toff[:, None] * stride_x + coff[None, :], mask=tc_mask)
+    if USE_TD:
+        cur = _load_rows_td(
+            x_ptr,
+            x_rows,
+            x_cols,
+            stride_x,
+            row0,
+            col0,
+            toff.shape[0],
+            coff.shape[0],
+        )
+    else:
+        cur = tl.load(x_ptr + toff[:, None] * stride_x + coff[None, :], mask=tc_mask)
     cur = cur.to(dtype)
     safe_slot = tl.maximum(slot, 0)
     dst = (
@@ -336,6 +395,10 @@ def _sconv_kernel(
     BT: tl.constexpr,
     BLOCK_C: tl.constexpr,
     SKIP_IDLE_CACHE: tl.constexpr,
+    USE_TD: tl.constexpr = False,
+    # Token bucket of the autotuned launch (unused in the body): an autotune
+    # key, so that the buckets never share a tuned tile.
+    BUCKET: tl.constexpr = 0,
 ):
     first = tl.program_id(0) * BT
     tile_reads_cache = True
@@ -379,7 +442,23 @@ def _sconv_kernel(
         SKIP_IDLE_CACHE=SKIP_IDLE_CACHE,
         CACHE_FIRST=not SKIP_IDLE_CACHE,
         tile_reads_cache=tile_reads_cache,
+        USE_TD=USE_TD,
+        x_rows=T,
+        x_cols=C,
+        row0=first,
+        col0=tl.program_id(1) * BLOCK_C,
     ).to(out_ptr.dtype.element_ty)
+    if USE_TD:
+        col0 = tl.program_id(1) * BLOCK_C
+        if HAS_ADDEND:
+            acc = _load_rows_td(addend_ptr, T, C, C, first, col0, BT, BLOCK_C)
+            acc = acc.to(tl.float32)
+            if HAS_RES:
+                res = _load_rows_td(res_ptr, T, C, C, first, col0, BT, BLOCK_C)
+                acc = res.to(tl.float32) + acc
+            y = (acc + y.to(tl.float32)).to(out_ptr.dtype.element_ty)
+        _store_rows_td(out_ptr, y, T, C, C, first, col0, BT, BLOCK_C)
+        return
     offs = toff[:, None] * C + coff[None, :]
     mask = t_mask[:, None] & c_mask[None, :]
     if HAS_ADDEND:
@@ -424,13 +503,7 @@ def short_conv(
     width = weight.shape[1]
     # Prefill tiles skip the cache reads they never need.
     prefill = num_tokens > 256
-    if num_tokens <= 8:
-        block_t, block_c = 1, 1024
-    else:
-        block_t, block_c = (4, 256) if prefill else (2, 512)
-    block_c = min(triton.next_power_of_2(channels), block_c)
-    grid = (triton.cdiv(num_tokens, block_t), triton.cdiv(channels, block_c))
-    _sconv_kernel[grid](
+    args = (
         x,
         cache,
         weight,
@@ -453,20 +526,119 @@ def short_conv(
         block_table.shape[1],
         cache.shape[2],
         (width + 1) ** -0.5,
+    )
+    meta = dict(
         W=width,
         OFF=stream_offset,
         WS=stream_width,
         H=num_heads,
         HAS_RES=residual is not None,
         HAS_ADDEND=addend is not None,
+        SKIP_IDLE_CACHE=prefill,
+        enable_fp_fusion=False,
+    )
+    if use_kernel_autotune():
+        use_td = use_kernel_td() and tensor_descriptor_compatible(
+            x, out, addend, residual
+        )
+        if use_td:
+            # On every launch: Triton's allocator is a per-thread ContextVar.
+            set_triton_allocator(x.device)
+
+        def tuned_grid(meta):
+            return (
+                triton.cdiv(num_tokens, meta["BT"]),
+                triton.cdiv(channels, meta["BLOCK_C"]),
+            )
+
+        bucket = _sconv_bucket(num_tokens)
+        _sconv_kernel_tuned(bucket, prefill)[tuned_grid](
+            *args, **meta, USE_TD=use_td, BUCKET=bucket
+        )
+        return out
+    block_t, block_c, _ = _sconv_fixed_tile(num_tokens, prefill)
+    block_c = min(triton.next_power_of_2(channels), block_c)
+    grid = (triton.cdiv(num_tokens, block_t), triton.cdiv(channels, block_c))
+    _sconv_kernel[grid](
+        *args,
+        **meta,
         BT=block_t,
         BLOCK_C=block_c,
-        SKIP_IDLE_CACHE=prefill,
         num_warps=4,
-        enable_fp_fusion=False,
         **pdl_launch_kwargs(),
     )
     return out
+
+
+# Autotuning buckets of `short_conv`: (upper token count, token tiles) for
+# decode, mixed batches and prefill. Each bucket has its own tuner, and the
+# bucket is part of the tuning key, so their tuned tiles stay apart, also in
+# Triton's on-disk autotuning cache. The first config of every bucket
+# (VLLM_TRITON_FORCE_FIRST_CONFIG) is valid at any shape: channel tiles past
+# the channels are masked.
+_SCONV_BUCKETS = ((8, (1, 2)), (256, (1, 2, 4)), (1 << 62, (4, 8)))
+
+# (BT, BLOCK_C, num_warps) autotuned on XPU; includes the fixed tiles.
+_SCONV_TILES = (
+    (1, 1024, 4),
+    (2, 512, 4),
+    (4, 256, 4),
+    (2, 1024, 8),
+    (4, 512, 8),
+    (8, 256, 8),
+)
+
+
+def _sconv_bucket(tokens: int) -> int:
+    return next(b for b, _ in _SCONV_BUCKETS if tokens <= b)
+
+
+def _sconv_fixed_tile(tokens: int, prefill: bool) -> tuple[int, int, int]:
+    """The fixed (BT, BLOCK_C, num_warps) of `short_conv` without
+    autotuning (BLOCK_C is then capped at the channels)."""
+    if tokens <= 8:
+        return 1, 1024, 4
+    return (4, 256, 4) if prefill else (2, 512, 4)
+
+
+def _prune_sconv_tiles(configs, named_args, **kwargs):
+    """Channel tiles up to the channels."""
+    args = {**named_args, **kwargs}
+    channels = triton.next_power_of_2(args["H"] * args["WS"])
+    return [c for c in configs if c.kwargs["BLOCK_C"] <= channels] or configs[:1]
+
+
+@functools.cache
+def _sconv_kernel_tuned(bucket: int, prefill: bool):
+    """`_sconv_kernel` with the tile and warps autotuned per shape and path,
+    for the token counts of `bucket` (prefill or not): its fixed tile
+    first."""
+    rows = dict(_SCONV_BUCKETS)[bucket]
+    fixed = _sconv_fixed_tile(bucket, prefill)
+    tiles = [fixed, *(t for t in _SCONV_TILES if t[0] in rows and t != fixed)]
+    # The fixed launch passes no num_stages: XPU's default, 2. The other
+    # tiles keep `triton.Config`'s default.
+    return autotune(
+        configs=[
+            triton.Config({"BT": bt, "BLOCK_C": bc}, num_warps=w, num_stages=2)
+            if i == 0
+            else triton.Config({"BT": bt, "BLOCK_C": bc}, num_warps=w)
+            for i, (bt, bc, w) in enumerate(tiles)
+        ],
+        key=[
+            "W",
+            "WS",
+            "H",
+            "HAS_RES",
+            "HAS_ADDEND",
+            "SKIP_IDLE_CACHE",
+            "USE_TD",
+            "BUCKET",
+        ],
+        prune_configs_by={"early_config_prune": _prune_sconv_tiles},
+        # The residual may alias the output.
+        restore_value=["out_ptr"],
+    )(_sconv_kernel)
 
 
 # Columns of shift_rel_proj beyond the extent, 256 on either side.
