@@ -24,6 +24,8 @@ from vllm.models.inkling2.common.moe import (  # noqa: E402
     Inkling2MoE,
     flat_experts_class,
 )
+from vllm.models.inkling2.common.ops import moe as moe_ops  # noqa: E402
+from vllm.models.inkling2.common.ops.linear import linear_k_groups  # noqa: E402
 from vllm.models.inkling2.common.ops.moe import select_experts  # noqa: E402
 from vllm.models.inkling2.configs import Inkling2ModelConfig  # noqa: E402
 from vllm.models.inkling2.xpu.experts import (  # noqa: E402
@@ -476,3 +478,31 @@ def test_nvfp4_experts_batch_invariant(monkeypatch, model: str):
     local = ids[0] >= 0
     assert local.any()
     assert torch.equal(alone[:TOPK][local], batch[:TOPK][local])
+
+
+@pytest.mark.parametrize("tokens", [5, 300])
+def test_select_experts_every_tuned_config(tokens: int, monkeypatch):
+    """Each autotuned warp count of the router top-k (small and large
+    batches) gives torch's experts and routing weights."""
+    torch.manual_seed(0)
+    hidden, num_experts, route_scale = 2304, 128, 8.0
+    x = torch.randn(tokens, hidden, device=DEVICE).bfloat16()
+    gate = torch.randn(num_experts, hidden, device=DEVICE).bfloat16() * 0.02
+    bias = torch.randn(num_experts, device=DEVICE) * 0.01
+    bounds = torch.tensor([4, 68], dtype=torch.int32, device=DEVICE)
+    logits = linear_k_groups(x, gate)
+    _, ref_ids = torch.topk(logits.sigmoid() + bias, TOPK, sorted=True)
+    selected = torch.nn.functional.logsigmoid(logits.gather(1, ref_ids))
+    ref_weights = selected.softmax(-1) * route_scale
+    local = (ref_ids >= 4) & (ref_ids < 68)
+    tuner = moe_ops._select_kernel_tuned(tokens <= 256)
+    for config in list(tuner.configs):
+        # A one-config tuner launches it without benchmarking.
+        monkeypatch.setattr(tuner, "configs", [config])
+        ids, weights, src2dst = select_experts(x, gate, bias, TOPK, route_scale, bounds)
+        torch.testing.assert_close(ids.long(), torch.where(local, ref_ids - 4, -1))
+        torch.testing.assert_close(weights.view(tokens, -1), ref_weights)
+        rows = torch.arange(tokens * TOPK, device=DEVICE).view(tokens, -1)
+        torch.testing.assert_close(
+            src2dst.view(tokens, -1).long(), torch.where(local, rows, -1)
+        )
