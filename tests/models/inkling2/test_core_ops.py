@@ -582,6 +582,11 @@ def test_short_conv_chunked_matches_full_sequence(fused_residual, steps):
 )
 @pytest.mark.parametrize("dim", [4608, 2304])
 @pytest.mark.parametrize("with_norm", [True, False])
+# Off CUDA, `conv_mix` is `short_conv` then `attn_res`, i.e. this reference;
+# those two are checked against torch references above.
+@pytest.mark.skipif(
+    not current_platform.is_cuda(), reason="conv_mix CUDA op not built off CUDA"
+)
 def test_conv_mix_matches_conv_then_attn_res(
     num_stack, num_q, with_last, with_residual, dim, with_norm
 ):
