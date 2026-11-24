@@ -79,18 +79,14 @@ def flat_experts_class(
     quant_format: QuantFormat, topk: int, gate_cap: float, up_cap: float
 ) -> Callable[..., FlatExperts]:
     """This platform's `FlatExperts` constructor for `quant_format` experts
-    with `topk` slots per token and the SiTU softcaps of the layer. Raises
-    `NotImplementedError` (at model init) where no kernel serves them."""
-    if current_platform.is_cuda():
-        return HummingExperts
+    with `topk` slots per token and the SiTU softcaps of the layer: the XPU
+    backends (which raise `NotImplementedError` at model init where no
+    kernel serves them) on XPU, Humming elsewhere."""
     if current_platform.is_xpu():
         from vllm.models.inkling2.xpu.experts import xpu_flat_experts
 
         return xpu_flat_experts(quant_format, topk, gate_cap, up_cap)
-    raise NotImplementedError(
-        f"Inkling2 {quant_format.upper()} routed experts have no expert GEMM "
-        f"kernel on {current_platform.device_name}"
-    )
+    return HummingExperts
 
 
 class ExpertsLoRA(Protocol):

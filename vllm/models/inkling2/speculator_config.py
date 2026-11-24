@@ -14,12 +14,11 @@ class Inkling2DSparkSpeculatorConfig(DSparkSpeculatorConfig):
 
     @classmethod
     def adapt_draft_model_config(cls, spec: "SpeculativeConfig") -> None:
-        if not current_platform.is_cuda():
+        if current_platform.is_xpu():
             # The draft (`nvidia/dspark.py`) uses FlashInfer and CUDA kernels.
             raise NotImplementedError(
-                "Inkling2 DSpark speculative decoding is only supported on "
-                f"CUDA, not on {current_platform.device_name}; disable "
-                "--speculative-config"
+                "Inkling2 DSpark speculative decoding is not supported on XPU; "
+                "disable --speculative-config"
             )
         super().adapt_draft_model_config(spec)
         if current_platform.is_device_capability_family(120):

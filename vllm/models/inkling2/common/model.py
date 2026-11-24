@@ -11,8 +11,8 @@ Looped checkpoints (`loop_config`) are `Inkling2LoopModel` (`loop.py`).
 
 The CUDA fast paths (fused all-reduce, sequence parallel, SM12x low-M GEMMs)
 and the CUDA-only features (vision tower, LoRA, DSpark) come from `nvidia/`;
-other platforms (e.g. XPU) run the text model on the portable kernels and
-reject those features at init (`_check_platform_support`).
+XPU runs the text model on the portable kernels and rejects those features
+at init (`_check_platform_support`).
 """
 
 from collections import Counter
@@ -283,8 +283,8 @@ class Inkling2Model(nn.Module):
         if get_tensor_model_parallel_world_size() > 1:
             assert self.normalize_values
             group = get_tp_group().cpu_group
-            # FlashInfer MNNVL buffers and `csrc/inkling2` ops: CUDA only.
-            if current_platform.is_cuda():
+            # FlashInfer MNNVL buffers and `csrc/inkling2` ops: not on XPU.
+            if not current_platform.is_xpu():
                 self.allreduce_workspace = Inkling2AllReduceWorkspace.create(
                     group, config.hidden_size
                 )
@@ -517,10 +517,11 @@ register_lora()
 
 
 def _check_platform_support(vllm_config: VllmConfig, vision: bool) -> None:
-    """Fail at init, not mid-forward, on the features that so far run on
-    CUDA only: the vision tower (FA3 / tml_fa4 attention), LoRA, and the
-    DSpark draft (also rejected when the speculative config is built)."""
-    if current_platform.is_cuda():
+    """On XPU, fail at init, not mid-forward, on the features that run on
+    the CUDA kernels of `nvidia/` only: the vision tower (FA3 / tml_fa4
+    attention), LoRA, and the DSpark draft (also rejected when the
+    speculative config is built). Other platforms are not checked here."""
+    if not current_platform.is_xpu():
         return
     unsupported = []
     if vision:
@@ -535,8 +536,7 @@ def _check_platform_support(vllm_config: VllmConfig, vision: bool) -> None:
         unsupported.append("DSpark speculative decoding")
     if unsupported:
         raise NotImplementedError(
-            f"Inkling2 on {current_platform.device_name} does not support "
-            + "; ".join(unsupported)
+            "Inkling2 on XPU does not support " + "; ".join(unsupported)
         )
 
 
@@ -587,8 +587,7 @@ class Inkling2ForConditionalGeneration(
         config: Inkling2MMConfig = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         assert quant_config is None or isinstance(quant_config, Inkling2QuantConfig)
-        if vllm_config.parallel_config.pipeline_parallel_size != 1:
-            raise NotImplementedError("Inkling2 does not support pipeline parallelism")
+        assert vllm_config.parallel_config.pipeline_parallel_size == 1
         if vllm_config.model_config.enable_prompt_embeds:
             # The reference applies embed_norm to raw input embeddings, which
             # cannot be told apart from already-normalized ones here.
