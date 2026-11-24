@@ -12,13 +12,31 @@ A program owns `BLOCK_M` rows (tokens x GQA group) of one request and KV
 head, and one KV split: split `s` of `S` takes key blocks `s, s + S, ...`
 of the rows' visible range, so a split count that depends only on the batch
 holds for every replay of a CUDA graph.
+
+On XPU with `use_kernel_td()` and 16-bit KV, the K and V tiles load
+through per-page tensor descriptors (2D block loads); a key tile then never
+spans two pages (`PAGE % BLOCK_N == 0`, asserted in the kernel). Q, the
+sheared relative logits and the outputs stay pointer accesses: their rows are
+tokens x GQA group, and the group (3 or 6 for Inkling 2) is not a power of
+two. CUDA always takes the pointer path, whatever `VLLM_TRITON_USE_TD` says:
+the Hopper pipeliner cannot predicate the in-loop `tensormap_create` of the
+per-page descriptors. On XPU (`use_kernel_autotune`) the key tile and warps
+are autotuned, with the fixed launch config first; CUDA keeps the fixed
+launch config.
 """
 
 import torch
 
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import (
+    tensor_descriptor_compatible,
+    tl,
+    triton,
+)
+from vllm.triton_utils.allocation import set_triton_allocator
 
+from .autotune import autotune
 from .e4m3 import _NATIVE_E4M3, _e4m3_f16, e4m3_arg
+from .platform import use_kernel_autotune, use_kernel_td
 
 # The query tile of tml_fa4 that shears the relative logits.
 _SHEAR_TILE = tl.constexpr(128)
@@ -63,6 +81,30 @@ def _load_fp8_kv(ptr, offsets, mask, dtype: tl.constexpr, D: tl.constexpr):
 
 
 @triton.jit
+def _load_kv_tile_td(
+    cache,
+    page,
+    kv_off,
+    offset_in_page,
+    stride_kv_blk,
+    stride_kv_slot,
+    PAGE: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    D: tl.constexpr,
+):
+    """`[BLOCK_N, D]` keys `offset_in_page + [0, BLOCK_N)` of KV-cache page
+    `page` through a descriptor over that page's `[PAGE, D]` slots of one
+    KV head."""
+    desc = tl.make_tensor_descriptor(
+        cache + page * stride_kv_blk + kv_off,
+        shape=[PAGE, D],
+        strides=[stride_kv_slot, 1],
+        block_shape=[BLOCK_N, D],
+    )
+    return desc.load([offset_in_page, 0])
+
+
+@triton.jit
 def _rel_attention_kernel(
     Q,
     K,
@@ -99,9 +141,13 @@ def _rel_attention_kernel(
     WINDOW: tl.constexpr,
     DRAFT: tl.constexpr,
     MODE: tl.constexpr,
+    USE_TD: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
+    if USE_TD:
+        # The per-page descriptors load whole key tiles of one page.
+        tl.static_assert(PAGE % BLOCK_N == 0)
     TOKENS: tl.constexpr = BLOCK_M // G
     E_PAD: tl.constexpr = E + 256
     LOG2E: tl.constexpr = 1.4426950408889634
@@ -160,18 +206,37 @@ def _rel_attention_kernel(
         n = n_lo + split + i * num_splits
         keys = n * BLOCK_N + tl.arange(0, BLOCK_N)
         key_valid = keys < seqlen_k
-        page = tl.load(block_table + keys // PAGE, mask=key_valid, other=0)
-        kv_ptrs = (
-            page.to(tl.int64) * stride_kv_blk + (keys % PAGE) * stride_kv_slot + kv_off
-        )
-        if K.dtype.element_ty.primitive_bitwidth == 8:
-            k = _load_fp8_kv(K, kv_ptrs, key_valid, q.dtype, D).T
+        if USE_TD:
+            # The tile's keys share one page; slots past `seqlen_k` are read
+            # as stored, then masked below.
+            tile_page = tl.load(block_table + n * BLOCK_N // PAGE).to(tl.int64)
+            offset_in_page = n * BLOCK_N % PAGE
+            k = _load_kv_tile_td(
+                K,
+                tile_page,
+                kv_off,
+                offset_in_page,
+                stride_kv_blk,
+                stride_kv_slot,
+                PAGE,
+                BLOCK_N,
+                D,
+            ).T.to(q.dtype)
         else:
-            k = tl.load(
-                K + kv_ptrs[None, :] + offs_d[:, None],
-                mask=key_valid[None, :],
-                other=0.0,
-            ).to(q.dtype)
+            page = tl.load(block_table + keys // PAGE, mask=key_valid, other=0)
+            kv_ptrs = (
+                page.to(tl.int64) * stride_kv_blk
+                + (keys % PAGE) * stride_kv_slot
+                + kv_off
+            )
+            if K.dtype.element_ty.primitive_bitwidth == 8:
+                k = _load_fp8_kv(K, kv_ptrs, key_valid, q.dtype, D).T
+            else:
+                k = tl.load(
+                    K + kv_ptrs[None, :] + offs_d[:, None],
+                    mask=key_valid[None, :],
+                    other=0.0,
+                ).to(q.dtype)
         s = tl.dot(q, k) * qk_scale
         dist = pos[:, None] - keys[None, :]
         visible = (dist >= 0) & key_valid[None, :]
@@ -187,7 +252,21 @@ def _rel_attention_kernel(
         alpha = tl.exp2(m_i - m_safe)
         p = tl.exp2(s - m_safe[:, None])
         l_i = l_i * alpha + tl.sum(p, 1)
-        if V.dtype.element_ty.primitive_bitwidth == 8:
+        if USE_TD:
+            v = _load_kv_tile_td(
+                V,
+                tile_page,
+                kv_off,
+                offset_in_page,
+                stride_kv_blk,
+                stride_kv_slot,
+                PAGE,
+                BLOCK_N,
+                D,
+            ).to(q.dtype)
+            # Stale slots may hold non-finite values, where p is 0.
+            v = tl.where(key_valid[:, None], v, 0.0).to(q.dtype)
+        elif V.dtype.element_ty.primitive_bitwidth == 8:
             v = _load_fp8_kv(V, kv_ptrs, key_valid, q.dtype, D)
         else:
             v = tl.load(
@@ -242,6 +321,80 @@ def _block_m(max_query_len: int, group: int) -> int:
     return 16 if rows <= 16 else 32 if rows <= 32 else 64 if rows <= 64 else 128
 
 
+def _fixed_config(block_m: int) -> dict[str, int]:
+    """The launch config without autotuning (CUDA)."""
+    return dict(
+        BLOCK_N=64 if block_m >= 128 else 128 if block_m <= 32 else 64,
+        num_warps=8 if block_m >= 128 else 4,
+        num_stages=2,
+    )
+
+
+# (BLOCK_N, num_warps) autotuned on XPU, the fixed configs among them.
+_TUNED_TILES = ((128, 4), (64, 4), (64, 8), (128, 8))
+
+
+def _prune_tiles(configs, named_args, **kwargs):
+    """With USE_TD, the key tiles that do not span two pages."""
+    args = {**named_args, **kwargs}
+    if not args["USE_TD"]:
+        return configs
+    return [c for c in configs if args["PAGE"] % c.kwargs["BLOCK_N"] == 0]
+
+
+def _tuned_tiles(block_m: int) -> tuple[tuple[int, int], ...]:
+    """`_TUNED_TILES` with the fixed config of `block_m` first."""
+    fixed = _fixed_config(block_m)
+    first = (fixed["BLOCK_N"], fixed["num_warps"])
+    return (first, *(tile for tile in _TUNED_TILES if tile != first))
+
+
+def _tuned_kernel(tiles: tuple[tuple[int, int], ...]):
+    # The same kernel with the key tile and warps autotuned per shape and
+    # path. A launch only writes its outputs, so the tuning runs leave no
+    # trace.
+    return autotune(
+        configs=[
+            triton.Config({"BLOCK_N": n}, num_warps=w, num_stages=2) for n, w in tiles
+        ],
+        key=["G", "D", "PAGE", "WINDOW", "DRAFT", "MODE", "USE_TD", "BLOCK_M"],
+        prune_configs_by={"early_config_prune": _prune_tiles},
+    )(_rel_attention_kernel)
+
+
+# One autotuner per fixed config (decode BLOCK_M <= 32, 33-127, prefill 128),
+# each listing that fixed config first.
+_rel_attention_kernel_tuned = {
+    tiles[0]: _tuned_kernel(tiles)
+    for tiles in (_tuned_tiles(16), _tuned_tiles(64), _tuned_tiles(128))
+}
+
+
+def _rel_attention_tuner(block_m: int):
+    """The autotuner of `block_m`'s launches (its fixed config first)."""
+    return _rel_attention_kernel_tuned[_tuned_tiles(block_m)[0]]
+
+
+def use_kv_descriptors(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_m: int,
+    use_td: bool | None = None,
+) -> bool:
+    """Whether `rel_attention` loads K/V tiles through per-page descriptors:
+    on the autotuned XPU path (`use_kernel_td(use_td)`), with 16-bit KV and
+    pages that hold whole key tiles of the smallest tuned tile (tiles that
+    do not divide the page are pruned)."""
+    if not use_kernel_td(use_td):
+        return False
+    min_block_n = min(n for n, _ in _TUNED_TILES)
+    return (
+        key_cache.element_size() == 2
+        and key_cache.shape[1] % min_block_n == 0
+        and tensor_descriptor_compatible(key_cache, value_cache)
+    )
+
+
 def rel_attention(
     q: torch.Tensor,
     key_cache: torch.Tensor,
@@ -260,6 +413,7 @@ def rel_attention(
     window: int,
     num_splits: int,
     mode: int,
+    use_td: bool | None = None,
 ) -> None:
     """Launch `_rel_attention_kernel` over the requests of `cu_seqlens_q`.
 
@@ -270,7 +424,8 @@ def rel_attention(
     fp32 `out` `(T, H, D)` and natural-log `lse` `(H, T)`; `MODE_GATED`
     the bf16 `(T, H * D)` `out` (gated by `gate` and `sinks` unless
     drafting; a single split); `MODE_PARTIAL` the fp32 `out`
-    `(S, T, H, D)` and log2 `lse` `(S, T, H)` partials.
+    `(S, T, H, D)` and log2 `lse` `(S, T, H)` partials. `use_td`
+    overrides `use_tensor_descriptor()` (on XPU; see `use_kv_descriptors`).
     """
     num_tokens, num_heads, head_dim = q.shape
     page, num_kv_heads = key_cache.shape[1:3]
@@ -309,7 +464,14 @@ def rel_attention(
     else:
         assert out.is_contiguous() and lse.is_contiguous()
         out_strides = (0, 0, 0, 0)
-    _rel_attention_kernel[grid](
+    tuned = use_kernel_autotune()
+    config = {} if tuned else _fixed_config(block_m)
+    use_td = use_kv_descriptors(key_cache, value_cache, block_m, use_td)
+    if use_td:
+        # On every launch: Triton's allocator is a per-thread ContextVar.
+        set_triton_allocator(q.device)
+    kernel = _rel_attention_tuner(block_m) if tuned else _rel_attention_kernel
+    kernel[grid](
         q,
         e4m3_arg(key_cache),
         e4m3_arg(value_cache),
@@ -342,8 +504,7 @@ def rel_attention(
         WINDOW=window,
         DRAFT=draft,
         MODE=mode,
+        USE_TD=use_td,
         BLOCK_M=block_m,
-        BLOCK_N=64 if block_m >= 128 else 128 if block_m <= 32 else 64,
-        num_warps=8 if block_m >= 128 else 4,
-        num_stages=2,
+        **config,
     )
