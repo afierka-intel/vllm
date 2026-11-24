@@ -30,6 +30,7 @@ import torch
 import vllm.envs as envs
 from vllm.model_executor.layers.fused_moe.experts.nvfp4_emulation_moe import (
     invoke_fused_moe_nvfp4_emulation_kernel,
+    nvfp4_emulation_use_td,
 )
 from vllm.model_executor.layers.fused_moe.fused_moe import (
     try_get_optimal_moe_config,
@@ -386,8 +387,11 @@ class XpuNvfp4Experts:
         # Rows per expert over all experts (the routing's), as the bound
         # was measured; the default path's config as
         # `Nvfp4QuantizationEmulationTritonExperts` gets it.
-        # This kernel loads the weights through pointers (no TD path).
-        split_dots = use_split_dots(tokens, topk, num_global_experts, x.shape[-1])
+        # Tensor-descriptor weight loads (XPU default) move Mini's bound.
+        td = nvfp4_emulation_use_td(
+            x, w13, split_dots_config(tokens, topk, num_global_experts), None
+        )
+        split_dots = use_split_dots(tokens, topk, num_global_experts, x.shape[-1], td)
         if split_dots:
             config = split_dots_config(tokens, topk, num_global_experts)
         else:
