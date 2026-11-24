@@ -10,6 +10,7 @@ Weights are dequantized on the fly during each forward, we fall back to calling
 is applied on `a13`, `a2`.
 """
 
+from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -267,12 +268,19 @@ def invoke_fused_moe_nvfp4_emulation_kernel(
     top_k: int,
     config: dict[str, Any],
     compute_type: tl.dtype,
+    launch_options: Mapping[str, Any] | None = None,
 ):
     """Launch the fused NVFP4 emulation MoE kernel.
 
     B has shape [E, N, K_packed] where K_packed = K // 2 (two FP4 per byte).
     B_scale has shape [E, N, K // group_size] in FP8-E4M3 (stored as uint8).
     w_global_scale has shape [E] (per-expert scalar).
+    `launch_options` are passed to the launch as they are (`num_warps`,
+    `num_stages`, and backend options such as `grf_mode` on XPU), for a
+    caller that chose them for this kernel. Without them the launch takes
+    Triton's defaults: the `num_warps` / `num_stages` entries of `config`
+    are not used, since the tuned MoE config files hold launch configs of
+    `fused_moe_kernel`.
     """
     assert B_scale is not None and B_scale.ndim == 3
 
@@ -328,6 +336,7 @@ def invoke_fused_moe_nvfp4_emulation_kernel(
         BLOCK_SIZE_N=config["BLOCK_SIZE_N"],
         BLOCK_SIZE_K=config["BLOCK_SIZE_K"],
         GROUP_SIZE_M=config["GROUP_SIZE_M"],
+        **(launch_options or {}),
     )
 
 
