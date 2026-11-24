@@ -16,6 +16,7 @@ import torch
 
 import vllm.models.inkling2.common.ops.linear as linear_ops
 import vllm.models.inkling2.common.ops.rel_attention as rel_attention_ops
+import vllm.models.inkling2.common.ops.sconv as sconv_ops
 from tests.models.inkling2 import test_attention, test_core_ops
 from tests.models.inkling2.utils import DEVICE
 from vllm.platforms import current_platform
@@ -36,6 +37,7 @@ def _tuners():
     return [
         rel_attention_ops._rel_attention_kernel_tuned,
         *(linear_ops._k_group_kernel_tuned(b) for b, _ in linear_ops._TOKEN_BUCKETS),
+        *(sconv_ops._sconv_kernel_tuned(b) for b, _ in sconv_ops._SCONV_BUCKETS),
     ]
 
 
@@ -106,6 +108,13 @@ def test_rel_decode_attention_tunes_and_matches_reference(cold_tuning):
         24, 8, None, [1] * 4, [1, 200, 1025, 3000], 128, 9
     )
     _assert_tuned(cold_tuning, "_rel_attention_kernel")
+
+
+def test_short_conv_tunes_and_matches_full_sequence(cold_tuning):
+    test_core_ops.test_short_conv_chunked_matches_full_sequence(
+        False, test_core_ops.LONG_STEPS, 0
+    )
+    _assert_tuned(cold_tuning, "_sconv_kernel")
 
 
 def test_k_group_buckets_keep_separate_tuning_keys():
