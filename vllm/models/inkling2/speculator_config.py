@@ -14,6 +14,12 @@ class Inkling2DSparkSpeculatorConfig(DSparkSpeculatorConfig):
 
     @classmethod
     def adapt_draft_model_config(cls, spec: "SpeculativeConfig") -> None:
+        if current_platform.is_xpu():
+            # The draft (`nvidia/dspark.py`) uses FlashInfer and CUDA kernels.
+            raise NotImplementedError(
+                "Inkling2 DSpark speculative decoding is not supported on XPU; "
+                "disable --speculative-config"
+            )
         super().adapt_draft_model_config(spec)
         if current_platform.is_device_capability_family(120):
             # The target's clipped, unit-scale FP8 cache does not describe the
