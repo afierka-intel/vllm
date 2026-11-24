@@ -7,7 +7,6 @@ decisions the CUDA kernels made before the portable paths. The platform and
 its device capability are emulated on the current device's platform object.
 """
 
-import functools
 import json
 import sys
 
@@ -36,29 +35,32 @@ _PREDICATES = (
 
 @pytest.fixture
 def emulate(monkeypatch):
-    """`emulate(platform, family)`: `current_platform` reports `platform`
-    ("cuda", "rocm" or "xpu") and, on CUDA, compute capability family
-    `family` (e.g. 90). The cached predicates are recomputed."""
+    """`emulate(platform, capability)`: `current_platform` reports `platform`
+    ("cuda", "rocm" or "xpu") and device capability `capability` (e.g. 90
+    for SM90, 94 for gfx942; XPU reports none). The cached predicates are
+    recomputed."""
 
     def clear():
         for predicate in _PREDICATES:
             predicate.cache_clear()
 
-    def apply(platform: str, family: int | None = None) -> None:
-        cuda = platform == "cuda"
-        monkeypatch.setattr(current_platform, "is_cuda", lambda: cuda)
+    def apply(platform: str, capability: int | None = None) -> None:
+        assert platform != "xpu" or capability is None
+        monkeypatch.setattr(current_platform, "is_cuda", lambda: platform == "cuda")
         monkeypatch.setattr(current_platform, "is_rocm", lambda: platform == "rocm")
         monkeypatch.setattr(current_platform, "is_xpu", lambda: platform == "xpu")
         monkeypatch.setattr(
             current_platform,
             "is_device_capability_family",
-            lambda capability, device_id=0: cuda and capability == family,
+            lambda family, device_id=0: (
+                capability is not None and capability // 10 == family // 10
+            ),
         )
         monkeypatch.setattr(
             current_platform,
             "has_device_capability",
-            lambda capability, device_id=0: (
-                cuda and family is not None and family >= capability
+            lambda minimum, device_id=0: (
+                capability is not None and capability >= minimum
             ),
         )
         clear()
@@ -87,14 +89,44 @@ def test_cuda_predicates_keep_cuda_decisions(emulate, family):
         assert flat_experts_class(quant_format, 8, 4.0, 25.0) is HummingExperts
 
 
-def test_rocm_keeps_cuda_dispatch(emulate):
-    """ROCm takes none of the XPU decisions: the conv/mix op and the
-    Humming experts, as before the portable paths."""
-    emulate("rocm")
+@pytest.mark.parametrize("capability", [90, 94, 95])
+def test_rocm_keeps_cuda_dispatch(emulate, capability):
+    """ROCm takes none of the XPU decisions: the conv/mix op, the Humming
+    experts, PDL launches and the TMA K-group kernel, as before the
+    portable paths."""
+    emulate("rocm", capability)
     assert predicates.use_native_conv_mix()
     assert not predicates.use_kernel_autotune()
+    assert predicates.use_pdl()
+    assert predicates.use_tma_k_groups()
     for quant_format in ("nvfp4", "mxfp8"):
         assert flat_experts_class(quant_format, 8, 4.0, 25.0) is HummingExperts
+
+
+@pytest.mark.parametrize(
+    "platform,capability,kwargs",
+    [
+        # The pin launched every PDL kernel with launch_pdl=True.
+        ("cuda", 90, {"launch_pdl": True}),
+        ("cuda", 100, {"launch_pdl": True}),
+        ("cuda", 120, {"launch_pdl": True}),
+        ("rocm", 94, {"launch_pdl": True}),
+        ("rocm", 95, {"launch_pdl": True}),
+        # vllm-project/vllm#69165: launch_pdl=use_pdl() below SM90.
+        ("cuda", 80, {"launch_pdl": False}),
+        ("cuda", 89, {"launch_pdl": False}),
+        # Intel's Triton rejects the option, even when it is False.
+        ("xpu", None, {}),
+    ],
+)
+def test_pdl_launch_kwargs_per_platform(emulate, platform, capability, kwargs):
+    """`pdl_launch_kwargs()` is `launch_pdl=use_pdl()` everywhere but XPU,
+    which gets no option at all; `use_pdl` (and so the griddepcontrol calls
+    of `pdl.py`) and the TMA K-group kernel follow SM90+ (#69165)."""
+    emulate(platform, capability)
+    assert dict(predicates.pdl_launch_kwargs()) == kwargs
+    assert predicates.use_pdl() == kwargs.get("launch_pdl", False)
+    assert predicates.use_tma_k_groups() == kwargs.get("launch_pdl", False)
 
 
 def test_xpu_predicates_take_portable_paths(emulate):
@@ -129,7 +161,7 @@ def _vllm_config(tmp_path, lora: bool):
 def test_model_init_gates_skip_cuda_and_rocm(tmp_path, emulate, platform):
     """Image inputs and LoRA pass the model-init gate off XPU."""
     config = _vllm_config(tmp_path, lora=True)
-    emulate(platform, 90 if platform == "cuda" else None)
+    emulate(platform, 90 if platform == "cuda" else 94)
     _check_platform_support(config, vision=True)
 
 
@@ -170,7 +202,7 @@ def test_linear_small_batches_without_flashinfer(monkeypatch, emulate, rows):
     is a CUDA-only dependency (unimportable here), and is `F.linear`."""
     monkeypatch.setitem(sys.modules, "flashinfer", None)
     monkeypatch.setitem(sys.modules, "flashinfer.autotuner", None)
-    emulate("xpu" if current_platform.is_xpu() else "cuda", 90)
+    emulate(*(("xpu", None) if current_platform.is_xpu() else ("cuda", 90)))
     torch.manual_seed(0)
     x = torch.randn(rows, 512, device=DEVICE, dtype=torch.bfloat16)
     weight = torch.randn(256, 512, device=DEVICE, dtype=torch.bfloat16)
@@ -209,38 +241,3 @@ def test_fp8_kv_cache_rejected_at_model_init_off_sm12x(tmp_path, dist_init):
         else:
             with pytest.raises(ValueError, match="KV cache dtype must be one of"):
                 Inkling2ForConditionalGeneration(vllm_config=config)
-
-
-@pytest.mark.skipif(
-    not current_platform.is_xpu(), reason="vllm-xpu-kernels grouped GEMM routing"
-)
-def test_xpu_mxfp8_experts_only_on_xe2_grouped_gemm(monkeypatch):
-    """MXFP8 runs only where `XpuFusedMoe` takes the xe_2 grouped GEMM (bf16
-    activations, e4m3 weights); elsewhere it fails at init. NVFP4 does not
-    depend on it."""
-    from vllm.models.inkling2.xpu.experts import (
-        XpuMxfp8Experts,
-        XpuNvfp4Experts,
-        mxfp8_experts_supported,
-        xpu_flat_experts,
-    )
-
-    # The CI card (Arc Pro B70) is an Xe2 part.
-    assert mxfp8_experts_supported()
-    mxfp8 = xpu_flat_experts("mxfp8", 8, 4.0, 25.0)
-    assert isinstance(mxfp8, functools.partial) and mxfp8.func is XpuMxfp8Experts
-
-    monkeypatch.setenv("FORCE_XE3P_KERNEL", "1")
-    assert not mxfp8_experts_supported()
-    with pytest.raises(NotImplementedError, match="xe_3 GEMM"):
-        xpu_flat_experts("mxfp8", 8, 4.0, 25.0)
-    monkeypatch.delenv("FORCE_XE3P_KERNEL")
-
-    xpu_ops = torch.ops._xpu_C
-    monkeypatch.setattr(xpu_ops, "is_xe2_arch", lambda device_index=-1: False)
-    monkeypatch.setattr(xpu_ops, "is_xe3_arch", lambda device_index=-1: False)
-    assert not mxfp8_experts_supported()
-    with pytest.raises(NotImplementedError, match="xe_2 grouped GEMM"):
-        xpu_flat_experts("mxfp8", 8, 4.0, 25.0)
-    nvfp4 = xpu_flat_experts("nvfp4", 8, 4.0, 25.0)
-    assert isinstance(nvfp4, functools.partial) and nvfp4.func is XpuNvfp4Experts

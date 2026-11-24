@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """PDL (griddepcontrol) calls of the Triton kernels, compiled out without
-`use_pdl` (non-CUDA backends): there, the kernels launch without
-`pdl_launch_kwargs()`, stream ordered, and need no wait."""
+`use_pdl` (below SM90, and on XPU): there, launches are stream ordered and
+need no wait."""
 
 from vllm.triton_utils import tl, triton
 
