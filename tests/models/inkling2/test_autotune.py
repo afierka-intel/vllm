@@ -17,6 +17,7 @@ import torch
 
 import vllm.models.inkling2.common.ops.attention_sm90 as rel_attention_ops
 import vllm.models.inkling2.common.ops.linear as linear_ops
+import vllm.models.inkling2.common.ops.sconv as sconv_ops
 from tests.models.inkling2 import test_attention, test_core_ops
 from tests.models.inkling2.utils import DEVICE
 from vllm.platforms import current_platform
@@ -28,6 +29,11 @@ def _tuners():
     return [
         *rel_attention_ops._rel_attention_kernel_tuned.values(),
         *(linear_ops._k_group_kernel_tuned(b) for b, _ in linear_ops._TOKEN_BUCKETS),
+        *(
+            sconv_ops._sconv_kernel_tuned(b, prefill)
+            for b, _ in sconv_ops._SCONV_BUCKETS
+            for prefill in (False, True)
+        ),
     ]
 
 
@@ -45,6 +51,35 @@ FIXED_FIRST = [
     (lambda: linear_ops._k_group_kernel_tuned(128), {"BM": 16, "BN": 64}, 4, 2),
     (lambda: linear_ops._k_group_kernel_tuned(256), {"BM": 64, "BN": 64}, 4, 2),
     (lambda: linear_ops._k_group_kernel_tuned(1 << 62), {"BM": 64, "BN": 128}, 8, 2),
+    # _sconv_kernel per token bucket, decode / prefill (the fixed launch:
+    # XPU's default 2 stages).
+    *(
+        (
+            lambda p=p: sconv_ops._sconv_kernel_tuned(8, p),
+            {"BT": 1, "BLOCK_C": 1024},
+            4,
+            2,
+        )
+        for p in (False, True)
+    ),
+    *(
+        (
+            lambda b=b: sconv_ops._sconv_kernel_tuned(b, False),
+            {"BT": 2, "BLOCK_C": 512},
+            4,
+            2,
+        )
+        for b in (256, 1 << 62)
+    ),
+    *(
+        (
+            lambda b=b: sconv_ops._sconv_kernel_tuned(b, True),
+            {"BT": 4, "BLOCK_C": 256},
+            4,
+            2,
+        )
+        for b in (256, 1 << 62)
+    ),
 ]
 
 
@@ -237,3 +272,58 @@ def test_k_group_buckets_keep_separate_tuning_keys():
         assert shape_keys and all(key[4] == bucket for key in shape_keys)
         keys.append(shape_keys)
     assert not keys[0] & keys[1]
+
+
+@requires_xpu
+@requires_tuning
+def test_short_conv_tunes_and_matches_full_sequence(cold_tuning):
+    """The tuned short conv times every config of a fresh key and its pick
+    matches the full-sequence conv."""
+    test_core_ops.test_short_conv_chunked_matches_full_sequence(
+        False, test_core_ops.LONG_STEPS, 0
+    )
+    _assert_tuned(cold_tuning, "_sconv_kernel")
+
+
+@requires_xpu
+@pytest.mark.parametrize("index", range(len(sconv_ops._SCONV_TILES)))
+def test_short_conv_every_config_matches_full_sequence(monkeypatch, index):
+    """Each config of the short-conv tuners, alone, against the
+    full-sequence conv."""
+    tuners = [
+        sconv_ops._sconv_kernel_tuned(b, prefill)
+        for b, _ in sconv_ops._SCONV_BUCKETS
+        for prefill in (False, True)
+    ]
+    _pin(monkeypatch, tuners, index)
+    test_core_ops.test_short_conv_chunked_matches_full_sequence(
+        False, test_core_ops.LONG_STEPS, 0
+    )
+
+
+@pytest.mark.parametrize(
+    "bucket,fused,channels,prefill,fixed_only",
+    [
+        (8, False, 4608, False, True),
+        (8, True, 2304, False, True),
+        (256, False, 2304, False, False),
+        (256, True, 2304, False, True),
+        (256, True, 4608, False, False),
+        (1 << 62, False, 4608, True, False),
+        (1 << 62, True, 4608, True, True),
+        (1 << 62, True, 2304, True, False),
+    ],
+)
+def test_short_conv_tunes_only_where_it_gained(
+    bucket, fused, channels, prefill, fixed_only
+):
+    """The short conv runs its fixed tile alone where tuning gave no stable
+    gain (any platform)."""
+    args = {
+        "BUCKET": bucket,
+        "HAS_RES": fused,
+        "H": 1,
+        "WS": channels,
+        "SKIP_IDLE_CACHE": prefill,
+    }
+    assert sconv_ops._sconv_fixed_only(args) == fixed_only
