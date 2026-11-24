@@ -52,14 +52,18 @@ steps:
 
 - label: ":intel: (B70) Inkling 2"
   key: inkling2-xpu
-  # Measured cold (empty Triton cache, one B70): 119 min, mostly autotuning.
-  timeout_in_minutes: 150
+  # Measured cold (empty Triton cache, one B70): 28 min for the first command
+  # (forced first config) + 3.3 min for test_autotune.py; 119 min when the
+  # first command autotuned too.
+  timeout_in_minutes: 50
   device: intel_gpu_k8s
   num_devices: 1
   resource_claim_template: b70-1
   working_dir: "/vllm-workspace/"
   env:
     VLLM_TEST_DEVICE: "xpu"
+    # First valid config, no timing; test_autotune.py covers the tuned path.
+    VLLM_TRITON_FORCE_FIRST_CONFIG: "1"
   source_file_dependencies:
   - vllm/models/inkling2/
   - vllm/models/inkling/nvidia/sconv_swa_attn.py
@@ -89,4 +93,4 @@ steps:
       models/inkling2/test_xpu_experts.py
       models/inkling2/test_platform_gates.py
     # The tuned launch path: each case times every config of a fresh key.
-    - pytest -v -s models/inkling2/test_autotune.py
+    - VLLM_TRITON_FORCE_FIRST_CONFIG=0 pytest -v -s models/inkling2/test_autotune.py
