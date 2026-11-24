@@ -42,7 +42,14 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4Dynamic,
     kNvfp4Static,
 )
-from vllm.triton_utils import tl, triton
+from vllm.platforms import current_platform
+from vllm.triton_utils import (
+    tensor_descriptor_compatible,
+    tl,
+    triton,
+    use_tensor_descriptor,
+)
+from vllm.triton_utils.allocation import set_triton_allocator
 
 logger = init_logger(__name__)
 
@@ -96,6 +103,13 @@ def nvfp4_emulation_split_dots_config(
 def _block_scales_to_f32(raw):
     """fp32 values of FP8-E4M3 block scales stored as uint8."""
     return tl.cast(raw, tl.float8e4nv, bitcast=True).to(tl.float32)
+
+
+@triton.jit
+def _load_b_td(b_desc, row, col):
+    """Packed weight tile [BLOCK_SIZE_N, BLOCK_SIZE_K // 2] at (row, col) of
+    an expert's [N, K // 2] descriptor."""
+    return b_desc.load([row, col])
 
 
 @triton.jit
@@ -181,6 +195,7 @@ def fused_moe_nvfp4_emulation_kernel(
     compute_type: tl.constexpr,
     group_size: tl.constexpr,
     SPLIT_DOTS: tl.constexpr = False,
+    USE_TD: tl.constexpr = False,
 ):
     """Fused MoE kernel for emulated NVFP4 weight-only dequantization + GEMM.
 
@@ -207,6 +222,10 @@ def fused_moe_nvfp4_emulation_kernel(
     group_size]) and broadcast over the group, and the global scale is
     applied to the fp32 accumulator: the e2m1 x e4m3 products (at most 6
     significant bits) are then exact in bf16 / fp16.
+
+    USE_TD loads the packed weight tiles through a tensor descriptor over
+    the expert's [N, K // 2] bytes (2D block loads on XPU); A, the block
+    scales and C stay pointer accesses. The loaded values are the same.
     """
     BLOCK_SIZE_K_PACKED: tl.constexpr = BLOCK_SIZE_K // 2
 
@@ -293,6 +312,16 @@ def fused_moe_nvfp4_emulation_kernel(
     # scale indices the same way unpacked indices map via group_size.
     group_size_packed: tl.constexpr = group_size // 2
 
+    if USE_TD:
+        # The expert's packed weights [N, K // 2] as a tensor descriptor
+        # (2D block loads on XPU).
+        b_desc = tl.make_tensor_descriptor(
+            base=b_ptr + off_experts * stride_be,
+            shape=(N, K // 2),
+            strides=(stride_bn, stride_bk),
+            block_shape=(BLOCK_SIZE_N, BLOCK_SIZE_K_PACKED),
+        )
+
     # Load per-expert global scale (scalar).
     w_global_scale = tl.load(w_global_scale_ptr + off_experts).to(tl.float32)
 
@@ -302,10 +331,16 @@ def fused_moe_nvfp4_emulation_kernel(
     if SPLIT_DOTS:
         for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
             # Packed weight tile [BLOCK_SIZE_N, BLOCK_SIZE_K_PACKED].
-            if block_k_diviable:
+            if not block_k_diviable:
+                kp_mask = offs_k_packed[None, :] < (K // 2) - k * BLOCK_SIZE_K_PACKED
+            if USE_TD:
+                # Out-of-bounds bytes (K tail, rows past N) load as 0.
+                raw_bytes = _load_b_td(
+                    b_desc, pid_n * BLOCK_SIZE_N, k * BLOCK_SIZE_K_PACKED
+                )
+            elif block_k_diviable:
                 raw_bytes = tl.load(b_ptrs)
             else:
-                kp_mask = offs_k_packed[None, :] < (K // 2) - k * BLOCK_SIZE_K_PACKED
                 raw_bytes = tl.load(b_ptrs, mask=kp_mask, other=0)
             accumulator = _split_dots_step(
                 accumulator,
@@ -342,10 +377,16 @@ def fused_moe_nvfp4_emulation_kernel(
                 )
 
             # Load packed weight tile [BLOCK_SIZE_N, BLOCK_SIZE_K_PACKED].
-            if block_k_diviable:
+            if not block_k_diviable:
+                kp_mask = offs_k_packed[None, :] < (K // 2) - k * BLOCK_SIZE_K_PACKED
+            if USE_TD:
+                # Out-of-bounds bytes (K tail, rows past N) load as 0.
+                raw_bytes = _load_b_td(
+                    b_desc, pid_n * BLOCK_SIZE_N, k * BLOCK_SIZE_K_PACKED
+                )
+            elif block_k_diviable:
                 raw_bytes = tl.load(b_ptrs)
             else:
-                kp_mask = offs_k_packed[None, :] < (K // 2) - k * BLOCK_SIZE_K_PACKED
                 raw_bytes = tl.load(b_ptrs, mask=kp_mask, other=0)
 
             # Extract both nibbles from each byte (each [N, K_packed]).
@@ -421,6 +462,7 @@ def invoke_fused_moe_nvfp4_emulation_kernel(
     config: dict[str, Any],
     compute_type: tl.dtype,
     split_dots: bool = False,
+    use_td: bool | None = None,
 ):
     """Launch the fused NVFP4 emulation MoE kernel.
 
@@ -432,12 +474,26 @@ def invoke_fused_moe_nvfp4_emulation_kernel(
     (`nvfp4_emulation_use_split_dots`); its numerics differ from the default
     path (exact dequantized bf16 / fp16 weights, global scale on the fp32
     accumulator).
+    On XPU the weight tiles load through a tensor descriptor (USE_TD) when
+    `use_tensor_descriptor(use_td)`; elsewhere `use_td` is ignored.
     """
     assert B_scale is not None and B_scale.ndim == 3
     group_size = 16
     if split_dots:
         # Whole groups per K tile.
         assert config["BLOCK_SIZE_K"] % group_size == 0, config
+    use_td = (
+        current_platform.is_xpu()
+        and use_tensor_descriptor(use_td)
+        # A per-expert [N, K // 2] descriptor with 16-byte aligned rows.
+        and tensor_descriptor_compatible(B)
+        and B.stride(0) % 16 == 0
+        # Inner block of >= 16 bytes.
+        and config["BLOCK_SIZE_K"] >= 32
+    )
+    if use_td:
+        # On every launch: Triton's allocator is a per-thread ContextVar.
+        set_triton_allocator(A.device)
 
     N = B.size(1)
     K = A.size(1)
@@ -492,6 +548,7 @@ def invoke_fused_moe_nvfp4_emulation_kernel(
         compute_type=compute_type,
         group_size=group_size,
         SPLIT_DOTS=split_dots,
+        USE_TD=use_td,
         BLOCK_SIZE_M=config["BLOCK_SIZE_M"],
         BLOCK_SIZE_N=config["BLOCK_SIZE_N"],
         BLOCK_SIZE_K=config["BLOCK_SIZE_K"],
