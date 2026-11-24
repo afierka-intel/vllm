@@ -193,7 +193,8 @@ class XpuNvfp4Experts:
     (`invoke_fused_moe_nvfp4_emulation_kernel`) with bf16 activations
     (W4A16): `w13` GEMM, `swiglu` (routing weight before the down
     projection, as on Hopper) and `w2` GEMM over the flat rows. Batches of
-    up to `SPLIT_DOTS_MAX_TOKENS` tokens take the kernel's split-dots path.
+    fewer than `SPLIT_DOTS_ROWS_PER_EXPERT` rows per expert (over all
+    experts) take the kernel's split-dots path.
 
     Args:
         weights: Per projection (`w13`, `w2`), the checkpoint weights
@@ -275,7 +276,7 @@ class XpuNvfp4Experts:
             return x.new_empty((0, w2.shape[1]))
         # The path and config of `Nvfp4QuantizationEmulationTritonExperts`
         # in its W4A16 mode, with the routing over all experts.
-        split_dots = nvfp4_emulation_use_split_dots(tokens)
+        split_dots = nvfp4_emulation_use_split_dots(tokens, topk, num_global_experts)
         if split_dots:
             config = nvfp4_emulation_split_dots_config(tokens, topk, num_global_experts)
         else:

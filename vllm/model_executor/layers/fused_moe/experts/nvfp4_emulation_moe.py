@@ -53,16 +53,30 @@ from vllm.triton_utils.allocation import set_triton_allocator
 
 logger = init_logger(__name__)
 
-# Largest batch (tokens) for which `nvfp4_emulation_use_split_dots` selects the
-# split-dots path of the kernel.
-SPLIT_DOTS_MAX_TOKENS = 64
+# `nvfp4_emulation_use_split_dots` selects the split-dots path of the kernel
+# below this many rows (token x slot) per expert.
+SPLIT_DOTS_ROWS_PER_EXPERT = 32
 
 
-def nvfp4_emulation_use_split_dots(num_tokens: int) -> bool:
-    """Whether a batch of `num_tokens` tokens takes the split-dots path of
+def _rows_per_expert(num_tokens: int, top_k: int, num_experts: int) -> int:
+    return triton.cdiv(num_tokens * top_k, max(num_experts, 1))
+
+
+def nvfp4_emulation_use_split_dots(
+    num_tokens: int, top_k: int, num_experts: int
+) -> bool:
+    """Whether a batch of `num_tokens` tokens routed to `top_k` of
+    `num_experts` experts takes the split-dots path of
     `fused_moe_nvfp4_emulation_kernel` (`split_dots` of
-    `invoke_fused_moe_nvfp4_emulation_kernel`): small (decode) batches."""
-    return num_tokens <= SPLIT_DOTS_MAX_TOKENS
+    `invoke_fused_moe_nvfp4_emulation_kernel`): batches with fewer than
+    `SPLIT_DOTS_ROWS_PER_EXPERT` rows per expert (decode, and short
+    prefills of models with many experts). On an Intel Arc Pro B70 at
+    Inkling 2 expert shapes the path is faster than the default one there
+    (e.g. 1.3x at 300 tokens of Mini, 3.5x at 300 and 6x at 1024 tokens of
+    Small), and slower above."""
+    return _rows_per_expert(num_tokens, top_k, num_experts) < (
+        SPLIT_DOTS_ROWS_PER_EXPERT
+    )
 
 
 def nvfp4_emulation_split_dots_config(
@@ -74,7 +88,7 @@ def nvfp4_emulation_split_dots_config(
     the best single tile of a sweep at Inkling 2 expert shapes on an Intel
     Arc Pro B70 for 1-64 tokens (with `get_default_config` this path was up
     to 20x slower there at 64 tokens)."""
-    rows_per_expert = triton.cdiv(num_tokens * top_k, max(num_experts, 1))
+    rows_per_expert = _rows_per_expert(num_tokens, top_k, num_experts)
     return {
         "BLOCK_SIZE_M": min(64, max(16, triton.next_power_of_2(rows_per_expert))),
         "BLOCK_SIZE_N": 128,
@@ -667,7 +681,7 @@ class Nvfp4QuantizationEmulationTritonExperts(TritonExperts):
         # The W4A16 mode takes the split-dots path for small batches; W4A4
         # keeps the default path.
         split_dots = not self.quantize_activations and (
-            nvfp4_emulation_use_split_dots(num_tokens)
+            nvfp4_emulation_use_split_dots(num_tokens, top_k_num, global_num_experts)
         )
 
         # TODO: There is actually no support for tuning of the underlying triton

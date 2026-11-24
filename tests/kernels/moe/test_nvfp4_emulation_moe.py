@@ -434,3 +434,20 @@ def test_split_dots_config_row_block(tokens, top_k, experts, block_m):
     )
     assert config["BLOCK_SIZE_M"] == block_m
     assert config["BLOCK_SIZE_K"] % 16 == 0
+
+
+@pytest.mark.parametrize(
+    "tokens,top_k,experts,split",
+    [
+        (1, 8, 128, True),
+        (300, 8, 128, True),
+        (512, 8, 128, False),
+        (1024, 8, 384, True),
+    ],
+)
+def test_split_dots_below_32_rows_per_expert(tokens, top_k, experts, split):
+    """The split-dots path serves batches of fewer than 32 rows per expert."""
+    assert (
+        nvfp4_emulation_moe.nvfp4_emulation_use_split_dots(tokens, top_k, experts)
+        == split
+    )

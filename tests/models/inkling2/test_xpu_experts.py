@@ -184,13 +184,13 @@ def test_deinterleave_rows_round_trip(dtype: torch.dtype):
 
 @pytest.mark.parametrize("fmt", FORMATS)
 @pytest.mark.parametrize("model", list(SHAPES))
-@pytest.mark.parametrize("tokens", [1, 7, 64, 65, 300])
+@pytest.mark.parametrize("tokens", [1, 7, 64, 300, 1600])
 def test_xpu_experts_match_reference(fmt: str, model: str, tokens: int):
     """The XPU backend of `flat_experts_class` on local experts (one EP
     rank for Small) vs. the dequantized reference, with non-local slots,
     empty experts and a token routed to no local expert (which comes out
-    0). NVFP4: 64 tokens take the kernel's split-dots path, 65 its default
-    path."""
+    0). NVFP4: up to 300 tokens take the kernel's split-dots path, 1600 its
+    default path (fewer / more than 32 rows per expert)."""
     torch.manual_seed(0)
     hidden, inter, num_global, num_local = SHAPES[model]
     weights = random_weights(fmt, num_local, hidden, inter)
