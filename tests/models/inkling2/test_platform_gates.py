@@ -16,6 +16,7 @@ _PREDICATES = (
     predicates.use_sm100_kernels,
     predicates.use_pdl,
     predicates.pdl_launch_kwargs,
+    predicates.use_kernel_autotune,
     predicates.use_native_conv_mix,
     predicates.use_native_e4m3,
 )
@@ -114,14 +115,30 @@ def test_no_literal_launch_pdl_outside_pdl_launch_kwargs():
     assert not found, found
 
 
+@pytest.mark.parametrize("platform", ["xpu", "cuda"])
+def test_batch_invariant_runs_fixed_configs(emulate, monkeypatch, platform):
+    """`VLLM_BATCH_INVARIANT=1` turns autotuning off on XPU (the fixed launch
+    configs run, as on CUDA); CUDA never autotunes."""
+    from vllm import envs
+
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    emulate(platform, None if platform == "xpu" else 90)
+    assert not predicates.use_kernel_autotune()
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", False)
+    predicates.use_kernel_autotune.cache_clear()
+    assert predicates.use_kernel_autotune() == (platform == "xpu")
+
+
 def test_xpu_predicates_take_portable_paths(emulate):
     """XPU: `short_conv` + `attn_res`, stream-ordered launches (no
-    `launch_pdl` option at all), software e4m3, no SM10x kernels."""
+    `launch_pdl` option at all), software e4m3, autotuned tiles, no SM10x
+    kernels."""
     emulate("xpu")
     assert not predicates.use_native_conv_mix()
     assert not predicates.use_pdl()
     assert dict(predicates.pdl_launch_kwargs()) == {}
     assert not predicates.use_native_e4m3()
+    assert predicates.use_kernel_autotune()
     assert not predicates.use_sm100_kernels()
 
 
@@ -268,3 +285,28 @@ def test_fp8_kv_cache_follows_the_attention_layer_support(tmp_path, dist_init):
                 Inkling2ForConditionalGeneration(vllm_config=config)
     if current_platform.is_xpu():
         assert "fp8_e4m3" not in supported_kv_cache_dtypes()
+
+
+def test_batch_invariant_runs_fixed_pointer_launches(monkeypatch):
+    """`VLLM_BATCH_INVARIANT=1`: no autotuning and no tensor descriptors in
+    any portable kernel, even with `VLLM_TRITON_USE_TD=1` (the fixed pointer
+    launches). Otherwise XPU autotunes and follows `VLLM_TRITON_USE_TD`;
+    other platforms do neither."""
+    from vllm import envs
+
+    envs.disable_envs_cache()
+    monkeypatch.setenv("VLLM_TRITON_USE_TD", "1")
+    try:
+        monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+        predicates.use_kernel_autotune.cache_clear()
+        assert not predicates.use_kernel_autotune()
+        assert not predicates.use_kernel_td()
+        assert not predicates.use_kernel_td(True)
+        monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
+        predicates.use_kernel_autotune.cache_clear()
+        xpu = current_platform.is_xpu()
+        assert predicates.use_kernel_autotune() == xpu
+        assert predicates.use_kernel_td() == xpu
+        assert not predicates.use_kernel_td(False)
+    finally:
+        predicates.use_kernel_autotune.cache_clear()
