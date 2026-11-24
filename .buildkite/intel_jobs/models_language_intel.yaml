@@ -53,7 +53,8 @@ steps:
 - label: ":intel: (B70) Inkling 2"
   key: inkling2-xpu
   # Cold (empty Triton cache, one B70) on development trees: 27-28 min for
-  # the first five test files, about 5 min for the NVFP4 kernel tests.
+  # the first command, with the forced first config (the fixed launch
+  # configs); the tuned launches (test_autotune.py) are timed per PR.
   timeout_in_minutes: 50
   device: intel_gpu_k8s
   num_devices: 1
@@ -61,6 +62,9 @@ steps:
   working_dir: "/vllm-workspace/"
   env:
     VLLM_TEST_DEVICE: "xpu"
+    # The first config of every autotuned launch, i.e. its fixed launch
+    # config, without timing; test_autotune.py covers the tuned path.
+    VLLM_TRITON_FORCE_FIRST_CONFIG: "1"
   source_file_dependencies:
   - vllm/models/inkling2/
   - vllm/models/inkling/nvidia/sconv_swa_attn.py
@@ -105,3 +109,6 @@ steps:
       models/inkling2/test_xpu_experts.py
       models/inkling2/test_platform_gates.py
       kernels/moe/test_nvfp4_emulation_moe.py
+    # The tuned launch path: every config against the reference, and the
+    # timing of a fresh key.
+    - VLLM_TRITON_FORCE_FIRST_CONFIG=0 pytest -v -s models/inkling2/test_autotune.py
