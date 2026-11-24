@@ -120,3 +120,33 @@ def test_xpu_predicates_take_portable_paths(emulate):
     assert dict(predicates.pdl_launch_kwargs()) == {}
     assert not predicates.use_native_e4m3()
     assert not predicates.use_sm100_kernels()
+
+
+@pytest.mark.skipif(
+    not (current_platform.is_cuda_alike() or current_platform.is_xpu()),
+    reason="needs a GPU",
+)
+@pytest.mark.parametrize("rows", [1, 8, 32])
+def test_linear_small_batches_without_flashinfer(monkeypatch, rows):
+    """Off SM10x, `linear` of up to 32 rows never queries FlashInfer (a
+    CUDA-only dependency, made unimportable here) and is `F.linear`. Before
+    the operand reorder, the FlashInfer autotuning query ran first and raised
+    `ModuleNotFoundError`."""
+    import sys
+
+    import torch
+
+    from vllm.models.inkling2.common.ops import linear as linear_ops
+
+    if predicates.use_sm100_kernels():
+        pytest.skip("SM10x runs FlashInfer's mm_bf16 for up to 32 rows")
+    monkeypatch.setitem(sys.modules, "flashinfer", None)
+    monkeypatch.setitem(sys.modules, "flashinfer.autotuner", None)
+    device = current_platform.device_type
+    torch.manual_seed(0)
+    x = torch.randn(rows, 512, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(256, 512, device=device, dtype=torch.bfloat16)
+    actual = linear_ops.linear(x, weight)
+    torch.testing.assert_close(
+        actual, torch.nn.functional.linear(x, weight), atol=0, rtol=0
+    )
