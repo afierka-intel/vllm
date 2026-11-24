@@ -12,9 +12,12 @@ the result of the picked one.
 from types import SimpleNamespace
 
 import pytest
+import torch
 
+import vllm.models.inkling2.common.ops.linear as linear_ops
 import vllm.models.inkling2.common.ops.rel_attention as rel_attention_ops
-from tests.models.inkling2 import test_attention
+from tests.models.inkling2 import test_attention, test_core_ops
+from tests.models.inkling2.utils import DEVICE
 from vllm.platforms import current_platform
 from vllm.triton_utils import force_first_config
 
@@ -32,6 +35,7 @@ def _tuners():
     variant)."""
     return [
         rel_attention_ops._rel_attention_kernel_tuned,
+        *(linear_ops._k_group_kernel_tuned(b) for b, _ in linear_ops._TOKEN_BUCKETS),
     ]
 
 
@@ -85,6 +89,13 @@ def _assert_tuned(events, *names):
         )
 
 
+def test_k_group_tunes_and_matches_ordered_groups(cold_tuning, monkeypatch):
+    test_core_ops.test_k_group_partials_match_ordered_groups(
+        37, 384, 4608, torch.float32, monkeypatch
+    )
+    _assert_tuned(cold_tuning, "_k_group_kernel")
+
+
 def test_rel_attention_prefill_tunes_and_matches_reference(cold_tuning):
     test_attention.test_inkling2_rel_attention(12, 2, 16, None, "prefill", 1, True)
     _assert_tuned(cold_tuning, "_rel_attention_kernel")
@@ -95,3 +106,32 @@ def test_rel_decode_attention_tunes_and_matches_reference(cold_tuning):
         24, 8, None, [1] * 4, [1, 200, 1025, 3000], 128, 9
     )
     _assert_tuned(cold_tuning, "_rel_attention_kernel")
+
+
+def test_k_group_buckets_keep_separate_tuning_keys():
+    """Buckets 64 and 1024 prune to the same configs at N <= 32 (Inkling 2's
+    dynamic taps); the bucket in the tuning key still keeps their picks
+    apart, in memory and in Triton's on-disk cache (keyed by the tuning key
+    and the configs)."""
+    n, k = 32, 4608
+    small = linear_ops._k_group_kernel_tuned(64)
+    large = linear_ops._k_group_kernel_tuned(1024)
+    args = {"N": n}
+    pruned = [
+        [str(c) for c in linear_ops._prune_k_group_tiles(t.configs, args)]
+        for t in (small, large)
+    ]
+    assert pruned[0] == pruned[1]
+    torch.manual_seed(0)
+    w = torch.randn(n, k, device=DEVICE).bfloat16()
+    for tokens in (40, 100):
+        x = torch.randn(tokens, k, device=DEVICE).bfloat16()
+        linear_ops.k_group_partials(x, w)
+    keys = []
+    for bucket, tuner in ((64, small), (1024, large)):
+        assert tuner.keys[-1] == "BUCKET"
+        # (N, K, SPLIT, USE_TD, BUCKET, dtypes...) of this weight shape.
+        shape_keys = {key for key in tuner.cache if key[:2] == (n, k)}
+        assert shape_keys and all(key[4] == bucket for key in shape_keys)
+        keys.append(shape_keys)
+    assert not keys[0] & keys[1]

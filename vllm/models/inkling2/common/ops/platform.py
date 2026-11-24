@@ -62,6 +62,17 @@ def use_kernel_autotune() -> bool:
 
 
 @functools.cache
+def use_tma_k_groups() -> bool:
+    """Whether `k_group_partials` runs its host TensorDescriptor kernel for
+    large batches: with `use_pdl` (SM90+, as in vllm-project/vllm#69165; ROCm
+    as before the portable paths). XPU runs the K-group kernel, whose
+    tensor-descriptor path follows `use_tensor_descriptor()`."""
+    from vllm.platforms import current_platform
+
+    return use_pdl() and not current_platform.is_xpu()
+
+
+@functools.cache
 def use_native_conv_mix() -> bool:
     """Whether the csrc/inkling2 conv/mix kernels run here: they are built
     for Hopper and SM10x only."""

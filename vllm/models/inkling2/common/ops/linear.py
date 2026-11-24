@@ -1,7 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """bf16 linears: small batches on FlashInfer's CuTe DSL low-M kernels, and the
-reference `linear` with fp32 accumulation in ordered 1024-wide K groups."""
+reference `linear` with fp32 accumulation in ordered 1024-wide K groups.
+
+On XPU (`use_kernel_autotune`) the K-group kernel's tile is autotuned per
+token bucket and weight shape, and with `use_tensor_descriptor()` its x / W
+tiles load and its output tile stores through tensor descriptors (2D block
+IO). CUDA keeps the fixed tiles and pointer accesses, whatever
+`VLLM_TRITON_USE_TD` says."""
+
+import functools
 
 import torch
 
@@ -10,12 +18,25 @@ from vllm.models.inkling2.nvidia.ops.ll_gemm_sm120 import (
     use_sm12x_bf16_ll_gemm,
 )
 from vllm.platforms import current_platform
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import (
+    tensor_descriptor_compatible,
+    tl,
+    triton,
+    use_tensor_descriptor,
+)
+from vllm.triton_utils.allocation import set_triton_allocator
 from vllm.utils.flashinfer import is_flashinfer_autotuning
 
+from .autotune import autotune
 from .intrinsics import keep_separate, prefetch_l2
 from .pdl import gdc_launch_dependents, gdc_wait
-from .platform import pdl_launch_kwargs, use_pdl, use_sm100_kernels
+from .platform import (
+    pdl_launch_kwargs,
+    use_kernel_autotune,
+    use_pdl,
+    use_sm100_kernels,
+    use_tma_k_groups,
+)
 
 # Up to this many rows, FlashInfer's CuTe DSL low-M kernels run near HBM
 # bandwidth (cuBLAS is up to 2x slower); larger batches use cuBLAS.
@@ -46,6 +67,25 @@ def linear(
 
 
 @triton.jit
+def _load_k_tile_td(desc, row, k):
+    """`[rows, 128]` tile at `(row, k)` of a row-major `[rows, K]` operand;
+    out-of-range rows and columns read as zero."""
+    return desc.load([row, k])
+
+
+@triton.jit
+def _store_y_td(
+    Y, total, M, N: tl.constexpr, row, col, BM: tl.constexpr, BN: tl.constexpr
+):
+    """Store the `[BM, BN]` tile at `(row, col)` of the `[M, N]` output `Y`;
+    out-of-range rows and columns are dropped."""
+    desc = tl.make_tensor_descriptor(
+        Y, shape=[M, N], strides=[N, 1], block_shape=[BM, BN]
+    )
+    desc.store([row, col], total.to(Y.dtype.element_ty))
+
+
+@triton.jit
 def _k_group_tile(
     X,
     W,
@@ -59,6 +99,7 @@ def _k_group_tile(
     pid_n,
     pid_m,
     pid_k,
+    USE_TD: tl.constexpr = False,
 ):
     # Row tiles of at most 64 keep tl.dot on the same mma.sync instruction
     # sequence as the reference's 16x32x32 tiling. With SPLIT, each program computes one
@@ -68,22 +109,34 @@ def _k_group_tile(
     ks = tl.arange(0, 128)
     first = pid_k if SPLIT else 0
     NUM_GROUPS: tl.constexpr = 1 if SPLIT else (K + 1023) // 1024
+    if USE_TD:
+        x_desc = tl.make_tensor_descriptor(
+            X, shape=[M, K], strides=[K, 1], block_shape=[BM, 128]
+        )
+        w_desc = tl.make_tensor_descriptor(
+            W, shape=[N, K], strides=[K, 1], block_shape=[BN, 128]
+        )
     total = tl.zeros((BM, BN), tl.float32)
     for g in tl.static_range(NUM_GROUPS):
         group = first + g
         partial = tl.zeros((BM, BN), tl.float32)
         for tile in range(tl.minimum(8, tl.cdiv(K - group * 1024, 128))):
-            k = group * 1024 + tile * 128 + ks
-            x = tl.load(
-                X + rows[:, None] * K + k[None, :],
-                (rows[:, None] < M) & (k[None, :] < K),
-                other=0,
-            )
-            w = tl.load(
-                W + cols[None, :] * K + k[:, None],
-                (cols[None, :] < N) & (k[:, None] < K),
-                other=0,
-            )
+            if USE_TD:
+                k0 = group * 1024 + tile * 128
+                x = _load_k_tile_td(x_desc, pid_m * BM, k0)
+                w = _load_k_tile_td(w_desc, pid_n * BN, k0).T
+            else:
+                k = group * 1024 + tile * 128 + ks
+                x = tl.load(
+                    X + rows[:, None] * K + k[None, :],
+                    (rows[:, None] < M) & (k[None, :] < K),
+                    other=0,
+                )
+                w = tl.load(
+                    W + cols[None, :] * K + k[:, None],
+                    (cols[None, :] < N) & (k[:, None] < K),
+                    other=0,
+                )
             partial = tl.dot(x, w, partial)
         if g > 0:
             # Keep a short tail's dot separate from the preceding 1024-wide
@@ -91,11 +144,14 @@ def _k_group_tile(
             # (`keep_separate` is an identity off CUDA, see `intrinsics`).
             partial = keep_separate(partial)
         total = partial if g == 0 else total + partial
-    tl.store(
-        Y + (first * M + rows[:, None]) * N + cols[None, :],
-        total.to(Y.dtype.element_ty),
-        (rows[:, None] < M) & (cols[None, :] < N),
-    )
+    if USE_TD:
+        _store_y_td(Y + first * M * N, total, M, N, pid_m * BM, pid_n * BN, BM, BN)
+    else:
+        tl.store(
+            Y + (first * M + rows[:, None]) * N + cols[None, :],
+            total.to(Y.dtype.element_ty),
+            (rows[:, None] < M) & (cols[None, :] < N),
+        )
 
 
 @triton.jit
@@ -120,6 +176,10 @@ def _k_group_kernel(
     BM: tl.constexpr,
     BN: tl.constexpr,
     SPLIT: tl.constexpr,
+    USE_TD: tl.constexpr = False,
+    # Token bucket of the autotuned launch (unused in the body): an autotune
+    # key, so that the buckets never share a tuned tile.
+    BUCKET: tl.constexpr = 0,
 ):
     if SPLIT and tl.program_id(1) == 0:
         _prefetch_k_group_tile(W, N, K, BN, tl.program_id(0), tl.program_id(2))
@@ -137,6 +197,7 @@ def _k_group_kernel(
         tl.program_id(0),
         tl.program_id(1),
         tl.program_id(2),
+        USE_TD,
     )
 
 
@@ -209,7 +270,7 @@ def k_group_partials(
     # SM12x, SM86 and SM89 have ~100 KB of shared memory per block; SM80's
     # 164 KB fits the default stage counts. SM8x has no TMA.
     small_smem = sm120 or not (use_pdl() or current_platform.is_device_capability(80))
-    if tokens >= TMA_MIN_TOKENS and use_pdl():
+    if tokens >= TMA_MIN_TOKENS and use_tma_k_groups():
         from triton.tools.tensor_descriptor import TensorDescriptor
 
         out = torch.empty((1, tokens, n), dtype=out_dtype, device=x.device)
@@ -232,19 +293,50 @@ def k_group_partials(
             **pdl_launch_kwargs(),
         )
         return out
-    block_m = 16 if tokens <= 128 else 64
-    block_n = 32 if tokens <= 16 else 64 if tokens <= 256 else 128
     groups = triton.cdiv(hidden, 1024)
     split = groups > 1 and tokens < 4096
-    num_warps = 4 if block_n <= 64 else 8
-    num_stages = 4 if not split else 3 if block_n <= 64 else 2
-    if small_smem:
-        num_stages = min(num_stages, 2)
     out = torch.empty(
         (groups if split else 1, tokens, n),
         dtype=torch.float32 if split else out_dtype,
         device=x.device,
     )
+    if use_kernel_autotune():
+        use_td = (
+            current_platform.is_xpu()
+            and use_tensor_descriptor()
+            and tensor_descriptor_compatible(x, weight, out[0])
+        )
+        if use_td:
+            # On every launch: Triton's allocator is a per-thread ContextVar.
+            set_triton_allocator(x.device)
+
+        def tuned_grid(meta):
+            return (
+                triton.cdiv(n, meta["BN"]),
+                triton.cdiv(tokens, meta["BM"]),
+                groups if split else 1,
+            )
+
+        bucket = _token_bucket(tokens)
+        _k_group_kernel_tuned(bucket)[tuned_grid](
+            x,
+            weight,
+            out,
+            tokens,
+            n,
+            hidden,
+            SPLIT=split,
+            USE_TD=use_td,
+            BUCKET=bucket,
+            enable_fp_fusion=False,
+        )
+        return out
+    block_m = 16 if tokens <= 128 else 64
+    block_n = 32 if tokens <= 16 else 64 if tokens <= 256 else 128
+    num_warps = 4 if block_n <= 64 else 8
+    num_stages = 4 if not split else 3 if block_n <= 64 else 2
+    if small_smem:
+        num_stages = min(num_stages, 2)
     grid = (
         triton.cdiv(n, block_n),
         triton.cdiv(tokens, block_m),
@@ -266,6 +358,58 @@ def k_group_partials(
         **pdl_launch_kwargs(),
     )
     return out
+
+
+# Autotuning buckets of `k_group_partials`: (upper token count, row tiles).
+# Each bucket has its own tuner, and the bucket is part of the tuning key, so
+# their tuned tiles stay apart, also in Triton's on-disk autotuning cache when
+# pruning leaves two buckets the same configs. The first config of every
+# bucket (VLLM_TRITON_FORCE_FIRST_CONFIG) is valid at any shape.
+_TOKEN_BUCKETS = (
+    (16, (16,)),
+    (64, (16, 32)),
+    (1024, (16, 32, 64)),
+    (1 << 62, (32, 64)),
+)
+
+# (BM, BN, num_warps, num_stages) autotuned on XPU. Every tile gives the same
+# bits (each output's K-group sums run in the same order; see
+# test_k_group_tiles_are_bitwise_identical).
+_TUNED_TILES = (
+    (16, 32, 4, 3),
+    (16, 64, 4, 3),
+    (32, 32, 4, 3),
+    (32, 64, 4, 3),
+    (64, 64, 4, 3),
+    (64, 128, 8, 2),
+)
+
+
+def _token_bucket(tokens: int) -> int:
+    return next(b for b, _ in _TOKEN_BUCKETS if tokens <= b)
+
+
+def _prune_k_group_tiles(configs, named_args, **kwargs):
+    """Column tiles up to the output width."""
+    n = {**named_args, **kwargs}["N"]
+    width = max(32, triton.next_power_of_2(n))
+    return [c for c in configs if c.kwargs["BN"] <= width] or configs[:1]
+
+
+@functools.cache
+def _k_group_kernel_tuned(bucket: int):
+    """`_k_group_kernel` with the tile autotuned per weight shape, split and
+    path, for token counts up to `bucket`."""
+    rows = dict(_TOKEN_BUCKETS)[bucket]
+    return autotune(
+        configs=[
+            triton.Config({"BM": bm, "BN": bn}, num_warps=w, num_stages=s)
+            for bm, bn, w, s in _TUNED_TILES
+            if bm in rows
+        ],
+        key=["N", "K", "SPLIT", "USE_TD", "BUCKET"],
+        prune_configs_by={"early_config_prune": _prune_k_group_tiles},
+    )(_k_group_kernel)
 
 
 def linear_k_groups(

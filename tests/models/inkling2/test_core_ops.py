@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 import torch
 
+import vllm.models.inkling2.common.ops.linear as linear_ops
 import vllm.models.inkling2.common.ops.sconv as sconv_ops
 from tests.models.inkling2.test_attention import shear_rel_logits
 from tests.models.inkling2.utils import DEVICE, device_graph
@@ -21,11 +22,130 @@ from vllm.models.inkling2.common.ops.sconv import (
     short_conv,
 )
 from vllm.platforms import current_platform
+from vllm.triton_utils import triton
 
 pytestmark = pytest.mark.skipif(
     not (torch.cuda.is_available() or current_platform.is_xpu()),
     reason="needs CUDA or XPU",
 )
+requires_xpu = pytest.mark.skipif(
+    not current_platform.is_xpu(), reason="autotuned on XPU only"
+)
+
+
+def _spy_k_group_launches(monkeypatch) -> list[bool]:
+    """The `USE_TD` of every autotuned K-group launch."""
+    calls: list[bool] = []
+    tuned = linear_ops._k_group_kernel_tuned
+
+    class Launcher:
+        def __init__(self, bucket):
+            self.tuner = tuned(bucket)
+
+        def __getitem__(self, grid):
+            launch = self.tuner[grid]
+
+            def run(*args, **kwargs):
+                calls.append(kwargs["USE_TD"])
+                return launch(*args, **kwargs)
+
+            return run
+
+    monkeypatch.setattr(linear_ops, "_k_group_kernel_tuned", Launcher)
+    return calls
+
+
+@pytest.mark.parametrize(
+    "tokens,n,k",
+    [(1, 128, 2304), (37, 384, 4608), (300, 32, 4608), (2048, 128, 2304)],
+)
+@pytest.mark.parametrize("out_dtype", [torch.float32, torch.bfloat16])
+def test_k_group_partials_match_ordered_groups(tokens, n, k, out_dtype, monkeypatch):
+    """`k_group_partials` keeps fp32 1024-wide K-group partials (or their
+    in-order sum); on XPU its descriptor path gives the pointer path's bits
+    at the same tile."""
+    from vllm.models.inkling2.common.ops import linear as ops
+
+    torch.manual_seed(0)
+    x = torch.randn(tokens, k, device=DEVICE).bfloat16()
+    w = torch.randn(n, k, device=DEVICE).bfloat16()
+    groups = [
+        x[:, g : g + 1024].float() @ w[:, g : g + 1024].float().T
+        for g in range(0, k, 1024)
+    ]
+    out = ops.k_group_partials(x, w, out_dtype)
+    if out.shape[0] == len(groups):
+        expected = torch.stack(groups)
+    else:
+        total = groups[0]
+        for partial in groups[1:]:
+            total = total + partial
+        expected = total[None].to(out_dtype)
+    torch.testing.assert_close(out.float(), expected.float(), atol=2e-3, rtol=1e-2)
+    if not ops.use_kernel_autotune():
+        return
+    # One tile for both paths.
+    monkeypatch.setattr(ops, "_TOKEN_BUCKETS", ((1 << 62, (32,)),))
+    monkeypatch.setattr(ops, "_TUNED_TILES", ((32, 64, 4, 3),))
+    tuned = ops._k_group_kernel_tuned
+    tuned.cache_clear()
+    try:
+        calls = _spy_k_group_launches(monkeypatch)
+        results = []
+        for use_td in (False, True):
+            monkeypatch.setattr(ops, "use_tensor_descriptor", lambda td=use_td: td)
+            results.append(ops.k_group_partials(x, w, out_dtype))
+    finally:
+        tuned.cache_clear()
+    # The second launch really took the descriptor path.
+    assert calls == [False, True]
+    torch.testing.assert_close(results[1], results[0], atol=0, rtol=0)
+
+
+@requires_xpu
+@pytest.mark.parametrize(
+    "tokens,n,k",
+    # Router / dynamic taps (split K groups) and an unsplit in-order sum.
+    [(8, 32, 4608), (40, 384, 4608), (300, 128, 2304), (4096, 128, 2304)],
+)
+@pytest.mark.parametrize("use_td", [False, True])
+def test_k_group_tiles_are_bitwise_identical(tokens, n, k, use_td):
+    """Every autotuned K-group tile gives the bits of the first one (with
+    and without descriptors), so the tuned pick (per process, per TP rank)
+    cannot change a router's top-k."""
+    from vllm.models.inkling2.common.ops import linear as ops
+    from vllm.triton_utils.allocation import set_triton_allocator
+
+    torch.manual_seed(0)
+    x = torch.randn(tokens, k, device=DEVICE).bfloat16()
+    w = torch.randn(n, k, device=DEVICE).bfloat16()
+    groups = triton.cdiv(k, 1024)
+    split = groups > 1 and tokens < 4096
+    if use_td:
+        set_triton_allocator(x.device)
+    results = []
+    for bm, bn, warps, stages in ops._TUNED_TILES:
+        out = torch.empty(groups if split else 1, tokens, n, device=DEVICE)
+        grid = (triton.cdiv(n, bn), triton.cdiv(tokens, bm), groups if split else 1)
+        ops._k_group_kernel[grid](
+            x,
+            w,
+            out,
+            tokens,
+            n,
+            k,
+            bm,
+            bn,
+            split,
+            USE_TD=use_td,
+            num_warps=warps,
+            num_stages=stages,
+            enable_fp_fusion=False,
+        )
+        results.append(((bm, bn, warps, stages), out))
+    first = results[0][1]
+    for tile, out in results[1:]:
+        assert torch.equal(out.view(torch.int32), first.view(torch.int32)), tile
 
 
 @pytest.mark.parametrize("in_dtype", [torch.bfloat16, torch.float32])
@@ -735,3 +855,20 @@ def test_sm12x_linear_large_batch_fallback():
     weight = torch.randn(129, 256, device=DEVICE).bfloat16()
     expected = torch.nn.functional.linear(x, weight)
     torch.testing.assert_close(linear(x, weight), expected, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(current_platform.is_xpu(), reason="the TD gate off XPU")
+def test_td_paths_stay_off_on_cuda(monkeypatch):
+    """With TD forced on (`VLLM_TRITON_USE_TD=1`), the K-group launches keep
+    their pointer path off XPU: none of them sets up the descriptors'
+    allocator."""
+
+    def no_descriptors(device):
+        raise AssertionError("a tensor-descriptor path ran off XPU")
+
+    for module in (linear_ops,):
+        monkeypatch.setattr(module, "use_tensor_descriptor", lambda *_: True)
+        monkeypatch.setattr(module, "set_triton_allocator", no_descriptors)
+    test_k_group_partials_match_ordered_groups(
+        37, 384, 4608, torch.float32, monkeypatch
+    )
