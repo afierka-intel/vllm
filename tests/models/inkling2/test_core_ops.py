@@ -33,6 +33,18 @@ requires_xpu = pytest.mark.skipif(
 )
 
 
+def _each_tuned_config(monkeypatch, tuner) -> Iterator[Any]:
+    """On XPU, pin each config of `tuner` in turn (a one-config tuner
+    launches it without benchmarking); elsewhere (or without a tuner) one
+    pass on the fixed launch config."""
+    if tuner is None or not linear_ops.use_kernel_autotune():
+        yield None
+        return
+    for config in list(tuner.configs):
+        monkeypatch.setattr(tuner, "configs", [config])
+        yield config
+
+
 def _spy_k_group_launches(monkeypatch) -> list[bool]:
     """The `USE_TD` of every autotuned K-group launch."""
     calls: list[bool] = []
@@ -375,7 +387,7 @@ def test_prologue_shears_rel_logits(is_local, split, monkeypatch):
 # Small batches keep rows in registers; large ones loop over D chunks.
 @pytest.mark.parametrize("tokens", [29, 300])
 def test_attn_res_matches_softmax_mix_then_norm(
-    num_stack, num_q, with_addend, normalize, tokens
+    num_stack, num_q, with_addend, normalize, tokens, monkeypatch
 ):
     dim = 4608
     stack = torch.randn(num_stack, tokens, dim, device=DEVICE).bfloat16()
@@ -395,15 +407,25 @@ def test_attn_res_matches_softmax_mix_then_norm(
     ref = mix * torch.rsqrt(mix.square().mean(-1, keepdim=True) + 1e-6)
     ref = (ref * weight.float()[:, None]).bfloat16()
 
-    out = attn_res(stack, last, addend, queries, weight, 1e-6, normalize)
-    assert out.dtype == torch.bfloat16
-    torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-2)
+    for _ in _each_tuned_config(monkeypatch, _attn_res_tuner(tokens, num_q)):
+        out = attn_res(stack, last, addend, queries, weight, 1e-6, normalize)
+        assert out.dtype == torch.bfloat16
+        torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-2)
+
+
+def _attn_res_tuner(tokens: int, num_q: int):
+    """The autotuned AttnRes launch `attn_res` takes: none, both AttnRes
+    kernels keep their fixed configs (the D chunk sets the sum-of-squares
+    order)."""
+    return None
 
 
 @pytest.mark.parametrize("num_stack,with_addend", [(1, False), (3, True)])
 # Small batches keep rows in registers; large ones loop over D chunks.
 @pytest.mark.parametrize("tokens", [29, 300])
-def test_attn_res_without_norm_returns_fp32_mix(num_stack, with_addend, tokens):
+def test_attn_res_without_norm_returns_fp32_mix(
+    num_stack, with_addend, tokens, monkeypatch
+):
     """Without a norm weight, `attn_res` returns the fp32 softmax mix (the
     loop's sublayer inputs before their controllers, and its message reads:
     a mix of two blocks)."""
@@ -420,9 +442,10 @@ def test_attn_res_without_norm_returns_fp32_mix(num_stack, with_addend, tokens):
     probs = torch.einsum("ntd,qd,nt->qtn", values, queries, inv_rms).softmax(-1)
     ref = torch.einsum("qtn,ntd->qtd", probs, values * inv_rms[..., None])
 
-    out = attn_res(stack, last, addend, queries, None, 0.0, True)
-    assert out.dtype == torch.float32
-    torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-4)
+    for _ in _each_tuned_config(monkeypatch, _attn_res_tuner(tokens, 4)):
+        out = attn_res(stack, last, addend, queries, None, 0.0, True)
+        assert out.dtype == torch.float32
+        torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-4)
 
 
 @pytest.mark.parametrize("tokens", [1, 300])
