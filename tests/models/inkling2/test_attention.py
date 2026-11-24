@@ -508,6 +508,27 @@ def test_inkling2_rel_decode_attention(
     assert (out[num_tokens:] == 0).all()
 
 
+@pytest.mark.skipif(not current_platform.is_xpu(), reason="autotuned on XPU")
+@pytest.mark.parametrize(
+    "query_lens,kv_lens,large",
+    [([8, 8, 3], [8, 1500, 2100], False), ([8, 8, 8], [8, 1500, 2100], True)],
+)
+def test_rel_decode_combine_every_tuned_config(query_lens, kv_lens, large, monkeypatch):
+    """Each config of the autotuned split-KV combine (small and large
+    batches) meets the decode reference tolerance."""
+    from vllm.models.inkling2.common.ops import attention as ops
+
+    num_heads = 24
+    assert (sum(query_lens) * num_heads >= 512) == large
+    tuner = ops._rel_decode_combine_kernel_tuned(large, False)
+    for config in list(tuner.configs):
+        # A one-config tuner launches it without benchmarking.
+        monkeypatch.setattr(tuner, "configs", [config])
+        test_inkling2_rel_decode_attention(
+            num_heads, 8, None, query_lens, kv_lens, 128, 9
+        )
+
+
 @requires_triton_attention
 @pytest.mark.parametrize("is_local", [False, True])
 @pytest.mark.parametrize("num_splits", [1, 9])
