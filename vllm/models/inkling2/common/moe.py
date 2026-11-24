@@ -61,7 +61,13 @@ class FlatExperts(Protocol):
     returns the combined bf16 `[T, H]` output instead: the routing weight
     scales each down-projection row in fp32 and the sum is rounded once to
     bf16, as `combine` does. It serves only the reduced output (no
-    `reduce=False` rows, no `push`). Without the attribute it is False."""
+    `reduce=False` rows, no `push`). Without the attribute it is False.
+
+    A backend whose `keeps_parameters` is True (the XPU ones) is built from
+    the layer's Parameters instead of their `.data` and keeps them, in the
+    checkpoint layout or rewritten in place into its kernel layout; the
+    other backends get the `.data` tensors and the Parameters are emptied
+    after the build."""
 
     def __call__(
         self,
@@ -80,8 +86,7 @@ def flat_experts_class(
 ) -> Callable[..., FlatExperts]:
     """This platform's `FlatExperts` constructor for `quant_format` experts
     with `topk` slots per token and the SiTU softcaps of the layer: the XPU
-    backends (which raise `NotImplementedError` at model init where no
-    kernel serves them) on XPU, Humming elsewhere."""
+    backends on XPU, Humming elsewhere."""
     if current_platform.is_xpu():
         from vllm.models.inkling2.xpu.experts import xpu_flat_experts
 
@@ -260,9 +265,27 @@ class Inkling2Experts(nn.Module):
         )
         param.data.copy_(loaded)
 
+    def _flat_experts_keep_parameters(self) -> bool:
+        """Whether the flat backend is built from the Parameters themselves
+        (its `keeps_parameters`): it keeps them, rewritten in place into its
+        kernel layout where it needs one, so they stay module state."""
+        backend = self.flat_experts_cls
+        # The XPU constructors are `functools.partial`s of the backend.
+        backend = getattr(backend, "func", backend)
+        return bool(getattr(backend, "keeps_parameters", False))
+
     def process_weights_after_loading(self) -> None:
         if self.sm100 or (self.sm120 and not self.humming_nvfp4):
             return
+        if self.flat_experts is not None or self.humming is not None:
+            raise RuntimeError(
+                "Inkling2Experts.process_weights_after_loading was already "
+                "called: the expert kernels were built from the loaded "
+                "weights, which now hold the kernel layout (or were released). "
+                "Reloading the routed experts' weights into a built layer is "
+                "not supported."
+            )
+        keep = not self.humming_nvfp4 and self._flat_experts_keep_parameters()
         weights = {}
         for name in ("w13", "w2"):
             amax, denominator = self.scales(name)
@@ -271,16 +294,18 @@ class Inkling2Experts(nn.Module):
                 global_scale = (
                     self.ones if self.humming_nvfp4 else amax.data / denominator.data
                 )
-            weights[name] = (
-                getattr(self, f"{name}_weight").data,
-                getattr(self, f"{name}_weight_scale").data,
-                global_scale,
-            )
+            weight = getattr(self, f"{name}_weight")
+            scale = getattr(self, f"{name}_weight_scale")
+            if not keep:
+                weight, scale = weight.data, scale.data
+            weights[name] = (weight, scale, global_scale)
         if self.humming_nvfp4:
             self.humming = HummingNVFP4Experts(weights, self.shapes)
         else:
             assert self.flat_experts_cls is not None
             self.flat_experts = self.flat_experts_cls(weights, self.shapes, self.nvfp4)
+        if keep:
+            return
         # The repacked copies replace the checkpoint layout.
         for name in ("w13", "w2"):
             for suffix in ("weight", "weight_scale"):

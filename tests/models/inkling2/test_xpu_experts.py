@@ -1,20 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inkling2 XPU routed-expert backends vs. dequantized torch references, at
-the expert shapes of Inkling 2 Mini and Small."""
+the expert shapes of Inkling 2 Mini and Small. The NVFP4 kernel itself
+(`nvfp4_emulation_moe.py`) is tested in
+`tests/kernels/moe/test_nvfp4_emulation_moe.py`."""
 
 import pytest
 import torch
 
 from vllm.platforms import current_platform
-from vllm.triton_utils import tensor_descriptor_compatible, tl, triton
 
 if not current_platform.is_xpu():
     pytest.skip("Inkling2 XPU expert backends", allow_module_level=True)
 
-from vllm.model_executor.layers.fused_moe.moe_align_block_size import (  # noqa: E402
-    moe_align_block_size,
-)
 from vllm.models.inkling2.common.moe import (  # noqa: E402
     Inkling2MoE,
     flat_experts_class,
@@ -22,10 +20,6 @@ from vllm.models.inkling2.common.moe import (  # noqa: E402
 from vllm.models.inkling2.common.ops import moe as moe_ops  # noqa: E402
 from vllm.models.inkling2.common.ops.linear import linear_k_groups  # noqa: E402
 from vllm.models.inkling2.common.ops.moe import select_experts  # noqa: E402
-from vllm.models.inkling2.common.ops.nvfp4_w4a16_moe import (  # noqa: E402
-    _e4m3_to_f32,
-    nvfp4_w4a16_moe,
-)
 from vllm.models.inkling2.configs import Inkling2ModelConfig  # noqa: E402
 from vllm.models.inkling2.xpu.experts import (  # noqa: E402
     XpuMxfp8Experts,
@@ -171,12 +165,13 @@ def test_deinterleave_rows_round_trip(dtype: torch.dtype):
 
 @pytest.mark.parametrize("fmt", FORMATS)
 @pytest.mark.parametrize("model", list(SHAPES))
-@pytest.mark.parametrize("tokens", [1, 7, 64, 300])
+@pytest.mark.parametrize("tokens", [1, 7, 64, 65, 300])
 def test_xpu_experts_match_reference(fmt: str, model: str, tokens: int):
     """The XPU backend of `flat_experts_class` on local experts (one EP
     rank for Small) vs. the dequantized reference, with non-local slots,
     empty experts and a token routed to no local expert (which comes out
-    0)."""
+    0). NVFP4: 64 tokens take the kernel's split-dots path, 65 its default
+    path."""
     torch.manual_seed(0)
     hidden, inter, num_global, num_local = SHAPES[model]
     weights = random_weights(fmt, num_local, hidden, inter)
@@ -202,12 +197,10 @@ def test_xpu_experts_match_reference(fmt: str, model: str, tokens: int):
     torch.testing.assert_close(out, ref, atol=1e-2 * scale, rtol=2e-2)
 
 
-@pytest.mark.parametrize("fmt", FORMATS)
-@pytest.mark.parametrize("tokens", [5, 64])
-def test_xpu_moe_layer_matches_reference(dist_init, fmt: str, tokens: int):
-    """`Inkling2MoE` (TP=1) at Mini shapes: `select_experts`, the XPU
-    backend and the combine, vs. the reference on the layer's own routing."""
-    torch.manual_seed(0)
+def mini_layer(fmt: str):
+    """`Inkling2MoE` (TP=1) at Mini shapes with random checkpoint weights
+    loaded through the weight loaders, before `process_weights_after_loading`;
+    and those weights."""
     hidden, inter, num_experts, _ = SHAPES["mini"]
     config = Inkling2ModelConfig(
         hidden_size=hidden,
@@ -235,8 +228,18 @@ def test_xpu_moe_layer_matches_reference(dist_init, fmt: str, tokens: int):
             )
     for name, param in moe.named_parameters():
         param.weight_loader(param, loaded[name])
+    return moe, weights
+
+
+@pytest.mark.parametrize("fmt", FORMATS)
+@pytest.mark.parametrize("tokens", [5, 64])
+def test_xpu_moe_layer_matches_reference(dist_init, fmt: str, tokens: int):
+    """`Inkling2MoE` (TP=1) at Mini shapes: `select_experts`, the XPU
+    backend and the combine, vs. the reference on the layer's own routing."""
+    torch.manual_seed(0)
+    moe, weights = mini_layer(fmt)
     moe.experts.process_weights_after_loading()
-    x = torch.randn(tokens, hidden, device=DEVICE).bfloat16()
+    x = torch.randn(tokens, SHAPES["mini"][0], device=DEVICE).bfloat16()
     out = moe(x)
 
     gate = moe.gate
@@ -250,101 +253,62 @@ def test_xpu_moe_layer_matches_reference(dist_init, fmt: str, tokens: int):
     torch.testing.assert_close(out, ref, atol=1e-2 * scale, rtol=2e-2)
 
 
-@pytest.mark.parametrize("use_td", [False, True])
-@pytest.mark.parametrize("a_div", [1, TOPK])
-@pytest.mark.parametrize(
-    "n,k,block_m",
-    # Mini down projection (K % 256 != 0) and Small gate/up, every row block.
-    [(2304, 1152, 16), (2304, 1152, 64), (4608, 4608, 16), (4608, 4608, 32)],
-)
-def test_nvfp4_w4a16_moe_matches_dequantized_matmul(
-    n: int, k: int, block_m: int, a_div: int, use_td: bool
-):
-    """Each row the alignment lists (not the -1 slots, none of the empty
-    experts) is its activation row times its expert's dequantized weights;
-    rows of several row blocks per expert and of one-row experts. Weight
-    tiles load by pointers and through a tensor descriptor."""
+@pytest.mark.parametrize("fmt", FORMATS)
+def test_xpu_experts_keep_kernel_weights_as_parameters(dist_init, fmt: str):
+    """After `process_weights_after_loading` the backend computes on the
+    layer's Parameters (MXFP8: rewritten into the kernel layout, with the
+    library's rebuild mark on the `w13` Parameter; NVFP4: the checkpoint
+    layout as loaded), so `named_parameters()` shows the weights in use;
+    a second call fails loudly."""
     torch.manual_seed(0)
-    num_experts, tokens = 24, 40
-    values, scales, amax = random_nvfp4(num_experts, n, k)
-    global_scale = amax / DENOMINATOR
-    ids = torch.randint(0, num_experts - 3, (tokens, TOPK), dtype=torch.int32)
-    ids[ids == 2] = -1
-    ids[0, 0] = num_experts - 1  # a one-row expert
-    ids = ids.to(DEVICE)
-    rows = tokens * TOPK
-    a = torch.randn(rows // a_div, k, device=DEVICE).bfloat16()
-    alignment = moe_align_block_size(
-        ids, block_m, num_experts, ignore_invalid_experts=True
-    )[:3]
-    # The descriptor path is taken when asked for.
-    assert tensor_descriptor_compatible(values)
-    out = nvfp4_w4a16_moe(
-        a, values, scales, global_scale, alignment, rows, a_div, block_m, use_td
-    )
-    flat = ids.flatten()
-    for expert in range(num_experts):
-        (r,) = (flat == expert).nonzero(as_tuple=True)
-        w = dequant_nvfp4(values[expert], scales[expert]) * global_scale[expert]
-        ref = a[r // a_div].float() @ w.T
-        # Only the fp32 summation order differs; one bf16 rounding.
-        torch.testing.assert_close(out[r].float(), ref, atol=1e-3, rtol=2**-8)
+    moe, weights = mini_layer(fmt)
+    experts = moe.experts
+    experts.process_weights_after_loading()
+    params = dict(experts.named_parameters())
+    backend = experts.flat_experts
+    if fmt == "mxfp8":
+        assert isinstance(backend, XpuMxfp8Experts)
+        assert backend.moe.w13 is params["w13_weight"]
+        assert backend.moe.w2 is params["w2_weight"]
+        assert getattr(params["w13_weight"], "xpu_fused_moe", False)
+        # xe_2 layout [E, K, N] of the de-interleaved checkpoint rows.
+        hidden, inter, _, _ = SHAPES["mini"]
+        assert params["w2_weight"].shape == (weights["w2"][0].shape[0], inter, hidden)
+        ckpt = weights["w2"][0]
+        assert torch.equal(
+            params["w2_weight"].view(torch.uint8),
+            ckpt.transpose(-1, -2).contiguous().view(torch.uint8),
+        )
+    else:
+        assert isinstance(backend, XpuNvfp4Experts)
+        for name in ("w13", "w2"):
+            weight, scale, _ = backend.weights[name]
+            assert weight is params[f"{name}_weight"]
+            assert scale is params[f"{name}_weight_scale"]
+            assert torch.equal(weight, weights[name][0])
+    with pytest.raises(RuntimeError, match="already called"):
+        experts.process_weights_after_loading()
 
 
-@triton.jit
-def _decode_e4m3_kernel(Codes, Out):
-    offs = tl.arange(0, 256)
-    tl.store(Out + offs, _e4m3_to_f32(tl.load(Codes + offs)))
-
-
-def test_nvfp4_e4m3_scale_decode_matches_torch():
-    """All 256 e4m3fn codes decode as torch does: zeros, subnormals, normals
-    up to 448, negatives, and NaN for 0x7F / 0xFF."""
-    codes = torch.arange(256, device=DEVICE).to(torch.uint8)
-    out = torch.empty(256, device=DEVICE)
-    _decode_e4m3_kernel[(1,)](codes, out)
-    expected = codes.view(torch.float8_e4m3fn).float()
-    assert torch.equal(out.isnan(), expected.isnan())
-    assert expected.isnan().sum() == 2
-    finite = ~expected.isnan()
-    # Bits, so that the sign of zero counts too.
-    assert torch.equal(
-        out[finite].view(torch.int32), expected[finite].view(torch.int32)
-    )
-
-
-@pytest.mark.parametrize("use_td", [False, True])
-@pytest.mark.parametrize("n,k,block_m", [(2304, 1152, 16), (4608, 4608, 32)])
-def test_nvfp4_w4a16_moe_every_finite_scale_code(
-    n: int, k: int, block_m: int, use_td: bool
-):
-    """Block scales of every finite e4m3 code (subnormal, the largest,
-    negative and zero), one code per output column, against the dequantized
-    matmul (same tolerance as the random-scale test)."""
+def test_mxfp8_build_memory_peak_is_documented(dist_init):
+    """The load-time extra memory of `XpuMxfp8Experts` is what its docstring
+    states: the de-interleave is one expert at a time, but the relayout
+    holds a copy of the whole local `w13` and `w2` at once."""
     torch.manual_seed(0)
-    num_experts, tokens = 4, 16
-    values, _, amax = random_nvfp4(num_experts, n, k)
-    global_scale = amax / DENOMINATOR
-    codes = torch.arange(256, dtype=torch.int32)
-    codes = codes[(codes & 0x7F) != 0x7F]
-    column = codes[torch.arange(n) % codes.numel()].to(torch.uint8)
-    scales = column[None, :, None].expand(num_experts, n, k // 16).contiguous()
-    scales = scales.to(DEVICE).view(torch.float8_e4m3fn)
-    assert not scales.float().isnan().any()
-    ids = torch.randint(0, num_experts, (tokens, TOPK), dtype=torch.int32)
-    ids = ids.to(DEVICE)
-    rows = tokens * TOPK
-    a = torch.randn(rows, k, device=DEVICE).bfloat16()
-    alignment = moe_align_block_size(ids, block_m, num_experts)[:3]
-    out = nvfp4_w4a16_moe(
-        a, values, scales, global_scale, alignment, rows, 1, block_m, use_td
+    hidden, inter, _, num_local = SHAPES["mini"]
+    weights = random_weights("mxfp8", num_local, hidden, inter)
+    layer = sum(t.numel() * t.element_size() for w in weights.values() for t in w[:2])
+    w13_bytes = weights["w13"][0].numel()
+    torch.xpu.synchronize()
+    torch.xpu.reset_peak_memory_stats()
+    before = torch.xpu.memory_allocated()
+    experts = flat_experts_class("mxfp8", TOPK, GATE_CAP, UP_CAP)(
+        weights, ((2 * inter, hidden), (hidden, inter)), False
     )
-    flat = ids.flatten()
-    for expert in range(num_experts):
-        (r,) = (flat == expert).nonzero(as_tuple=True)
-        w = dequant_nvfp4(values[expert], scales[expert]) * global_scale[expert]
-        ref = a[r].float() @ w.T
-        torch.testing.assert_close(out[r].float(), ref, atol=1e-3, rtol=2**-8)
+    torch.xpu.synchronize()
+    extra = torch.xpu.max_memory_allocated() - before
+    assert w13_bytes < extra <= 1.05 * layer + 2**20, (extra, layer)
+    del experts
 
 
 @pytest.mark.parametrize("tokens", [5, 300])
