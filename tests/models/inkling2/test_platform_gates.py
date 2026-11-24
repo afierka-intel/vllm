@@ -84,7 +84,7 @@ def test_cuda_predicates_keep_cuda_decisions(emulate, family):
     assert dict(predicates.pdl_launch_kwargs()) == {"launch_pdl": True}
     assert predicates.use_sm100_kernels() == (family == 100)
     for quant_format in ("nvfp4", "mxfp8"):
-        assert flat_experts_class(quant_format) is HummingExperts
+        assert flat_experts_class(quant_format, 8, 4.0, 25.0) is HummingExperts
 
 
 @pytest.mark.parametrize("capability", [90, 94, 95])
@@ -95,7 +95,7 @@ def test_rocm_keeps_cuda_dispatch(emulate, capability):
     assert predicates.use_native_conv_mix()
     assert predicates.use_pdl()
     for quant_format in ("nvfp4", "mxfp8"):
-        assert flat_experts_class(quant_format) is HummingExperts
+        assert flat_experts_class(quant_format, 8, 4.0, 25.0) is HummingExperts
 
 
 @pytest.mark.parametrize(
@@ -132,15 +132,6 @@ def test_xpu_predicates_take_portable_paths(emulate):
     assert dict(predicates.pdl_launch_kwargs()) == {}
     assert not predicates.use_native_e4m3()
     assert not predicates.use_sm100_kernels()
-
-
-@pytest.mark.parametrize("quant_format", ["nvfp4", "mxfp8"])
-def test_xpu_routed_experts_fail_loud(emulate, quant_format):
-    """XPU has no routed-expert GEMM yet: the layer fails at model init,
-    before any weight loads, naming the format and the device."""
-    emulate("xpu")
-    with pytest.raises(NotImplementedError, match=quant_format.upper()):
-        flat_experts_class(quant_format)
 
 
 def _vllm_config(tmp_path, lora: bool):

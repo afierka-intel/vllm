@@ -52,8 +52,7 @@ steps:
 
 - label: ":intel: (B70) Inkling 2"
   key: inkling2-xpu
-  # Measured cold (empty Triton cache, one B70) with the expert tests of the
-  # follow-up PR: 28 min.
+  # Measured cold (empty Triton cache, one B70): 28 min.
   timeout_in_minutes: 50
   device: intel_gpu_k8s
   num_devices: 1
@@ -70,6 +69,8 @@ steps:
   - vllm/models/inkling/nvidia/ops/norm.py
   - vllm/models/inkling/nvidia/ops/fa4_rel_attention.py
   - vllm/model_executor/layers/fused_moe/moe_align_block_size.py
+  - vllm/model_executor/layers/fused_moe/experts/nvfp4_emulation_moe.py
+  - vllm/model_executor/layers/quantization/utils/nvfp4_emulation_utils.py
   - vllm/_custom_ops.py
   - vllm/v1/attention/backends/flash_attn.py
   - vllm/v1/core/single_type_kv_cache_manager.py
@@ -80,13 +81,17 @@ steps:
   - vllm/platforms/xpu.py
   - requirements/xpu.txt
   - tests/models/inkling2/
+  - tests/kernels/moe/test_nvfp4_emulation_moe.py
   commands:
-    # The portable Triton kernels, the tiny-model engines and the XPU gates
-    # (DSpark, LoRA, image inputs, FP8 KV, routed experts).
+    # The portable Triton kernels, the tiny-model engines, the XPU expert
+    # backends and their NVFP4 kernel, and the XPU gates (DSpark, LoRA,
+    # image inputs, FP8 KV).
     - cd tests
     - >-
       pytest -v -s
       models/inkling2/test_core_ops.py
       models/inkling2/test_attention.py
       models/inkling2/test_model.py
+      models/inkling2/test_xpu_experts.py
       models/inkling2/test_platform_gates.py
+      kernels/moe/test_nvfp4_emulation_moe.py

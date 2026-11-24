@@ -43,6 +43,13 @@ Note: Online FP8 = [Online Quantization](https://docs.vllm.ai/en/latest/features
 | Qwen/Qwen1.5-14B-Chat                           | QwenForCausalLM                                  | BF16/Online FP8       |
 | Qwen/Qwen1.5-32B-Chat                           | QwenForCausalLM                                  | BF16/Online FP8       |
 | RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8-dynamic | LlamaForCausalLM                                 | FP8                   |
+| thinkingmachines/Inkling-2-Mini                 | Inkling2LoopForConditionalGeneration             | NVFP4 + MXFP8         |
+| thinkingmachines/Inkling-2-Small                | Inkling2ForConditionalGeneration                 | NVFP4                 |
+| thinkingmachines/Inkling-2-Small-MXFP8          | Inkling2ForConditionalGeneration                 | MXFP8                 |
+
+Note: Inkling 2 on XPU is experimental and serves the text model only (no
+image inputs, LoRA or DSpark speculative decoding). Its routed experts run
+NVFP4 with bf16 activations (W4A16) and MXFP8.
 
 ### Multimodal Language Models
 
