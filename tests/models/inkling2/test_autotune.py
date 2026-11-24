@@ -1,0 +1,97 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Autotuning of the portable Inkling2 kernels (XPU).
+
+The CI step runs the other Inkling2 test files with
+`VLLM_TRITON_FORCE_FIRST_CONFIG=1` (first valid config, no timing) and this
+file without it, so that the tuned launch path stays covered: each test
+times every config of a fresh key (no pick from memory or disk) and checks
+the result of the picked one.
+"""
+
+from types import SimpleNamespace
+
+import pytest
+
+import vllm.models.inkling2.common.ops.rel_attention as rel_attention_ops
+from tests.models.inkling2 import test_attention
+from vllm.platforms import current_platform
+from vllm.triton_utils import force_first_config
+
+pytestmark = [
+    pytest.mark.skipif(not current_platform.is_xpu(), reason="autotuned on XPU"),
+    pytest.mark.skipif(
+        force_first_config.is_installed(),
+        reason="VLLM_TRITON_FORCE_FIRST_CONFIG replaces the autotuner",
+    ),
+]
+
+
+def _tuners():
+    """Every autotuned launch of the Inkling2 kernels (factories: each
+    variant)."""
+    return [
+        rel_attention_ops._rel_attention_kernel_tuned,
+    ]
+
+
+def test_tuned_launches_cache_picks_on_disk():
+    """The picks persist across processes (`cache_results`), independently
+    of `TRITON_CACHE_AUTOTUNING`."""
+    for tuner in _tuners():
+        assert tuner.cache_results, tuner.base_fn.__name__
+
+
+@pytest.fixture
+def cold_tuning(monkeypatch):
+    """Times every key met in the test: no pick from memory or disk. Yields
+    the tuning events `(name, configs timed, cache hit)`."""
+    from triton import knobs
+    from triton.runtime.autotuner import Autotuner
+
+    events: list[SimpleNamespace] = []
+
+    def listener(fn, key, best_config, configs_timings, duration, cache_hit):
+        events.append(
+            SimpleNamespace(
+                name=fn.__name__, timed=len(configs_timings or {}), hit=cache_hit
+            )
+        )
+
+    monkeypatch.setattr(knobs.autotuning, "listener", listener)
+    monkeypatch.setattr(
+        Autotuner,
+        "check_disk_cache",
+        lambda self, key, configs, bench_fn: bool(bench_fn()),
+    )
+    seen: set[int] = set()
+    run = Autotuner.run
+
+    def cold_run(self, *args, **kwargs):
+        if id(self) not in seen:
+            seen.add(id(self))
+            self.cache.clear()
+        return run(self, *args, **kwargs)
+
+    monkeypatch.setattr(Autotuner, "run", cold_run)
+    return events
+
+
+def _assert_tuned(events, *names):
+    for name in names:
+        assert any(e.name == name and not e.hit and e.timed > 1 for e in events), (
+            name,
+            events,
+        )
+
+
+def test_rel_attention_prefill_tunes_and_matches_reference(cold_tuning):
+    test_attention.test_inkling2_rel_attention(12, 2, 16, None, "prefill", 1, True)
+    _assert_tuned(cold_tuning, "_rel_attention_kernel")
+
+
+def test_rel_decode_attention_tunes_and_matches_reference(cold_tuning):
+    test_attention.test_inkling2_rel_decode_attention(
+        24, 8, None, [1] * 4, [1, 200, 1025, 3000], 128, 9
+    )
+    _assert_tuned(cold_tuning, "_rel_attention_kernel")

@@ -27,6 +27,7 @@ _PREDICATES = (
     predicates.use_sm100_kernels,
     predicates.use_pdl,
     predicates.pdl_launch_kwargs,
+    predicates.use_kernel_autotune,
     predicates.use_native_conv_mix,
     predicates.use_native_e4m3,
 )
@@ -76,12 +77,14 @@ CUDA_FAMILIES = [90, 100, 110, 120]
 @pytest.mark.parametrize("family", CUDA_FAMILIES)
 def test_cuda_predicates_keep_cuda_decisions(emulate, family):
     """CUDA: the native conv/mix op on Hopper and SM10x (as in
-    vllm-project/vllm#69165), PDL launches, the SM10x kernels on SM10x only,
-    and the Humming experts on the flat-row path."""
+    vllm-project/vllm#69165), PDL launches, the fixed launch configs, the
+    SM10x kernels on SM10x only, and the Humming experts on the flat-row
+    path."""
     emulate("cuda", family)
     assert predicates.use_native_conv_mix() == (family in (90, 100))
     assert predicates.use_pdl()
     assert dict(predicates.pdl_launch_kwargs()) == {"launch_pdl": True}
+    assert not predicates.use_kernel_autotune()
     assert predicates.use_sm100_kernels() == (family == 100)
     for quant_format in ("nvfp4", "mxfp8"):
         assert flat_experts_class(quant_format, 8, 4.0, 25.0) is HummingExperts
@@ -90,9 +93,11 @@ def test_cuda_predicates_keep_cuda_decisions(emulate, family):
 @pytest.mark.parametrize("capability", [90, 94, 95])
 def test_rocm_keeps_cuda_dispatch(emulate, capability):
     """ROCm takes none of the XPU decisions: the conv/mix op, the Humming
-    experts and PDL launches, as before the portable paths."""
+    experts, PDL launches and the fixed launch configs, as before the
+    portable paths."""
     emulate("rocm", capability)
     assert predicates.use_native_conv_mix()
+    assert not predicates.use_kernel_autotune()
     assert predicates.use_pdl()
     for quant_format in ("nvfp4", "mxfp8"):
         assert flat_experts_class(quant_format, 8, 4.0, 25.0) is HummingExperts
@@ -123,14 +128,30 @@ def test_pdl_launch_kwargs_per_platform(emulate, platform, capability, kwargs):
     assert predicates.use_pdl() == kwargs.get("launch_pdl", False)
 
 
+@pytest.mark.parametrize("platform", ["xpu", "cuda"])
+def test_batch_invariant_runs_fixed_configs(emulate, monkeypatch, platform):
+    """`VLLM_BATCH_INVARIANT=1` turns autotuning off on XPU (the fixed launch
+    configs run, as on CUDA); CUDA never autotunes."""
+    from vllm import envs
+
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    emulate(platform, None if platform == "xpu" else 90)
+    assert not predicates.use_kernel_autotune()
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", False)
+    predicates.use_kernel_autotune.cache_clear()
+    assert predicates.use_kernel_autotune() == (platform == "xpu")
+
+
 def test_xpu_predicates_take_portable_paths(emulate):
     """XPU: `short_conv` + `attn_res`, stream-ordered launches (no
-    `launch_pdl` option at all), software e4m3, no SM10x kernels."""
+    `launch_pdl` option at all), software e4m3, autotuned tiles, no SM10x
+    kernels."""
     emulate("xpu")
     assert not predicates.use_native_conv_mix()
     assert not predicates.use_pdl()
     assert dict(predicates.pdl_launch_kwargs()) == {}
     assert not predicates.use_native_e4m3()
+    assert predicates.use_kernel_autotune()
     assert not predicates.use_sm100_kernels()
 
 
