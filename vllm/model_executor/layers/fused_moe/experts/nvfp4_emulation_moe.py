@@ -292,6 +292,10 @@ def invoke_fused_moe_nvfp4_emulation_kernel(
     grid = lambda META: (
         triton.cdiv(EM, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
+    # The config's launch options; without them Triton launches 4 warps.
+    launch_options = {
+        key: config[key] for key in ("num_warps", "num_stages") if key in config
+    }
 
     fused_moe_nvfp4_emulation_kernel[grid](
         A,
@@ -328,6 +332,7 @@ def invoke_fused_moe_nvfp4_emulation_kernel(
         BLOCK_SIZE_N=config["BLOCK_SIZE_N"],
         BLOCK_SIZE_K=config["BLOCK_SIZE_K"],
         GROUP_SIZE_M=config["GROUP_SIZE_M"],
+        **launch_options,
     )
 
 
