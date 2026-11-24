@@ -101,7 +101,8 @@ def test_k_group_partials_match_ordered_groups(tokens, n, k, out_dtype, monkeypa
     # One tile for both paths.
     monkeypatch.setattr(ops, "_TOKEN_BUCKETS", ((1 << 62, (32,)),))
     monkeypatch.setattr(ops, "_TUNED_TILES", ((32, 64, 4, 3),))
-    ops._k_group_kernel_tuned.cache_clear()
+    tuned = ops._k_group_kernel_tuned
+    tuned.cache_clear()
     try:
         calls = _spy_k_group_launches(monkeypatch)
         results = []
@@ -109,7 +110,7 @@ def test_k_group_partials_match_ordered_groups(tokens, n, k, out_dtype, monkeypa
             monkeypatch.setattr(ops, "use_tensor_descriptor", lambda td=use_td: td)
             results.append(ops.k_group_partials(x, w, out_dtype))
     finally:
-        ops._k_group_kernel_tuned.cache_clear()
+        tuned.cache_clear()
     # The second launch really took the descriptor path.
     assert calls == [False, True]
     torch.testing.assert_close(results[1], results[0], atol=0, rtol=0)
