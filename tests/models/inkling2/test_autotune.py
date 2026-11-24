@@ -14,7 +14,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import vllm.models.inkling2.common.ops.attention as attention_ops
+import vllm.models.inkling2.common.ops.attn_res as attn_res_ops
 import vllm.models.inkling2.common.ops.linear as linear_ops
+import vllm.models.inkling2.common.ops.moe as moe_ops
 import vllm.models.inkling2.common.ops.rel_attention as rel_attention_ops
 import vllm.models.inkling2.common.ops.sconv as sconv_ops
 from tests.models.inkling2 import test_attention, test_core_ops
@@ -35,9 +38,15 @@ def _tuners():
     """Every autotuned launch of the Inkling2 kernels (factories: each
     variant)."""
     return [
+        attn_res_ops._attn_res_kernel_tuned,
         rel_attention_ops._rel_attention_kernel_tuned,
         sconv_ops._attn_prologue_kernel_tuned,
         sconv_ops._qr_rel_kernel_tuned,
+        *(
+            attention_ops._rel_decode_combine_kernel_tuned(large)
+            for large in (False, True)
+        ),
+        *(moe_ops._select_kernel_tuned(small) for small in (False, True)),
         *(linear_ops._k_group_kernel_tuned(b) for b, _ in linear_ops._TOKEN_BUCKETS),
         *(sconv_ops._sconv_kernel_tuned(b) for b, _ in sconv_ops._SCONV_BUCKETS),
     ]
@@ -109,7 +118,7 @@ def test_rel_decode_attention_tunes_and_matches_reference(cold_tuning):
     test_attention.test_inkling2_rel_decode_attention(
         24, 8, None, [1] * 4, [1, 200, 1025, 3000], 128, 9
     )
-    _assert_tuned(cold_tuning, "_rel_attention_kernel")
+    _assert_tuned(cold_tuning, "_rel_attention_kernel", "_rel_decode_combine_kernel")
 
 
 def test_short_conv_tunes_and_matches_full_sequence(cold_tuning):
@@ -128,6 +137,27 @@ def test_attention_prologue_tunes_and_matches_reference(
     )
     names = ("_attn_prologue_kernel", "_qr_rel_kernel")
     _assert_tuned(cold_tuning, *(names if split else names[:1]))
+
+
+def test_attn_res_tunes_and_matches_softmax_mix(cold_tuning):
+    """The D-chunked kernel (300 tokens), autotuned; the row kernel keeps
+    its fixed config."""
+    tokens = 300
+    dim = 4608
+    torch.manual_seed(0)
+    stack = torch.randn(1, tokens, dim, device=DEVICE).bfloat16()
+    last = torch.randn(tokens, dim, device=DEVICE).bfloat16()
+    queries = torch.randn(1, dim, device=DEVICE) * dim**-0.5
+    weight = torch.randn(1, dim, device=DEVICE).bfloat16()
+    values = torch.cat([stack, last[None]]).float()
+    inv_rms = torch.rsqrt(values.square().mean(-1) + 1e-6)
+    probs = torch.einsum("ntd,qd,nt->qtn", values, queries, inv_rms).softmax(-1)
+    mix = torch.einsum("qtn,ntd->qtd", probs, values * inv_rms[..., None])
+    ref = mix * torch.rsqrt(mix.square().mean(-1, keepdim=True) + 1e-6)
+    ref = (ref * weight.float()[:, None]).bfloat16()
+    out = attn_res_ops.attn_res(stack, last, None, queries, weight, 1e-6, True)
+    torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-2)
+    _assert_tuned(cold_tuning, "_attn_res_kernel")
 
 
 def test_k_group_buckets_keep_separate_tuning_keys():

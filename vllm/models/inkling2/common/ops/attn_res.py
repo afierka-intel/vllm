@@ -14,9 +14,10 @@ import torch
 
 from vllm.triton_utils import tl, tldevice, triton
 
+from .autotune import autotune
 from .intrinsics import rsqrt
 from .pdl import gdc_wait
-from .platform import pdl_launch_kwargs
+from .platform import pdl_launch_kwargs, use_kernel_autotune
 
 
 @triton.jit
@@ -294,16 +295,39 @@ def attn_res(
         APPLY_NORM=apply_norm,
         BLOCK_N=triton.next_power_of_2(num_stack + 1),
         enable_fp_fusion=False,
-        **pdl_launch_kwargs(),
     )
+    tuned = use_kernel_autotune()
     # The queries of a token run back to back and share its sources in L2.
     grid = (num_q, num_tokens)
     if num_tokens * num_q <= 256:
         block_a = triton.next_power_of_2(d + 1) // 2
         block_b = max(triton.next_power_of_2(d - block_a), 16)
+        # Not autotuned: the tuned warps were up to 1.3x slower than the
+        # fixed 8 for Inkling 2 Mini's sources and queries.
         _attn_res_row_kernel[grid](
-            *args, **meta, BLOCK_A=block_a, BLOCK_B=block_b, num_warps=8
+            *args,
+            **meta,
+            BLOCK_A=block_a,
+            BLOCK_B=block_b,
+            num_warps=8,
+            **pdl_launch_kwargs(),
         )
+    elif tuned:
+        _attn_res_kernel_tuned[grid](*args, **meta)
     else:
-        _attn_res_kernel[grid](*args, **meta, BLOCK_D=1024, num_warps=4)
+        _attn_res_kernel[grid](
+            *args, **meta, BLOCK_D=1024, num_warps=4, **pdl_launch_kwargs()
+        )
     return out
+
+
+# The D-chunked AttnRes launch with its warps and D chunk autotuned on XPU;
+# the configs include the fixed one, first (VLLM_TRITON_FORCE_FIRST_CONFIG).
+_ATTN_RES_KEY = ["D", "N_STACK", "HAS_ADDEND", "NORMALIZE", "APPLY_NORM"]
+_attn_res_kernel_tuned = autotune(
+    configs=[
+        triton.Config({"BLOCK_D": b}, num_warps=w)
+        for b, w in ((1024, 4), (512, 4), (1024, 8), (2048, 8), (512, 2))
+    ],
+    key=_ATTN_RES_KEY,
+)(_attn_res_kernel)
