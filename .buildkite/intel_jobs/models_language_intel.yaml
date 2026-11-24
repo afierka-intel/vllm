@@ -52,7 +52,8 @@ steps:
 
 - label: ":intel: (B70) Inkling 2"
   key: inkling2-xpu
-  timeout_in_minutes: 90
+  # Measured cold (empty Triton cache, one B70): 119 min, mostly autotuning.
+  timeout_in_minutes: 150
   device: intel_gpu_k8s
   num_devices: 1
   resource_claim_template: b70-1
