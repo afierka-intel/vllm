@@ -65,6 +65,26 @@ def nvfp4_emulation_use_split_dots(num_tokens: int) -> bool:
     return num_tokens <= SPLIT_DOTS_MAX_TOKENS
 
 
+def nvfp4_emulation_split_dots_config(
+    num_tokens: int, top_k: int, num_experts: int
+) -> dict[str, int]:
+    """Launch config of the split-dots path for a batch of `num_tokens`
+    tokens routed to `top_k` of `num_experts` experts: a row block of about
+    one expert's rows (16 to 64) and 128 x 128 weight tiles over 8 warps:
+    the best single tile of a sweep at Inkling 2 expert shapes on an Intel
+    Arc Pro B70 for 1-64 tokens (with `get_default_config` this path was up
+    to 20x slower there at 64 tokens)."""
+    rows_per_expert = triton.cdiv(num_tokens * top_k, max(num_experts, 1))
+    return {
+        "BLOCK_SIZE_M": min(64, max(16, triton.next_power_of_2(rows_per_expert))),
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 128,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 8,
+        "num_stages": 2,
+    }
+
+
 @triton.jit
 def _block_scales_to_f32(raw):
     """fp32 values of FP8-E4M3 block scales stored as uint8."""
@@ -644,16 +664,27 @@ class Nvfp4QuantizationEmulationTritonExperts(TritonExperts):
         if global_num_experts == -1:
             global_num_experts = E
 
+        # The W4A16 mode takes the split-dots path for small batches; W4A4
+        # keeps the default path.
+        split_dots = not self.quantize_activations and (
+            nvfp4_emulation_use_split_dots(num_tokens)
+        )
+
         # TODO: There is actually no support for tuning of the underlying triton
         # hyperparameters in benchmarks/kernels/benchmark_moe.py, to be added.
-        config = try_get_optimal_moe_config(
-            w1.size(),
-            w2.size(),
-            top_k_num,
-            self.quant_config.config_name(hidden_states.dtype),
-            num_tokens,
-            block_shape=None,
-        )
+        if split_dots:
+            config = nvfp4_emulation_split_dots_config(
+                num_tokens, top_k_num, global_num_experts
+            )
+        else:
+            config = try_get_optimal_moe_config(
+                w1.size(),
+                w2.size(),
+                top_k_num,
+                self.quant_config.config_name(hidden_states.dtype),
+                num_tokens,
+                block_shape=None,
+            )
 
         if hidden_states.dtype == torch.bfloat16:
             compute_type = tl.bfloat16
@@ -676,12 +707,6 @@ class Nvfp4QuantizationEmulationTritonExperts(TritonExperts):
             config["BLOCK_SIZE_M"],
             global_num_experts,
             expert_map,
-        )
-
-        # The W4A16 mode takes the split-dots path for small batches; W4A4
-        # keeps the default path.
-        split_dots = not self.quantize_activations and (
-            nvfp4_emulation_use_split_dots(num_tokens)
         )
 
         # Activation NVFP4 QDQ.

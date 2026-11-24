@@ -28,6 +28,7 @@ import torch
 
 from vllm.model_executor.layers.fused_moe.experts.nvfp4_emulation_moe import (
     invoke_fused_moe_nvfp4_emulation_kernel,
+    nvfp4_emulation_split_dots_config,
     nvfp4_emulation_use_split_dots,
 )
 from vllm.model_executor.layers.fused_moe.fused_moe import (
@@ -272,9 +273,15 @@ class XpuNvfp4Experts:
         w13, w2 = self.weights["w13"][0], self.weights["w2"][0]
         if tokens == 0:
             return x.new_empty((0, w2.shape[1]))
-        # The config `Nvfp4QuantizationEmulationTritonExperts` uses (bf16).
-        config = try_get_optimal_moe_config(w13.size(), w2.size(), topk, None, tokens)
+        # The path and config of `Nvfp4QuantizationEmulationTritonExperts`
+        # in its W4A16 mode, with the routing over all experts.
         split_dots = nvfp4_emulation_use_split_dots(tokens)
+        if split_dots:
+            config = nvfp4_emulation_split_dots_config(tokens, topk, num_global_experts)
+        else:
+            config = try_get_optimal_moe_config(
+                w13.size(), w2.size(), topk, None, tokens
+            )
         alignment = moe_align_block_size(
             ids, config["BLOCK_SIZE_M"], self.num_experts, ignore_invalid_experts=True
         )[:3]

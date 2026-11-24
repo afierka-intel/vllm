@@ -420,3 +420,17 @@ def test_activation_quantization_follows_mode(monkeypatch, quantize_activations)
     _apply(experts, x, w1, w2, topk_weights, topk_ids, num_experts)
     assert calls == (["nvfp4", "nvfp4"] if quantize_activations else [])
     assert launches == [not quantize_activations] * 2
+
+
+@pytest.mark.parametrize(
+    "tokens,top_k,experts,block_m",
+    [(1, 8, 128, 16), (64, 8, 128, 16), (64, 8, 16, 32), (64, 4, 4, 64)],
+)
+def test_split_dots_config_row_block(tokens, top_k, experts, block_m):
+    """The split-dots config's row block is about one expert's rows, 16 to
+    64, with tiles that hold whole scale groups."""
+    config = nvfp4_emulation_moe.nvfp4_emulation_split_dots_config(
+        tokens, top_k, experts
+    )
+    assert config["BLOCK_SIZE_M"] == block_m
+    assert config["BLOCK_SIZE_K"] % 16 == 0
