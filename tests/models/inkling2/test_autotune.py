@@ -13,16 +13,22 @@ of a fresh key (no pick from memory or disk) and checks its pick.
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 import vllm.models.inkling2.common.ops.attention_sm90 as rel_attention_ops
-from tests.models.inkling2 import test_attention
+import vllm.models.inkling2.common.ops.linear as linear_ops
+from tests.models.inkling2 import test_attention, test_core_ops
+from tests.models.inkling2.utils import DEVICE
 from vllm.platforms import current_platform
 from vllm.triton_utils import force_first_config
 
 
 def _tuners():
     """Every autotuned launch of the Inkling2 kernels."""
-    return [*rel_attention_ops._rel_attention_kernel_tuned.values()]
+    return [
+        *rel_attention_ops._rel_attention_kernel_tuned.values(),
+        *(linear_ops._k_group_kernel_tuned(b) for b, _ in linear_ops._TOKEN_BUCKETS),
+    ]
 
 
 # The first config of each tuned launch: the launch config the kernel used
@@ -34,6 +40,11 @@ FIXED_FIRST = [
     (lambda: rel_attention_ops._rel_attention_tuner(32), {"BLOCK_N": 128}, 4, 2),
     (lambda: rel_attention_ops._rel_attention_tuner(64), {"BLOCK_N": 64}, 4, 2),
     (lambda: rel_attention_ops._rel_attention_tuner(128), {"BLOCK_N": 64}, 8, 2),
+    # _k_group_kernel per token bucket (XPU's fixed tiles: 2 stages).
+    (lambda: linear_ops._k_group_kernel_tuned(16), {"BM": 16, "BN": 32}, 4, 2),
+    (lambda: linear_ops._k_group_kernel_tuned(128), {"BM": 16, "BN": 64}, 4, 2),
+    (lambda: linear_ops._k_group_kernel_tuned(256), {"BM": 64, "BN": 64}, 4, 2),
+    (lambda: linear_ops._k_group_kernel_tuned(1 << 62), {"BM": 64, "BN": 128}, 8, 2),
 ]
 
 
@@ -158,3 +169,71 @@ def test_rel_attention_tunes_and_matches_reference(cold_tuning, phase):
             24, 8, None, [1] * 4, [1, 200, 1025, 3000], 128, 9
         )
     _assert_tuned(cold_tuning, "_rel_attention_kernel")
+
+
+@requires_xpu
+@requires_tuning
+def test_k_group_tunes_and_matches_ordered_groups(cold_tuning, monkeypatch):
+    """The tuned K-group launch times every config of a fresh key, and its
+    pick matches the ordered K-group sums. (Every K-group config gives the
+    bits of the fixed one: `test_k_group_tiles_are_bitwise_identical`.)"""
+    # 37 tokens at N = 128: a regime that tunes (`_FIXED_ONLY_ABOVE_N`).
+    test_core_ops.test_k_group_partials_match_ordered_groups(
+        37, 128, 4608, torch.float32, monkeypatch
+    )
+    _assert_tuned(cold_tuning, "_k_group_kernel")
+
+
+@pytest.mark.parametrize(
+    "bucket,n,tuned",
+    [
+        (16, 32, False),
+        (16, 384, False),
+        (128, 128, True),
+        (128, 384, False),
+        (256, 384, True),
+        (1 << 62, 32, False),
+        (1 << 62, 128, False),
+    ],
+)
+def test_k_group_tunes_only_where_it_gained(bucket, n, tuned):
+    """The K-group tuners time more than one tile only in the regimes where
+    tuning measured a gain (any platform: the tuners are built at import)."""
+    tuner = linear_ops._k_group_kernel_tuned(bucket)
+    kept = linear_ops._prune_k_group_tiles(tuner.configs, {"N": n, "BUCKET": bucket})
+    assert (len(kept) > 1) == tuned
+
+
+@requires_xpu
+@requires_tuning
+def test_k_group_buckets_keep_separate_tuning_keys():
+    """Buckets 128 and 256 prune to the same configs at N <= 32 (Inkling 2's
+    dynamic taps); the bucket in the tuning key still keeps their picks
+    apart, in memory and in Triton's on-disk cache (keyed by the tuning key
+    and the configs)."""
+    n, k = 32, 4608
+    small = linear_ops._k_group_kernel_tuned(128)
+    large = linear_ops._k_group_kernel_tuned(256)
+    pruned = [
+        [
+            str(c)
+            for c in linear_ops._prune_k_group_tiles(
+                t.configs, {"N": n, "BUCKET": bucket}
+            )
+        ]
+        for t, bucket in ((small, 128), (large, 256))
+    ]
+    assert pruned[0] == pruned[1]
+    torch.manual_seed(0)
+    w = torch.randn(n, k, device=DEVICE).bfloat16()
+    for tokens in (100, 200):
+        x = torch.randn(tokens, k, device=DEVICE).bfloat16()
+        linear_ops.k_group_partials(x, w)
+    keys = []
+    for bucket, tuner in ((128, small), (256, large)):
+        assert tuner.keys[-1] == "BUCKET"
+        # (N, K, SPLIT, USE_TD, BUCKET, dtypes...) of this weight shape.
+        shape_keys = {key for key in tuner.cache if key[:2] == (n, k)}
+        assert shape_keys and all(key[4] == bucket for key in shape_keys)
+        keys.append(shape_keys)
+    assert not keys[0] & keys[1]
