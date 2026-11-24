@@ -5,15 +5,18 @@ attention sink, the log-scaling tau, and the split-KV decode/verify launch
 (`_rel_attention_kernel`, or on Blackwell the tcgen05 kernel of
 `nvidia/ops/attention.py`) with its partials combine."""
 
+import functools
+
 import torch
 
 from vllm.triton_utils import tl, tldevice, triton
 from vllm.utils.platform_utils import num_compute_units
 
 from .attention_sm90 import MODE_GATED, MODE_PARTIAL, rel_attention
+from .autotune import autotune
 from .intrinsics import ex2, lg2, sigmoid
 from .pdl import gdc_wait
-from .platform import pdl_launch_kwargs, use_sm100_kernels
+from .platform import pdl_launch_kwargs, use_kernel_autotune, use_sm100_kernels
 
 
 @triton.jit
@@ -166,6 +169,9 @@ def _rel_decode_combine_kernel(
     BLOCK_S: tl.constexpr,
     BLOCK_D: tl.constexpr,
     GATED: tl.constexpr,
+    # Batch class of the autotuned launch (unused in the body): an autotune
+    # key, so that the two tuners never share a tuned tile.
+    LARGE: tl.constexpr = False,
 ):
     """Merge the split partials, then apply the output gate and attention sink
     if `GATED`."""
@@ -375,13 +381,7 @@ def _decode_attention(
     if fuse_gate:
         out[num_actual_tokens:].zero_()
         return
-    # Small batches spread the merge over more programs; larger ones merge a
-    # whole head per (narrow) program.
-    if num_tokens * num_heads >= 512:
-        block_d, num_warps = head_dim, 2 if num_splits > 32 else 1
-    else:
-        block_d, num_warps = 32, 4
-    _rel_decode_combine_kernel[(num_tokens, num_heads, head_dim // block_d)](
+    args = (
         o_part,
         lse_part,
         gate,
@@ -391,12 +391,57 @@ def _decode_attention(
         num_actual_tokens,
         gate.stride(0),
         sinks.stride(0),
+    )
+    meta = dict(
         H=num_heads,
         D=head_dim,
         NUM_SPLITS=num_splits,
         BLOCK_S=triton.next_power_of_2(num_splits),
-        BLOCK_D=block_d,
         GATED=not draft,
-        num_warps=num_warps,
-        **pdl_launch_kwargs(),
     )
+    if use_kernel_autotune():
+
+        def grid(meta):
+            return (num_tokens, num_heads, head_dim // meta["BLOCK_D"])
+
+        large = num_tokens * num_heads >= 512
+        many = large and num_splits > 32
+        _rel_decode_combine_kernel_tuned(large, many)[grid](*args, **meta, LARGE=large)
+        return
+    # Small batches spread the merge over more programs; larger ones merge a
+    # whole head per (narrow) program.
+    if num_tokens * num_heads >= 512:
+        block_d, num_warps = head_dim, 2 if num_splits > 32 else 1
+    else:
+        block_d, num_warps = 32, 4
+    _rel_decode_combine_kernel[(num_tokens, num_heads, head_dim // block_d)](
+        *args, **meta, BLOCK_D=block_d, num_warps=num_warps, **pdl_launch_kwargs()
+    )
+
+
+# (BLOCK_D, num_warps) of the partials combine autotuned on XPU, for small
+# and large batches (`num_tokens * num_heads >= 512`); every BLOCK_D divides
+# the head dim 128. `LARGE` in the key keeps the small and large tuners apart,
+# also in Triton's on-disk autotuning cache.
+_COMBINE_TILES = {
+    False: ((32, 4), (64, 2), (128, 1)),
+    True: ((128, 1), (64, 2), (128, 2)),
+}
+
+
+@functools.cache
+def _rel_decode_combine_kernel_tuned(large: bool, many: bool):
+    """The combine autotuned for small or large batches (`many`: more than
+    32 splits); the fixed (BLOCK_D, num_warps) first, with the fixed
+    launch's (XPU default) 2 stages."""
+    fixed = (128, 2 if many else 1) if large else (32, 4)
+    tiles = [fixed, *(t for t in _COMBINE_TILES[large] if t != fixed)]
+    return autotune(
+        configs=[
+            triton.Config({"BLOCK_D": b}, num_warps=w, num_stages=2)
+            if i == 0
+            else triton.Config({"BLOCK_D": b}, num_warps=w)
+            for i, (b, w) in enumerate(tiles)
+        ],
+        key=["H", "D", "NUM_SPLITS", "GATED", "LARGE"],
+    )(_rel_decode_combine_kernel)
