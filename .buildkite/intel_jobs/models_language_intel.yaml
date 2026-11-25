@@ -46,3 +46,34 @@ steps:
       bash .buildkite/scripts/hardware_ci/run-intel-test.sh
       'cd tests &&
       pytest -v -s models/language/pooling/test_auto_prefix_cache_support.py'
+
+- label: ":intel: (BMG) Inkling 2"
+  key: inkling2-xpu
+  # Both commands together take about 27 min cold (empty Triton cache) on
+  # one B70.
+  timeout_in_minutes: 60
+  device: intel_gpu_k8s
+  num_devices: 1
+  resource_claim_template: b70-1
+  working_dir: "/vllm-workspace/"
+  env:
+    VLLM_TEST_DEVICE: "xpu"
+    # The first config of every autotuned launch, i.e. its fixed launch
+    # config, without timing; test_autotune.py covers the tuned path.
+    VLLM_TRITON_FORCE_FIRST_CONFIG: "1"
+  source_file_dependencies:
+  - vllm/models/inkling2/
+  - vllm/platforms/xpu.py
+  - tests/models/inkling2/xpu/
+  commands:
+    - cd tests
+    - >-
+      pytest -v -s
+      models/inkling2/xpu
+      --ignore=models/inkling2/xpu/test_autotune.py
+    # The tuned launches as served: timed picks, pruning and the tuning
+    # done in the warmup before graph capture.
+    - >-
+      VLLM_TRITON_FORCE_FIRST_CONFIG=0 pytest -v -s
+      models/inkling2/xpu/test_autotune.py
+      models/inkling2/xpu/test_model.py::test_graphs_match_eager
