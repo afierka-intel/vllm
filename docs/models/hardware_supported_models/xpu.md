@@ -43,6 +43,18 @@ Note: Online FP8 = [Online Quantization](https://docs.vllm.ai/en/latest/features
 | Qwen/Qwen1.5-14B-Chat                           | QwenForCausalLM                                  | BF16/Online FP8       |
 | Qwen/Qwen1.5-32B-Chat                           | QwenForCausalLM                                  | BF16/Online FP8       |
 | RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8-dynamic | LlamaForCausalLM                                 | FP8                   |
+| thinkingmachines/Inkling-2-Mini                 | Inkling2LoopForConditionalGeneration             | NVFP4                 |
+
+Inkling 2 models (`Inkling2ForConditionalGeneration`,
+`Inkling2LoopForConditionalGeneration`) run on XPU as text-only models with
+the checkpoints' NVFP4 or MXFP8 experts. Serve them with
+`--language-model-only` (or `--limit-mm-per-prompt '{"image": 0}'`) and a
+BF16 KV cache (the default `--kv-cache-dtype auto`). Image inputs, FP8 KV
+cache, LoRA and DSpark speculative decoding are not supported on XPU. MXFP8
+experts need `vllm-xpu-kernels` 0.1.17 or later. The Triton kernels autotune
+each new shape class on first use, which delays the engine step that meets it
+by up to tens of seconds; the picks are stored in the Triton cache directory
+(`TRITON_CACHE_DIR`) and reused by later runs.
 
 ### Multimodal Language Models
 
