@@ -156,7 +156,11 @@ def plan_decode_attention(
     return max(num_cus // work, min(num_cus // 8, 6 * num_cus // work))
 
 
-@triton.jit
+# `num_tokens` (the batch's rows, padded to a graph size) and
+# `num_actual_tokens` take every value serving produces; they only index and
+# bound rows, so without specialization the kernel compiles once per split
+# plan instead of once per (==1, %16==0, other) class of each.
+@triton.jit(do_not_specialize=["num_tokens", "num_actual_tokens"])
 def _rel_decode_combine_kernel(
     OPart,
     LsePart,

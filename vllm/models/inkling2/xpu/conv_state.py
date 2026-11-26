@@ -43,7 +43,12 @@ from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayerConfig
 
 
-@triton.jit
+# The four integers take every value serving produces (request counts, actual
+# and padded token counts, search depths): without specialization the kernel
+# compiles once instead of once per (==1, %16==0, other) class of each.
+@triton.jit(
+    do_not_specialize=["num_reqs", "num_actual_tokens", "num_padded_tokens", "n_iters"]
+)
 def _seq_metadata_kernel(
     qsl_ptr,  # [num_reqs + 1] int32 cumulative query start rows
     seq_idx_ptr,  # [T] int32 out: token -> owning request

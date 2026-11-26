@@ -18,8 +18,14 @@ _MODULES = {
     "Inkling2ForConditionalGeneration": "model",
     "Inkling2LoopForConditionalGeneration": "loop",
 }
-# XPU has no DSpark draft: `xpu/model.py` names it and rejects it at init.
-_XPU_MODULES = {**_MODULES, "Inkling2DSparkModel": "model"}
+# The exports of the XPU package, listed on their own so that an export added
+# for another platform is not looked up under `xpu/`. XPU has no DSpark draft:
+# `xpu/model.py` names it and rejects it at init.
+_XPU_MODULES = {
+    "Inkling2DSparkModel": "model",
+    "Inkling2ForConditionalGeneration": "model",
+    "Inkling2LoopForConditionalGeneration": "loop",
+}
 
 __all__ = [
     "Inkling2DSparkModel",
@@ -33,6 +39,10 @@ def __getattr__(name: str):
         from vllm.platforms import current_platform
 
         if current_platform.is_xpu():
+            if name not in _XPU_MODULES:
+                raise AttributeError(
+                    f"{name!r} of {__name__!r} is not supported on XPU"
+                )
             module = f"{__name__}.xpu.{_XPU_MODULES[name]}"
         else:
             module = f"{__name__}.nvidia.{_MODULES[name]}"

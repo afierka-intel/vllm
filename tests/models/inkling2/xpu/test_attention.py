@@ -488,3 +488,87 @@ def test_log_scaling_tau():
     tau = compute_log_scaling_tau(positions, 4096, 0.1)
     ratio = ((positions + 1).double() / 4096).clamp(min=1.0)
     torch.testing.assert_close(tau, (1 + 0.1 * ratio.log()).float())
+
+
+@torch.inference_mode()
+def test_rel_attention_reuses_jit_across_prefill_lengths():
+    """A prefill length off the %16 grid (and an unaligned `cache_seqlens`
+    slice) reuses the kernel compiled for an aligned one."""
+    heads, kv_heads, page = 24, 8, 64
+    key_cache, value_cache = _paged_kv(8, page, kv_heads)
+    table = torch.arange(8, device=DEVICE, dtype=torch.int32)[None]
+    device = torch.accelerator.current_device_index()
+    kernel_cache = rel_ops._rel_attention_kernel.device_caches[device][0]
+    kernel_cache.clear()
+
+    added = []
+    for num_tokens, offset in ((64, 0), (72, 1)):
+        before = len(kernel_cache)
+        q = _queries(num_tokens, heads)
+        seq_lens = torch.full((2,), num_tokens, device=DEVICE, dtype=torch.int32)
+        rel_attention(
+            q,
+            key_cache,
+            value_cache,
+            torch.empty(q.shape, device=DEVICE),
+            torch.empty(heads, num_tokens, device=DEVICE),
+            q.new_zeros(num_tokens + 128, heads, REL_EXTENT + 256),
+            block_table=table,
+            cache_seqlens=seq_lens[offset : offset + 1],
+            cu_seqlens_q=_cu_seqlens([num_tokens]),
+            max_query_len=num_tokens,
+            softmax_scale=HEAD_DIM**-0.5,
+            window=0,
+            num_splits=1,
+            mode=MODE_OUT_LSE,
+        )
+        added.append(len(kernel_cache) - before)
+
+    assert added[0] > 0 and added[1] == 0, added
+
+
+@torch.inference_mode()
+def test_rel_decode_combine_reuses_jit_across_batches():
+    """Decode batches whose row counts fall in different specialization
+    classes (%16, other, ==1) reuse the combine compiled for the first."""
+    heads, num_splits = 24, 9
+    device = torch.accelerator.current_device_index()
+    kernel_cache = attention_ops._rel_decode_combine_kernel.device_caches[device][0]
+    kernel_cache.clear()
+
+    added = []
+    for num_tokens, num_actual_tokens in ((32, 32), (24, 17), (1, 1)):
+        o_part = torch.randn(num_splits, num_tokens, heads, HEAD_DIM, device=DEVICE)
+        lse_part = torch.randn(num_splits, num_tokens, heads, device=DEVICE)
+        gate = torch.randn(num_tokens, heads * HEAD_DIM, device=DEVICE).bfloat16()
+        sinks = torch.randn(num_tokens, heads, device=DEVICE).bfloat16()
+        out = torch.empty(gate.shape, device=DEVICE, dtype=torch.bfloat16)
+        before = len(kernel_cache)
+        attention_ops._rel_decode_combine_kernel[(num_tokens, heads, HEAD_DIM // 32)](
+            o_part,
+            lse_part,
+            gate,
+            sinks,
+            out,
+            num_tokens,
+            num_actual_tokens,
+            gate.stride(0),
+            sinks.stride(0),
+            H=heads,
+            D=HEAD_DIM,
+            NUM_SPLITS=num_splits,
+            BLOCK_S=triton.next_power_of_2(num_splits),
+            BLOCK_D=32,
+            num_warps=4,
+        )
+        added.append(len(kernel_cache) - before)
+        # The partial LSEs are base 2; the merged one (vs the sink) is natural.
+        lse_nat = lse_part * 0.6931471805599453
+        w, lse = torch.softmax(lse_nat, 0), torch.logsumexp(lse_nat, 0)
+        expected = (w[..., None] * o_part).sum(0).view(num_tokens, -1)
+        expected *= torch.sigmoid(gate.float())
+        expected *= torch.sigmoid(lse - sinks.float()).repeat_interleave(HEAD_DIM, 1)
+        expected[num_actual_tokens:] = 0
+        torch.testing.assert_close(out.float(), expected, atol=1e-2, rtol=1e-2)
+
+    assert added == [1, 0, 0], added

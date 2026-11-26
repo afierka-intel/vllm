@@ -84,7 +84,9 @@ def _load_kv_tile_td(
     return desc.load([offset_in_page, 0])
 
 
-@triton.jit
+# The arguments that vary with the batch are not specialized on %16
+# alignment, so new prefill lengths reuse the compiled kernel.
+@triton.jit(do_not_specialize_on_alignment=["SeqLens", "num_tokens", "stride_lse_h"])
 def _rel_attention_kernel(
     Q,
     K,

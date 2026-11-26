@@ -22,7 +22,9 @@ from tests.models.inkling2.xpu.utils import (
     requires_xpu,
     shear_rel_logits,
 )
+from vllm.models.inkling2.xpu import conv_state
 from vllm.models.inkling2.xpu.ops import linear as linear_ops
+from vllm.models.inkling2.xpu.ops import sconv as sconv_ops
 from vllm.models.inkling2.xpu.ops.attn_res import attn_res
 from vllm.models.inkling2.xpu.ops.conv_mix import conv_mix
 from vllm.models.inkling2.xpu.ops.loop import pair_rms_norm
@@ -289,6 +291,67 @@ def test_prologue_shears_rel_logits(is_local, seqs):
     _, compact = _prologue_qr(*args)
     ref = shear_rel_logits(compact, seqs, 128, is_local)
     torch.testing.assert_close(rel[:tokens], ref[:tokens], atol=0, rtol=0)
+
+
+def test_attention_prologue_reuses_jit_across_prefill_lengths(monkeypatch):
+    """A prefill length off the %16 grid reuses the prologue and q/r kernels
+    compiled for an aligned one."""
+    monkeypatch.setattr(sconv_ops, "_PROLOGUE_SPLIT_MIN_TOKENS", 0)
+    heads, kv_heads, dim, d_rel, extent = 12, 2, 128, 16, 1024
+    device = torch.accelerator.current_device_index()
+    caches = [
+        kernel.device_caches[device][0]
+        for kernel in (sconv_ops._attn_prologue_kernel, sconv_ops._qr_rel_kernel)
+    ]
+    for cache in caches:
+        cache.clear()
+
+    added = []
+    for tokens in (64, 72):
+        before = [len(cache) for cache in caches]
+        q = torch.randn(tokens, heads, dim, device=DEVICE).bfloat16()
+        r = torch.randn(tokens, heads, d_rel, device=DEVICE).bfloat16()
+        rel_proj = torch.randn(d_rel, extent, device=DEVICE).bfloat16()
+        q_scale, r_scale = q.new_ones(heads, dim), q.new_ones(heads, d_rel)
+        _prologue_qr(q, r, q_scale, r_scale, None, rel_proj, kv_heads)
+        added.append([len(cache) - n for cache, n in zip(caches, before)])
+
+    assert added == [[1, 1], [0, 0]], added
+
+
+def test_seq_metadata_reuses_jit_across_batches():
+    """Batches whose request and token counts fall in different
+    specialization classes (==1, %16, other) reuse one compiled kernel and
+    fill the reference per-token request index and query start."""
+    device = torch.accelerator.current_device_index()
+    kernel_cache = conv_state._seq_metadata_kernel.device_caches[device][0]
+    kernel_cache.clear()
+    seq_idx = torch.empty(64, dtype=torch.int32, device=DEVICE)
+    query_start = torch.empty_like(seq_idx)
+
+    added = []
+    # (query lengths, padded tokens): 16 requests / 32 tokens, 1 / 1, 3 / 17
+    # padded to 24.
+    for q_lens, num_padded in (([2] * 16, 32), ([1], 1), ([5, 1, 11], 24)):
+        qsl = torch.tensor(
+            [0, *torch.tensor(q_lens).cumsum(0).tolist()],
+            dtype=torch.int32,
+            device=DEVICE,
+        )
+        num_actual = sum(q_lens)
+        before = len(kernel_cache)
+        conv_state.sconv_seq_metadata(
+            qsl, len(q_lens), num_actual, seq_idx, query_start, num_padded
+        )
+        added.append(len(kernel_cache) - before)
+        owner = torch.repeat_interleave(torch.arange(len(q_lens)), torch.tensor(q_lens))
+        pad = num_padded - num_actual
+        expected_idx = torch.cat([owner, owner.new_zeros(pad)]).int()
+        expected_start = torch.cat([qsl.cpu()[owner], owner.new_zeros(pad)]).int()
+        torch.testing.assert_close(seq_idx[:num_padded].cpu(), expected_idx)
+        torch.testing.assert_close(query_start[:num_padded].cpu(), expected_start)
+
+    assert added == [1, 0, 0], added
 
 
 def _attn_res_reference(stack, last, addend, queries, normalize):
