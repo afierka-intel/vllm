@@ -3,7 +3,7 @@
 """Inkling2 on XPU at model level: the platform dispatch and its import
 isolation, the features XPU rejects (image inputs, LoRA, DSpark, FP8 KV, BF16
 experts), the loop controllers, and tiny random-weight engines of both
-architectures (TP=1, BF16 KV)."""
+architectures (TP=1, BF16 KV), with their routed-experts capture."""
 
 import json
 import subprocess
@@ -281,6 +281,82 @@ def test_tiny_model_decode_matches_prefill(
         assert prefill is not None and token in prefill
         assert abs(prefill[token].logprob - step_logprob) < 2e-2
         assert prefill[token].rank == 1
+
+
+def _record_moe_routing(model: torch.nn.Module) -> None:
+    """Redraw the routers (dummy weights route every token alike) and the
+    loop message controllers (dummy ones leave every pass alike), then
+    record, in call order, the reference routing of every MoE call's input
+    (sorted expert ids per token)."""
+    from vllm.models.inkling2.xpu.loop import Inkling2LoopDecoderLayer
+    from vllm.models.inkling2.xpu.moe import Inkling2MoE
+    from vllm.models.inkling2.xpu.ops.linear import linear_k_groups
+
+    calls: list[torch.Tensor] = []
+    model.routing_calls = calls
+    generator = torch.Generator(device=DEVICE).manual_seed(0)
+
+    def hook(moe: Inkling2MoE, args: tuple) -> None:
+        gate = moe.gate
+        logits = linear_k_groups(args[0].contiguous(), gate.weight)
+        ids = torch.topk(logits.sigmoid() + gate.bias, gate.topk).indices
+        calls.append(ids.sort(-1).values.cpu())
+
+    for module in model.modules():
+        if isinstance(module, Inkling2LoopDecoderLayer):
+            # Unit-scale gates: tanh(gain), tanh(forget) ~ O(1).
+            down, gain_forget = module.controller_down, module.controller_gain_forget
+            down.normal_(std=down.shape[-1] ** -0.5, generator=generator)
+            gain_forget.normal_(std=gain_forget.shape[-1] ** -0.5, generator=generator)
+        if isinstance(module, Inkling2MoE):
+            module.gate.weight.normal_(generator=generator)
+            module.gate.bias.zero_()
+            module.register_forward_pre_hook(hook)
+
+
+def _routing_calls(model: torch.nn.Module) -> list[torch.Tensor]:
+    return model.routing_calls
+
+
+@pytest.mark.parametrize(
+    "config", [TINY_CONFIG, TINY_LOOP_CONFIG], ids=["text", "loop"]
+)
+def test_tiny_model_routed_experts(vllm_runner, tmp_path, enable_pickle, config):
+    """Routed-experts capture keeps a row per layer visit, in execution
+    order (a loop core layer has one per pass), each the experts that visit's
+    MoE call routed every prompt token to."""
+    looped = config is TINY_LOOP_CONFIG
+    # The capture's aux-output connector requires prefix caching.
+    kwargs = _engine_kwargs(
+        looped,
+        enforce_eager=True,
+        enable_return_routed_experts=True,
+        enable_prefix_caching=True,
+    )
+    prompt = list(range(2, 202))
+    with vllm_runner(write_config(tmp_path, config), **kwargs) as vllm:
+        llm = vllm.llm
+        # Looped: the prelude, 3 passes of the 2 core layers, then the coda.
+        num_visits = 8 if looped else 2
+        text_config = llm.llm_engine.model_config.hf_text_config
+        assert text_config.num_layer_visits == num_visits
+        llm.apply_model(_record_moe_routing)
+        output = llm.generate(
+            [{"prompt_token_ids": prompt}],
+            SamplingParams(max_tokens=1, ignore_eos=True, detokenize=False),
+        )[0]
+        calls = llm.apply_model(_routing_calls)[0]
+    # One prefill forward: one MoE call per layer visit.
+    assert len(calls) == num_visits and all(len(c) == len(prompt) for c in calls)
+    experts = output.outputs[0].routed_experts
+    assert experts is not None and experts.shape[1:] == (num_visits, 8)
+    n = len(prompt) - 1  # the last prompt token's row may be the sampled token's
+    captured = torch.from_numpy(experts[:n].astype("int64")).sort(-1).values
+    for visit, call in enumerate(calls):
+        torch.testing.assert_close(captured[:, visit], call[:n], atol=0, rtol=0)
+    if looped:
+        # The passes of a core layer route differently (no row is reused).
+        assert not torch.equal(captured[:, 1], captured[:, 3])
 
 
 def _chunked_mixed_prompt_logprobs(vllm_runner, model, looped, enforce_eager):
